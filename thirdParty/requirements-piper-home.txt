@@ -1,0 +1,10 @@
+# Direct project dependencies for the hardware/recording environment.
+# Transitive versions observed on 2026-09-09 are recorded in
+# environment-locks/piper-home.freeze.txt.
+h5py==3.16.0
+numpy==1.26.4
+opencv-python-headless==4.11.0.86
+playwright==1.62.0
+pyorbbecsdk2==2.1.2
+python-can==4.6.1
+pyzmq==27.2.0

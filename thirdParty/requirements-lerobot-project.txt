@@ -1,0 +1,6 @@
+# Packages used by this project's UI, HDF5 and hardware bridge code but not
+# declared by the selected LeRobot extras. LeRobot itself is synchronized from
+# lerobot/uv.lock by setup_envs.sh.
+Flask==3.1.3
+h5py==3.16.0
+pyzmq==27.2.0

@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Piper HDF5 Viewer</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark"><i data-lucide="scan-line"></i></span>
+      <div><strong>Piper HDF5 Viewer</strong><span>只读数据检查</span></div>
+    </div>
+    <form id="directory-form" class="directory-form">
+      <i data-lucide="folder-open"></i>
+      <input id="directory-input" aria-label="HDF5 数据目录" autocomplete="off" spellcheck="false">
+      <button class="icon-button" type="submit" title="扫描目录" aria-label="扫描目录"><i data-lucide="refresh-cw"></i></button>
+    </form>
+    <div id="scan-status" class="scan-status" aria-live="polite"></div>
+  </header>
+
+  <div class="workspace">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div>
+          <h2>Episodes</h2>
+          <span id="library-summary">尚未扫描</span>
+        </div>
+        <button id="sidebar-toggle" class="icon-button sidebar-toggle" title="收起列表" aria-label="收起列表"><i data-lucide="panel-left-close"></i></button>
+      </div>
+      <label class="search-field">
+        <i data-lucide="search"></i>
+        <input id="file-search" type="search" placeholder="筛选文件名或任务">
+      </label>
+      <div id="file-list" class="file-list" role="listbox"></div>
+    </aside>
+
+    <main class="main">
+      <section id="empty-state" class="empty-state">
+        <i data-lucide="database"></i>
+        <h1>选择一个 episode</h1>
+        <p>扫描结果会显示在左侧列表中。</p>
+      </section>
+
+      <div id="episode-view" class="episode-view hidden">
+        <section class="episode-header">
+          <div class="episode-title">
+            <button id="sidebar-open" class="icon-button sidebar-open" title="打开列表" aria-label="打开列表"><i data-lucide="panel-left-open"></i></button>
+            <div>
+              <h1 id="episode-name"></h1>
+              <p id="episode-path"></p>
+            </div>
+          </div>
+          <div class="episode-actions">
+            <label id="demo-select-wrap" class="compact-select hidden">Demo<select id="demo-select"></select></label>
+            <button id="copy-path" class="icon-button" title="复制文件路径" aria-label="复制文件路径"><i data-lucide="copy"></i></button>
+          </div>
+          <div id="episode-metrics" class="metrics"></div>
+          <p id="instruction" class="instruction hidden"></p>
+        </section>
+
+        <section id="camera-grid" class="camera-grid"></section>
+
+        <section class="transport" aria-label="播放控制">
+          <div class="transport-buttons">
+            <button id="previous-frame" class="icon-button" title="上一帧" aria-label="上一帧"><i data-lucide="skip-back"></i></button>
+            <button id="play-toggle" class="play-button" title="播放" aria-label="播放"><i data-lucide="play"></i></button>
+            <button id="next-frame" class="icon-button" title="下一帧" aria-label="下一帧"><i data-lucide="skip-forward"></i></button>
+          </div>
+          <div class="timeline-block">
+            <input id="timeline" type="range" min="0" max="0" value="0" aria-label="帧时间轴">
+            <div class="timeline-meta">
+              <span><strong id="frame-label">0 / 0</strong><span id="time-label">0.000 s</span></span>
+              <span id="phase-label" class="phase task">TASK</span>
+            </div>
+          </div>
+          <label class="frame-input">帧<input id="frame-input" type="number" min="1" value="1"></label>
+          <div id="speed-control" class="segmented" aria-label="播放速度">
+            <button data-speed="0.5">0.5x</button>
+            <button data-speed="1" class="active">1x</button>
+            <button data-speed="2">2x</button>
+          </div>
+        </section>
+
+        <nav class="tabs" aria-label="数据视图">
+          <button class="active" data-tab="curves"><i data-lucide="chart-no-axes-combined"></i>曲线</button>
+          <button data-tab="frame"><i data-lucide="table-properties"></i>当前帧</button>
+          <button data-tab="structure"><i data-lucide="network"></i>HDF5 结构</button>
+        </nav>
+
+        <section id="tab-curves" class="tab-panel">
+          <div class="curve-toolbar">
+            <div id="curve-source" class="segmented">
+              <button data-source="actions" class="active">控制动作</button>
+              <button data-source="state">反馈状态</button>
+            </div>
+            <div id="curve-side" class="segmented">
+              <button data-side="left" class="active">左臂</button>
+              <button data-side="right">右臂</button>
+            </div>
+          </div>
+          <div id="joint-legend" class="joint-legend"></div>
+          <div class="plot-section">
+            <div class="plot-heading"><div><h3>关节</h3><span id="joint-unit">rad</span></div><span id="joint-range"></span></div>
+            <canvas id="joint-chart"></canvas>
+          </div>
+          <div class="plot-section compact-plot">
+            <div class="plot-heading"><div><h3>夹爪宽度</h3><span id="gripper-unit">m</span></div><span id="gripper-range"></span></div>
+            <canvas id="gripper-chart"></canvas>
+          </div>
+        </section>
+
+        <section id="tab-frame" class="tab-panel hidden">
+          <div id="frame-details" class="frame-details"></div>
+        </section>
+
+        <section id="tab-structure" class="tab-panel hidden">
+          <div class="structure-header">
+            <div><strong id="dataset-count">0 datasets</strong><span>shape、dtype 与存储属性</span></div>
+            <label class="search-field structure-search"><i data-lucide="search"></i><input id="schema-search" type="search" placeholder="筛选数据集路径"></label>
+          </div>
+          <div class="table-wrap">
+            <table class="schema-table">
+              <thead><tr><th>路径</th><th>Shape</th><th>Dtype</th><th>单位 / 表示</th></tr></thead>
+              <tbody id="schema-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/vendor/lucide.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

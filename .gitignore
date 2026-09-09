@@ -1,0 +1,50 @@
+# Runtime data and model weights are transferred separately.
+/datasets/
+/models/
+
+# Recreate environments with thirdParty/setup_envs.sh.
+/thirdParty/.venvs/
+**/.venv/
+**/venv/
+
+# Python/runtime caches.
+**/__pycache__/
+*.py[cod]
+*.so.debug
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+*.egg-info/
+
+# Local credentials and service state.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pid
+*.log
+wandb/
+
+# Generated outputs and heavyweight model artifacts outside models/.
+outputs/
+build/
+dist/
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.h5
+*.hdf5
+
+# The pinned pyorbbecsdk2 wheel supplies the runtime native library.
+/thirdParty/pyorbbecsdk/sdk/lib/
+/thirdParty/pyorbbecsdk/docs/
+
+# Editor/OS files.
+.DS_Store
+.idea/
+.vscode/
+*~
