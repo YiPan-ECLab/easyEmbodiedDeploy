@@ -18,12 +18,18 @@
 `0.26.0+cu128`、CUDA runtime `12.8`、cuDNN `9.19.0`、LeRobot `0.6.2`。
 当前 wheel 原生包含 `sm_80` 与 `sm_120`，因此：
 
-- NVIDIA A800（Ampere，`sm_80`）可以直接运行。
-- NVIDIA RTX PRO 6000 Blackwell（`sm_120`）可以直接运行。
+- NVIDIA A800（Ampere，`sm_80`）可以直接运行，使用 R570
+  `570.86.10` 或更新驱动。
+- NVIDIA RTX PRO 6000 Blackwell（`sm_120`）可以直接运行，使用 R575
+  `575.51.03` 或更新驱动；推荐直接使用 R580 当前生产驱动。
 
-目标机使用 **NVIDIA Linux 驱动 570.86 或更高版本**。无需安装系统级 CUDA
-Toolkit；PyTorch wheel 已包含运行时库。只有编译自定义 CUDA 扩展时才建议另装
-CUDA Toolkit 12.8。目标机驱动可以比 12.8 更新，例如当前的 580 驱动。
+无需安装系统级 CUDA Toolkit；PyTorch wheel 已包含运行时库。只有编译自定义
+CUDA 扩展时才建议另装 CUDA Toolkit 12.8。驱动可以比 CUDA 12.8 随附版本更新，
+例如当前的 580.173.02。
+
+官方依据：[CUDA 12.8 Release Notes](https://docs.nvidia.com/cuda/archive/12.8.0/cuda-toolkit-release-notes/)、
+[NVIDIA Blackwell 驱动表](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/deployment-considerations.html)、
+[PyTorch cu128 安装索引](https://pytorch.org/get-started/previous-versions/)。
 
 ## 仓库内容与依赖记录
 
@@ -57,7 +63,7 @@ Orbbec 源码镜像中的多平台预编译库、生成后的 HTML 文档和示�
 nvidia-smi
 ```
 
-驱动版本应不低于 570.86。安装通用系统工具：
+驱动版本按上表选择，并确保 `nvidia-smi` 能正确显示目标 GPU。安装通用系统工具：
 
 ```bash
 sudo apt update
@@ -190,8 +196,8 @@ thirdParty/.venvs/lerobot-pi05/bin/python scripts/LerobotTrainer/trainer_app.py
 ## 常见问题
 
 **`torch.cuda.is_available()` 为 false**：先看 `nvidia-smi`。如果该命令失败，
-先修复 NVIDIA 驱动；如果驱动低于 570.86，升级驱动后重启。系统是否安装
-`/usr/local/cuda` 不决定当前 wheel 能否运行。
+先修复 NVIDIA 驱动；如果低于对应 GPU 的上表版本，升级驱动后重启。系统是否
+安装 `/usr/local/cuda` 不决定当前 wheel 能否运行。
 
 **提示 `no kernel image is available`**：运行
 `bash thirdParty/setup_envs.sh --check` 查看 compiled architectures。当前锁定 wheel
