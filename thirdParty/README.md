@@ -79,7 +79,7 @@ uv --version
 ```bash
 mkdir -p /home/py/main
 cd /home/py/main
-git clone --recurse-submodules <GitHub仓库URL> easyEmbodiedDeploy
+git clone --recurse-submodules https://github.com/YiPan-ECLab/easyEmbodiedDeploy.git easyEmbodiedDeploy
 cd easyEmbodiedDeploy
 ```
 
