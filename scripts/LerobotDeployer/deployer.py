@@ -17,6 +17,8 @@ AXES = tuple(
 )
 STATE_KEY = "observation.state"
 IMAGE_KEYS = tuple(f"observation.images.{name}" for name in CAMERAS)
+
+
 def _feature_names(feature: dict[str, Any]) -> tuple[str, ...]:
     names = feature.get("names")
     if isinstance(names, dict):
@@ -26,12 +28,35 @@ def _feature_names(feature: dict[str, Any]) -> tuple[str, ...]:
     return tuple(str(name) for name in names)
 
 
-def validate_dataset_contract(features: dict[str, dict[str, Any]]) -> None:
-    """Reject datasets whose order or camera contract differs from this robot."""
+def piper_feature_contract() -> dict[str, dict[str, Any]]:
+    """Build the dataset-shaped feature mapping required by LeRobot rollout APIs."""
+    features: dict[str, dict[str, Any]] = {
+        STATE_KEY: {
+            "dtype": "float32",
+            "shape": (14,),
+            "names": {"axes": list(AXES)},
+        },
+        "action": {
+            "dtype": "float32",
+            "shape": (14,),
+            "names": {"axes": list(AXES)},
+        },
+    }
+    for key in IMAGE_KEYS:
+        features[key] = {
+            "dtype": "image",
+            "shape": (224, 224, 3),
+            "names": ["height", "width", "channels"],
+        }
+    return features
+
+
+def validate_feature_contract(features: dict[str, dict[str, Any]]) -> None:
+    """Reject feature mappings whose axes or cameras differ from Piper."""
     required = {STATE_KEY, "action", *IMAGE_KEYS}
     missing = required.difference(features)
     if missing:
-        raise ValueError(f"dataset is missing deployment features: {sorted(missing)}")
+        raise ValueError(f"checkpoint is missing deployment features: {sorted(missing)}")
     for key in (STATE_KEY, "action"):
         feature = features[key]
         if tuple(feature.get("shape", ())) != (14,) or feature.get("dtype") != "float32":
@@ -47,11 +72,48 @@ def validate_dataset_contract(features: dict[str, dict[str, Any]]) -> None:
             raise ValueError(f"{key} must be an image/video feature")
 
 
-def dataset_features_for_rollout(
+def validate_checkpoint_contract(config: dict[str, Any]) -> None:
+    """Verify that checkpoint model features match the fixed Piper hardware contract."""
+    input_features = config.get("input_features")
+    output_features = config.get("output_features")
+    if not isinstance(input_features, dict) or not isinstance(output_features, dict):
+        raise ValueError("checkpoint config must contain input_features and output_features")
+
+    expected_inputs = {STATE_KEY, *IMAGE_KEYS}
+    missing = expected_inputs.difference(input_features)
+    if missing:
+        raise ValueError(f"checkpoint input_features are missing: {sorted(missing)}")
+    unexpected = set(input_features).difference(expected_inputs)
+    if unexpected:
+        raise ValueError(f"checkpoint has unsupported input_features: {sorted(unexpected)}")
+
+    expected = {
+        STATE_KEY: ("STATE", (14,)),
+        **{key: ("VISUAL", (3, 224, 224)) for key in IMAGE_KEYS},
+    }
+    for key, (feature_type, shape) in expected.items():
+        feature = input_features[key]
+        if str(feature.get("type", "")).upper() != feature_type or tuple(
+            feature.get("shape", ())
+        ) != shape:
+            raise ValueError(
+                f"checkpoint {key} must be {feature_type}{shape}, got {feature}"
+            )
+
+    if set(output_features) != {"action"}:
+        raise ValueError("checkpoint output_features must contain only action")
+    action = output_features["action"]
+    if str(action.get("type", "")).upper() != "ACTION" or tuple(
+        action.get("shape", ())
+    ) != (14,):
+        raise ValueError(f"checkpoint action must be ACTION(14,), got {action}")
+
+
+def features_for_rollout(
     features: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
     """Return the policy subset with LeRobot's vector names flattened."""
-    validate_dataset_contract(features)
+    validate_feature_contract(features)
     result: dict[str, dict[str, Any]] = {}
     for key in (STATE_KEY, "action", *IMAGE_KEYS):
         feature = dict(features[key])

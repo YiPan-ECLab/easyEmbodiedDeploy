@@ -11,16 +11,51 @@
 VENV=/home/py/main/easyEmbodiedDeploy/thirdParty/.venvs/piper-home
 $VENV/bin/python record.py --check
 $VENV/bin/python record.py
+# 例如：20 Hz 采样，并把开始动作阈值调到 0.02 rad
+$VENV/bin/python record.py --hz 20 --start-joint-delta-rad 0.02
 ```
 
 默认写入：
-`/home/py/main/easyEmbodiedDeploy/datasets/pyagxarm_recordings`。可通过
+`/home/py/main/easyEmbodiedDeploy/datasets/hdf5/pyagxarm_recordings`。可通过
 `--output DIR` 修改。
 
-启动后会先检查四路 CAN，连接三台相机和四台机械臂并回零。输入任务指令后，
+启动后会先检查四路 CAN，连接三台相机和四台机械臂并回零。四台臂均使用关节反馈
+闭环运动到六关节零位，leader 到位后恢复零力拖动。启动检查会确认两个
+follower 的关节与夹爪反馈，并通过示教器参数查询确认两个 leader 夹爪示教器在线。
+回零时，两个 leader 会临时切换到 follower 受控模式；示教臂关节进入位置控制并到达
+ZERO 后，再将 leader 和 follower 的四个夹爪全部闭合到 `0 m`，最后恢复 leader
+零力拖动。输入任务指令后，
 相机完整画面会等比例缩放并用黑边补到 `224x224`，不会裁掉左右视野。程序把
-左右 J6 预定位到 -45/+45 度，启动 200 Hz 跟随并以 10 Hz 采样。录制时
-按回车结束，机械臂回零期间仍继续采样，随后选择保存或丢弃。
+左右 J6 预定位到 -45/+45 度，启动 200 Hz 跟随并默认以 30 Hz 采样。录制时
+按回车结束。预定位完成后先建立静止动作基线；在真人动作超过
+`--start-joint-delta-rad`（默认 `0.01 rad`）或
+`--start-gripper-delta-m`（默认 `0.002 m`）前，只读取诊断数据而不写入 episode，
+因此 J6 内旋后的等待静止帧不会进入最终文件。检测到动作后才开始记录 task 帧，
+机械臂回零期间仍继续采样，随后选择保存或丢弃。任务阶段如果相邻
+采样间隔超过 `--max-task-gap-s`（默认 `0.35 s`），程序会停止本次录制并拒绝保存，
+避免把设备阻塞或系统调度造成的长空档混入训练数据；错误信息会同时给出相机读取和
+机器人反馈耗时。
+
+可用采集参数：`--hz` 控制写入采样频率；`--max-task-gap-s` 控制任务段允许的最大
+实际间隔；`--start-joint-delta-rad` 和 `--start-gripper-delta-m` 控制从静止等待切换
+到正式记录的动作阈值。它们不会改变 200 Hz 的 leader/follower 跟随频率。
+
+跟随线程以 200 Hz 轮询 leader 反馈，只在关节或夹爪实际数值变化时发送
+`move_js`/`move_gripper_m`。最新 Piper 固件会保持最新 JS 目标，静止时不需要重复
+发送相同控制帧，避免无效 CAN 流量影响反馈采集。
+
+leader 的六关节控制量由 `0x155`、`0x156`、`0x157` 三组 CAN 帧组成。程序只有在
+三组时间戳都完成一次刷新后才组装并下发动作，接管瞬间不会把尚未填满的零值半帧
+发送给 follower；上一条轨迹遗留的夹爪 `0x159` 帧也会按时间戳丢弃。
+
+夹爪两类 CAN 数据不能混用：受控模式下四个夹爪均通过 `get_gripper_status()` 读取
+`0x2A8` 状态并确认回零；恢复 leader 模式后，leader 夹爪示教器在真人操作时发送
+`0x159` 控制帧，程序通过 `get_gripper_ctrl_states()` 读取并转发给 follower。
+leader 静止时没有周期性的 `0x159`，此时返回 `None` 是正常行为，不表示连接失败。
+
+HDF5 落盘时会处理机械边界附近的编码器误差：关节超出官方边界不超过 `1°`、夹爪
+超出 `[0,0.1] m` 不超过 `0.001 m` 时，`state` 和 `action` 会截断为边界值；更大的
+越界仍拒绝保存。根节点属性 `boundary_clipped_values` 记录本次截断的数值个数。
 
 ## HDF5 控制量
 
@@ -58,7 +93,8 @@ J5 `[-1.221730, 1.221730]`、J6 `[-2.094396, 2.094396]` rad；两台 follower
 └── data/demo_0
     ├── actions, left_actions, right_actions
     ├── states, robot_states -> states
-    ├── timestamps, camera_timestamps, action_source_timestamps
+    ├── timestamps, scheduled_timestamps, camera_timestamps, action_source_timestamps
+    ├── capture_durations, camera_durations, robot_durations
     ├── trajectory_phase, rewards, dones
     └── obs
         ├── agentview, left_eye_in_hand, right_eye_in_hand
@@ -84,8 +120,11 @@ J5 `[-1.221730, 1.221730]`、J6 `[-2.094396, 2.094396]` rad；两台 follower
 | `obs/left/right_gripper_force` | `(T,1)` | N；新版为 SDK 反馈，迁移的历史文件为 `NaN`（旧采集未保存） |
 | `obs/agentview` 等三路图像 | `(T,224,224,3)` | RGB `uint8`，每通道 `[0,255]` |
 | `timestamps` | `(T,)` | s，相对 episode 第一帧 |
+| `scheduled_timestamps` | `(T,)` | s，采样循环计划时刻，用于诊断调度延迟 |
 | `camera_timestamps` | `(T,3)` | s，三路相机相对 episode 第一帧，可有很小负值 |
 | `action_source_timestamps` | `(T,2)` | s，左右 leader 最新命令相对 episode 第一帧 |
+| `capture_durations` | `(T,)` | s，每帧相机读取加机器人反馈总耗时 |
+| `camera_durations`, `robot_durations` | `(T,)` | s，分别记录相机读取和机器人反馈耗时 |
 | `trajectory_phase` | `(T,)` | 枚举：`0=task`，`1=home` |
 | `rewards` | `(T,)` | 无量纲；Recorder 当前写 0 |
 | `dones` | `(T,)` | 布尔值；仅最后一帧为 true |

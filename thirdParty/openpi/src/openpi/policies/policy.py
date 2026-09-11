@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 import logging
+import os
 import pathlib
 import time
 from typing import Any, TypeAlias
@@ -61,14 +62,45 @@ class Policy(BasePolicy):
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            self._sample_actions = nnx_utils.module_jit(
+                model.sample_actions,
+                static_argnames=("prefix_attention_schedule", "guidance_action_dim", "rtc_sample_mode"),
+            )
             self._rng = rng or jax.random.key(0)
+
+    _REALTIME_FIELDS = (
+        "prev_action_chunk",
+        "prefix_attention_start",
+        "prefix_attention_horizon",
+        "prefix_attention_schedule",
+        "max_guidance_weight",
+        "guidance_action_dim",
+        "guidance_action_mask",
+        "rtc_sample_mode",
+    )
+    _SAMPLE_CONTROL_FIELDS = ("noise", "num_steps")
 
     @override
     def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        realtime_kwargs: dict[str, Any] = {}
+        control_kwargs: dict[str, Any] = {}
+        if isinstance(inputs, dict):
+            for key in self._REALTIME_FIELDS:
+                if key in inputs:
+                    realtime_kwargs[key] = inputs.pop(key)
+            for key in self._SAMPLE_CONTROL_FIELDS:
+                if key in inputs:
+                    control_kwargs[key] = inputs.pop(key)
+        # Normalize the previous chunk with exactly the same input pipeline as
+        # training actions before it reaches the guidance sampler.
+        prev_raw = realtime_kwargs.pop("prev_action_chunk", None)
+        if prev_raw is not None and isinstance(inputs, dict):
+            inputs["actions"] = np.asarray(prev_raw, dtype=np.float32)
         inputs = self._input_transform(inputs)
+        if prev_raw is not None and isinstance(inputs, dict) and "actions" in inputs:
+            realtime_kwargs["prev_action_chunk"] = inputs.pop("actions")
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
             inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
@@ -80,12 +112,31 @@ class Policy(BasePolicy):
 
         # Prepare kwargs for sample_actions
         sample_kwargs = dict(self._sample_kwargs)
+        if "num_steps" in control_kwargs:
+            sample_kwargs["num_steps"] = int(control_kwargs["num_steps"])
+        if noise is None and "noise" in control_kwargs:
+            noise = np.asarray(control_kwargs["noise"], dtype=np.float32)
         if noise is not None:
             noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
 
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+
+        if realtime_kwargs and not self._is_pytorch_model:
+            realtime_kwargs.setdefault("rtc_sample_mode", os.environ.get("OPENPI_RTC_SAMPLE_MODE", "guidance"))
+            prev = realtime_kwargs.get("prev_action_chunk")
+            if prev is not None:
+                prev = np.asarray(prev, dtype=np.float32)
+                if prev.ndim == 2:
+                    prev = prev[None, ...]
+                realtime_kwargs["prev_action_chunk"] = jnp.asarray(prev)
+            action_mask = realtime_kwargs.get("guidance_action_mask")
+            if action_mask is not None:
+                realtime_kwargs["guidance_action_mask"] = jnp.asarray(
+                    np.asarray(action_mask, dtype=np.float32)
+                )
+            sample_kwargs.update(realtime_kwargs)
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()

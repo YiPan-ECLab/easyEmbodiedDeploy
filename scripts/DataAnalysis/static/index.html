@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <link rel="icon" href="data:,">
+    <title>Piper Data Inspector</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header>
+      <div class="brand"><span class="mark">QA</span><div><p>PIPER DATA OBSERVATORY</p><h1>Data Inspector</h1></div></div>
+      <span id="connection" class="connection"><i></i><b>连接中</b></span>
+    </header>
+    <main>
+      <section class="hero-strip">
+        <div><small>检查状态</small><strong id="metricStatus">未运行</strong><span id="metricStatusMeta">只读 CPU 分析</span></div>
+        <div><small id="metricUnitLabel">文件 / Episode</small><strong id="metricUnits">—</strong><span>完整逐条验证</span></div>
+        <div><small>数据帧</small><strong id="metricFrames">—</strong><span id="metricFramesMeta">等待报告</span></div>
+        <div><small>质量问题</small><strong id="metricErrors">—</strong><span id="metricWarnings">—</span></div>
+      </section>
+
+      <section class="workbench">
+        <section class="controls">
+          <div class="section-head"><div><p>ANALYSIS PROFILE</p><h2>检查配置</h2></div><span class="readonly">只读</span></div>
+          <div class="mode-switch">
+            <label><input type="radio" name="kind" value="hdf5" checked><span><b>HDF5</b><small>Recorder 原始数据</small></span></label>
+            <label><input type="radio" name="kind" value="lerobot"><span><b>LeRobot</b><small>转换后 v3 bundle</small></span></label>
+          </div>
+          <label class="field"><span>分析路径</span><input id="path" spellcheck="false"></label>
+          <div id="hdf5Options" class="option-grid">
+            <label class="field"><span>期望采样频率</span><span class="unit-input"><input id="expectedFps" type="number" min="1" step="1"><i>Hz</i></span></label>
+            <label class="field"><span>显著间隔系数</span><input id="gapFactor" type="number" min="1.01" step="0.1"></label>
+          </div>
+          <label id="sourceField" class="field hidden"><span>源 HDF5 目录 <small>留空从 processing.json 读取</small></span><input id="sourceDir" spellcheck="false"></label>
+          <div class="actions">
+            <button id="start" class="primary" type="button"><span>▶</span>开始全面检查</button>
+            <button id="cancel" class="danger hidden" type="button"><span>■</span>停止检查</button>
+          </div>
+          <p id="note">检查不会修改原始文件或 LeRobot 数据集。</p>
+        </section>
+
+        <section class="gates">
+          <div class="section-head"><div><p>QUALITY GATES</p><h2>验收项目</h2></div><span id="reportBadge" class="badge neutral">WAIT</span></div>
+          <ul id="gateList">
+            <li><i></i><span><b>结构与语义</b><small>Schema、轴序、单位、动作模式</small></span></li>
+            <li><i></i><span><b>时序完整性</b><small>采样频率、相邻间隔、索引连续</small></span></li>
+            <li><i></i><span><b>动作有效性</b><small>Piper 限位、NaN/Inf、delta 重算</small></span></li>
+            <li><i></i><span><b>阶段边界</b><small>首部接管、尾部静止、home 排除</small></span></li>
+            <li><i></i><span><b>视觉数据</b><small>三路相机、同步、尺寸与视频帧数</small></span></li>
+            <li><i></i><span><b>统计量</b><small>count、均值、方差与分位数顺序</small></span></li>
+          </ul>
+          <div class="progress"><i id="progress"></i></div>
+          <div class="run-status"><span id="runMessage">等待开始</span><b id="elapsed">—</b></div>
+        </section>
+      </section>
+
+      <section id="report" class="report hidden">
+        <div class="report-head"><div><p>QUALITY REPORT</p><h2 id="reportTitle">分析结果</h2><small id="reportPath"></small></div><div><button id="download" type="button">↓ 导出 JSON</button></div></div>
+        <div id="sourceSummary" class="source-summary hidden"></div>
+        <div id="messages" class="messages hidden"></div>
+        <div class="table-tools"><input id="search" type="search" placeholder="筛选文件或 episode"><label><input id="issues" type="checkbox">只看问题</label></div>
+        <div class="table-wrap"><table><thead id="tableHead"></thead><tbody id="tableBody"></tbody></table></div>
+      </section>
+    </main>
+    <div id="toast" class="toast"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -12,6 +12,8 @@ from typing import Any
 
 SIDES = ("left", "right")
 ZERO_JOINTS = (0.0,) * 6
+GRIPPER_LIMITS_M = (0.0, 0.1)
+HARDWARE_TOLERANCE_M = 1e-3
 JOINT_LIMITS_RAD = (
     (-2.617994, 2.617994),
     (0.0, 3.141593),
@@ -71,6 +73,11 @@ def _message_values(message, length: int, name: str) -> tuple[float, ...]:
     return tuple(float(value) for value in message.msg)
 
 
+def _normalize_gripper_width(value: float, maximum: float, name: str) -> float:
+    value = float(value)
+    return min(maximum, max(GRIPPER_LIMITS_M[0], value))
+
+
 class PiperPair:
     def __init__(
         self,
@@ -83,7 +90,6 @@ class PiperPair:
         home_speed: int,
         home_timeout_s: float,
         home_tolerance_deg: float,
-        home_leader_wait_s: float,
         preposition_speed: int,
         preposition_timeout_s: float,
         zero_tolerance_deg: float,
@@ -101,7 +107,6 @@ class PiperPair:
         self.home_speed = home_speed
         self.home_timeout_s = home_timeout_s
         self.home_tolerance = math.radians(home_tolerance_deg)
-        self.home_leader_wait_s = home_leader_wait_s
         self.preposition_speed = preposition_speed
         self.preposition_timeout_s = preposition_timeout_s
         self.zero_tolerance = math.radians(zero_tolerance_deg)
@@ -123,6 +128,7 @@ class PiperPair:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: Exception | None = None
+        self._last_sample_durations: dict[str, float] = {}
 
     def _create_arm(self, channel: str):
         from pyAgxArm import AgxArmFactory, ArmModel, create_agx_arm_config
@@ -135,8 +141,8 @@ class PiperPair:
         arm = AgxArmFactory.create_arm(config)
         gripper = arm.init_effector(arm.OPTIONS.EFFECTOR.AGX_GRIPPER)
         arm.set_joint_limits_enabled(True)
-        arm.connect()
         self._ports.callback(arm.disconnect)
+        arm.connect()
         return arm, gripper
 
     def connect(self) -> None:
@@ -146,8 +152,14 @@ class PiperPair:
         self.follower.set_follower_mode()
         self.leader.set_leader_mode()
         self.leader.restore_leader_drag_mode()
+        pendant = self.leader_gripper.get_gripper_teaching_pendant_param(
+            timeout=2.0, min_interval=0.0
+        )
+        if pendant is None:
+            raise RuntimeError(f"{self.leader_name} 夹爪示教器没有响应")
         print(
-            f"{self.side}: {self.leader_name}(leader) -> {self.follower_name}(follower)"
+            f"{self.side}: {self.leader_name}(leader) -> "
+            f"{self.follower_name}(follower)，夹爪示教器在线"
         )
 
     def _wait_follower_feedback(
@@ -156,7 +168,10 @@ class PiperPair:
         deadline = time.monotonic() + timeout
         for now in ticks(50):
             joints = self.follower.get_joint_angles()
-            fresh = joints is not None and (after is None or joints.timestamp > after)
+            fresh = joints is not None and (
+                after is None
+                or joints.timestamp > after
+            )
             if (
                 fresh
                 and self.follower.get_flange_pose() is not None
@@ -218,7 +233,26 @@ class PiperPair:
             raise RuntimeError(f"{self.follower_name} 没有夹爪反馈")
         if status.msg.mode != "width":
             raise RuntimeError(f"{self.follower_name} 夹爪不是 width 模式")
-        return min(self.gripper_max_width, max(0.0, float(status.msg.value)))
+        return _normalize_gripper_width(
+            status.msg.value, self.gripper_max_width, self.follower_name
+        )
+
+    def _enter_leader_control_mode(self, timeout: float = 5.0):
+        previous = self.leader.get_joint_angles()
+        previous_timestamp = 0.0 if previous is None else previous.timestamp
+        self._leader_is_follower = True
+        deadline = time.monotonic() + timeout
+        for now in ticks(20):
+            # Mode configuration is a single CAN frame. Repeat it until the
+            # controller starts publishing follower-mode joint feedback.
+            self.leader.set_follower_mode()
+            joints = self.leader.get_joint_angles()
+            if joints is not None and joints.timestamp > previous_timestamp:
+                return joints
+            if now >= deadline:
+                raise RuntimeError(
+                    f"{self.leader_name} 切换 follower 后没有关节反馈"
+                )
 
     def preposition(self) -> None:
         follower_joints = _message_values(
@@ -227,19 +261,7 @@ class PiperPair:
         if max(map(abs, follower_joints)) > self.zero_tolerance:
             raise RuntimeError(f"{self.follower_name} 不在 ZERO")
 
-        previous = self.leader.get_joint_angles()
-        previous_timestamp = previous.timestamp if previous is not None else 0.0
-        self.leader.set_follower_mode()
-        self._leader_is_follower = True
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            joints = self.leader.get_joint_angles()
-            if joints is not None and joints.timestamp > previous_timestamp:
-                break
-            time.sleep(0.02)
-        else:
-            raise RuntimeError(f"{self.leader_name} 切换 follower 后没有关节反馈")
-
+        joints = self._enter_leader_control_mode()
         if (
             max(map(abs, _message_values(joints, 6, f"{self.leader_name} 关节")))
             > self.zero_tolerance
@@ -277,23 +299,67 @@ class PiperPair:
             )
             time.sleep(0.01)
 
-        self._restore_teaching()
-        leader_joints = self.leader.get_leader_joint_angles()
+        joint_timestamps = self._leader_joint_group_timestamps()
         leader_gripper = self.leader_gripper.get_gripper_ctrl_states()
+        self._restore_teaching()
         self._error = None
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._follow_loop,
             args=(
                 command,
-                0.0 if leader_joints is None else leader_joints.timestamp,
-                0.0 if leader_gripper is None else leader_gripper.timestamp,
+                joint_timestamps,
+                0.0
+                if leader_gripper is None
+                else leader_gripper.timestamp,
             ),
             name=f"pyagxarm-follow-{self.side}",
             daemon=True,
         )
         self._thread.start()
         print(f"{self.side}: 跟随已启动 ({self.follow_hz:g} Hz)")
+
+    def _leader_joint_group_timestamps(self) -> tuple[float, float, float]:
+        parser = self.leader._parser
+        return tuple(
+            0.0 if message is None else float(message.timestamp)
+            for message in (
+                getattr(parser, "leader_joint_12", None),
+                getattr(parser, "leader_joint_34", None),
+                getattr(parser, "leader_joint_56", None),
+            )
+        )
+
+    def _complete_leader_joints(
+        self, previous_timestamps: tuple[float, float, float]
+    ) -> tuple[tuple[float, ...], tuple[float, float, float]] | None:
+        parser = self.leader._parser
+        messages = (
+            getattr(parser, "leader_joint_12", None),
+            getattr(parser, "leader_joint_34", None),
+            getattr(parser, "leader_joint_56", None),
+        )
+        if any(message is None for message in messages):
+            return None
+        timestamps = tuple(float(message.timestamp) for message in messages)
+        if any(
+            timestamp <= previous
+            for timestamp, previous in zip(timestamps, previous_timestamps)
+        ):
+            return None
+        values = (
+            float(messages[0].msg.joint_1),
+            float(messages[0].msg.joint_2),
+            float(messages[1].msg.joint_3),
+            float(messages[1].msg.joint_4),
+            float(messages[2].msg.joint_5),
+            float(messages[2].msg.joint_6),
+        )
+        # If the receive thread updated a group while values were copied, wait
+        # for the next loop instead of combining two CAN cycles.
+        if timestamps != tuple(float(message.timestamp) for message in messages):
+            return None
+        return self._clamp_joints(values), timestamps
 
     @staticmethod
     def _clamp_joints(values) -> tuple[float, ...]:
@@ -303,7 +369,10 @@ class PiperPair:
         )
 
     def _follow_loop(
-        self, command: ArmCommand, joint_timestamp: float, gripper_timestamp: float
+        self,
+        command: ArmCommand,
+        joint_timestamps: tuple[float, float, float],
+        gripper_timestamp: float,
     ) -> None:
         next_check = time.monotonic() + self.status_period_s
         try:
@@ -312,46 +381,46 @@ class PiperPair:
                 width = command.gripper_width
                 changed = False
 
-                joint_message = self.leader.get_leader_joint_angles()
-                if (
-                    joint_message is not None
-                    and joint_message.timestamp != joint_timestamp
-                ):
-                    joints = self._clamp_joints(joint_message.msg)
-                    joint_timestamp = joint_message.timestamp
-                    changed = True
+                joint_frame = self._complete_leader_joints(joint_timestamps)
+                if joint_frame is not None:
+                    candidate_joints, joint_timestamps = joint_frame
+                    if candidate_joints != joints:
+                        joints = candidate_joints
+                        changed = True
 
                 gripper_message = self.leader_gripper.get_gripper_ctrl_states()
                 if (
                     gripper_message is not None
-                    and gripper_message.timestamp != gripper_timestamp
+                    and gripper_message.timestamp > gripper_timestamp
                 ):
-                    if gripper_message.msg.status_code not in (0, 1, 2, 3):
-                        raise RuntimeError(
-                            f"{self.leader_name} 夹爪控制回显不是 width 模式"
-                        )
-                    width = min(
+                    candidate_width = _normalize_gripper_width(
+                        gripper_message.msg.value,
                         self.gripper_max_width,
-                        max(0.0, abs(float(gripper_message.msg.value))),
+                        self.leader_name,
                     )
-                    gripper_timestamp = gripper_message.timestamp
-                    changed = True
+                    message_timestamp = gripper_message.timestamp
+                    gripper_timestamp = message_timestamp
+                    if candidate_width != width:
+                        width = candidate_width
+                        changed = True
 
-                command = ArmCommand(
-                    joints,
-                    width,
-                    now if changed else command.timestamp,
-                )
+                if changed:
+                    # SocketCAN message timestamps use the Unix clock, while the
+                    # recorder timeline uses time.monotonic(). Stamp accepted
+                    # commands on the recorder clock so HDF5 diagnostics remain
+                    # comparable with episode timestamps.
+                    command = ArmCommand(joints, width, now)
                 with self._lock:
                     self._command = command
-                # Real-time leader/follower control uses JS passthrough mode.
-                # Unlike move_j(), move_js() avoids position-trajectory
-                # smoothing, reducing teleoperation lag while preserving the
-                # existing 200 Hz Python control loop.
-                self.follower.move_js(list(command.joints))
-                self.follower_gripper.move_gripper_m(
-                    command.gripper_width, force=self.gripper_force
-                )
+                # Poll leader feedback at follow_hz, but only send a control
+                # frame when the target value actually changes. The current
+                # Piper firmware retains the latest JS target, so repeating
+                # identical frames only adds CAN traffic.
+                if changed:
+                    self.follower.move_js(list(command.joints))
+                    self.follower_gripper.move_gripper_m(
+                        command.gripper_width, force=self.gripper_force
+                    )
 
                 if now >= next_check:
                     self._check_status(self.follower, self.follower_name)
@@ -362,22 +431,40 @@ class PiperPair:
     def sample(self) -> ArmSample:
         if self._error is not None:
             raise RuntimeError(f"{self.side} 跟随停止: {self._error}") from self._error
+        started_at = time.monotonic()
+        joint_started_at = started_at
         joints = _message_values(
             self.follower.get_joint_angles(), 6, f"{self.follower_name} 关节"
         )
+        joint_duration = time.monotonic() - joint_started_at
+        pose_started_at = time.monotonic()
         pose = _message_values(
             self.follower.get_flange_pose(), 6, f"{self.follower_name} 法兰位姿"
         )
+        pose_duration = time.monotonic() - pose_started_at
+        gripper_started_at = time.monotonic()
         gripper = self.follower_gripper.get_gripper_status()
         if gripper is None or gripper.msg.mode != "width":
             raise RuntimeError(f"{self.follower_name} 缺少 width 模式夹爪反馈")
+        width = _normalize_gripper_width(
+            gripper.msg.value, self.gripper_max_width, self.follower_name
+        )
+        # Firmware versions expose different force feedback scales. Preserve
+        # the SDK value for logging; force feedback is not a control gate.
+        force = float(gripper.msg.force)
+        self._last_sample_durations = {
+            "joints": joint_duration,
+            "pose": pose_duration,
+            "gripper": time.monotonic() - gripper_started_at,
+            "total": time.monotonic() - started_at,
+        }
         with self._lock:
             command = self._command
         return ArmSample(
             joints,
             pose,
-            float(gripper.msg.value),
-            float(gripper.msg.force),
+            width,
+            force,
             command,
         )
 
@@ -387,9 +474,11 @@ class PiperPair:
             self._command = ArmCommand(ZERO_JOINTS, 0.0, time.monotonic())
 
     def _home_gripper(self, gripper: Any, name: str) -> None:
-        """Close a gripper to 0 m and require fresh width feedback at zero."""
+        """Close a gripper to 0 m and require fresh feedback at zero."""
         previous = gripper.get_gripper_status()
-        previous_timestamp = previous.timestamp if previous is not None else 0.0
+        previous_timestamp = (
+            0.0 if previous is None else previous.timestamp
+        )
         deadline = time.monotonic() + self.gripper_home_timeout_s
         settled = 0
         for now in ticks(20):
@@ -398,35 +487,95 @@ class PiperPair:
             if status is not None and status.msg.mode != "width":
                 raise RuntimeError(f"{name} 夹爪不是 width 模式")
             fresh = status is not None and status.timestamp > previous_timestamp
-            at_zero = fresh and abs(float(status.msg.value)) <= self.gripper_home_tolerance_m
+            value = None if status is None else _normalize_gripper_width(
+                status.msg.value, self.gripper_max_width, name
+            )
+            at_zero = fresh and value is not None and value <= self.gripper_home_tolerance_m
             settled = settled + 1 if at_zero else 0
             if settled >= 3:
                 print(f"{name}: 夹爪 ZERO 完成 (0 m)")
                 return
             if now >= deadline:
-                value = None if status is None else float(status.msg.value)
                 raise RuntimeError(f"{name} 夹爪回零超时，当前宽度={value!r} m")
 
-    def home_follower(self) -> None:
-        self._move_to(
-            {self.follower_name: self.follower},
-            ZERO_JOINTS,
-            speed=self.home_speed,
-            timeout=self.home_timeout_s,
-            tolerance=self.home_tolerance,
-            hz=50,
-        )
-        print(f"{self.follower_name}: ZERO 完成")
-        self._home_gripper(self.follower_gripper, self.follower_name)
-
-    def home_leader(self) -> None:
-        self.leader.move_leader_to_home()
-        time.sleep(self.home_leader_wait_s)
+    def home_synchronized(self, start_barrier: threading.Barrier) -> None:
+        """Home a pair while the follower tracks the leader's smooth trajectory."""
         try:
-            self._home_gripper(self.leader_gripper, self.leader_name)
+            # This mode transition runs while HOME frames are already being
+            # sampled. The barrier below still prevents either pair from
+            # moving before both leaders are ready.
+            self._enter_leader_control_mode()
+            for name, arm in (
+                (self.leader_name, self.leader),
+                (self.follower_name, self.follower),
+            ):
+                arm.set_speed_percent(self.home_speed)
+                self._wait_enabled(arm, name)
+            try:
+                start_barrier.wait(timeout=5.0)
+            except threading.BrokenBarrierError as exc:
+                raise RuntimeError("左右两组机械臂回零启动同步失败") from exc
+
+            deadline = time.monotonic() + self.home_timeout_s
+            next_check = time.monotonic()
+            settled = 0
+            for now in ticks(self.follow_hz):
+                # Let move_j generate one smooth physical trajectory on the
+                # leader. Tracking its measured position keeps the follower
+                # from starting or finishing ahead of the leader.
+                self.leader.move_j(list(ZERO_JOINTS))
+                leader_joints = self._clamp_joints(
+                    _message_values(
+                        self.leader.get_joint_angles(),
+                        6,
+                        f"{self.leader_name} 关节",
+                    )
+                )
+                self.follower.move_js(list(leader_joints))
+                follower_joints = _message_values(
+                    self.follower.get_joint_angles(),
+                    6,
+                    f"{self.follower_name} 关节",
+                )
+
+                if now >= next_check:
+                    self._check_status(self.leader, self.leader_name)
+                    self._check_status(self.follower, self.follower_name)
+                    next_check = now + self.status_period_s
+                ready = all(
+                    max(map(abs, joints)) <= self.home_tolerance
+                    for joints in (leader_joints, follower_joints)
+                )
+                settled = settled + 1 if ready else 0
+                if settled >= 3:
+                    break
+                if now >= deadline:
+                    raise RuntimeError(
+                        f"{self.leader_name}, {self.follower_name} 同步回零超时"
+                    )
+
+            # Leave the follower in the regular position-speed mode expected
+            # by the next J6 preposition operation.
+            self.follower.move_j(list(ZERO_JOINTS))
+            print(f"{self.leader_name}, {self.follower_name}: 同步 ZERO 完成")
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = (
+                    pool.submit(
+                        self._home_gripper,
+                        self.leader_gripper,
+                        self.leader_name,
+                    ),
+                    pool.submit(
+                        self._home_gripper,
+                        self.follower_gripper,
+                        self.follower_name,
+                    ),
+                )
+                for future in futures:
+                    future.result()
         finally:
-            self.leader.restore_leader_drag_mode()
-        print(f"{self.leader_name}: 主臂和夹爪回零完成")
+            self._restore_teaching()
+        print(f"{self.side}: 主从臂和两个夹爪回零完成")
 
     def stop_following(self) -> None:
         self._stop.set()
@@ -437,15 +586,32 @@ class PiperPair:
             self._thread = None
 
     def close(self) -> None:
-        with self._ports:
+        error = None
+        try:
             self.stop_following()
-            if self._leader_is_follower:
-                self._restore_teaching()
+        except Exception as exc:  # noqa: BLE001 - preserve shutdown errors
+            error = exc
+        finally:
+            try:
+                if self._leader_is_follower:
+                    self._restore_teaching()
+            except Exception as exc:  # noqa: BLE001 - preserve shutdown errors
+                if error is None:
+                    error = exc
+            finally:
+                try:
+                    self._ports.close()
+                except Exception as exc:  # noqa: BLE001 - preserve shutdown errors
+                    if error is None:
+                        error = exc
+        if error is not None:
+            print(f"{self.side}: 关闭资源时出现警告: {error}")
 
 
 class DualPiper:
     def __init__(self, pipers: dict[str, dict], **motion):
         self.pairs = {side: PiperPair(side, **pipers[side], **motion) for side in SIDES}
+        self._sample_pool = ThreadPoolExecutor(max_workers=len(SIDES), thread_name_prefix="piper-sample")
 
     def _run_parallel(self, operation: Callable[[PiperPair], None]) -> None:
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -466,18 +632,21 @@ class DualPiper:
         self._run_parallel(PiperPair.start_following)
 
     def sample(self) -> dict[str, ArmSample]:
-        return {side: pair.sample() for side, pair in self.pairs.items()}
+        futures = {side: self._sample_pool.submit(pair.sample) for side, pair in self.pairs.items()}
+        return {side: future.result() for side, future in futures.items()}
+
+    def sample_diagnostics(self) -> dict[str, dict[str, float]]:
+        return {side: dict(pair._last_sample_durations) for side, pair in self.pairs.items()}
 
     def home(
         self, on_sample: Callable[[], None] | None = None, sample_hz: float = 20
     ) -> None:
-        for pair in self.pairs.values():
-            pair.prepare_home()
-        with ThreadPoolExecutor(max_workers=4) as pool:
+        self._run_parallel(PiperPair.prepare_home)
+        start_barrier = threading.Barrier(len(self.pairs))
+        with ThreadPoolExecutor(max_workers=len(self.pairs)) as pool:
             futures = [
-                pool.submit(method)
+                pool.submit(pair.home_synchronized, start_barrier)
                 for pair in self.pairs.values()
-                for method in (pair.home_follower, pair.home_leader)
             ]
             if on_sample is not None:
                 for _ in ticks(sample_hz):
@@ -488,5 +657,15 @@ class DualPiper:
                 future.result()
 
     def close(self) -> None:
-        for pair in self.pairs.values():
-            pair.close()
+        error = None
+        try:
+            for pair in self.pairs.values():
+                try:
+                    pair.close()
+                except Exception as exc:  # noqa: BLE001 - close all physical arms
+                    if error is None:
+                        error = exc
+        finally:
+            self._sample_pool.shutdown(wait=True, cancel_futures=True)
+        if error is not None:
+            print(f"关闭机械臂资源时出现警告: {error}")

@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts/PiperRecorder"))
 
 from piper_recorder.camera import open_cameras  # noqa: E402
-from piper_recorder.robot import DualPiper, verify_can_interface  # noqa: E402
+from piper_recorder.robot import DualPiper, ZERO_JOINTS, verify_can_interface  # noqa: E402
 from record import (  # noqa: E402
     CAMERA_FPS,
     CAMERA_HEIGHT,
@@ -36,7 +36,6 @@ from record import (  # noqa: E402
     GRIPPER_HOME_TIMEOUT_S,
     GRIPPER_HOME_TOLERANCE_M,
     GRIPPER_MAX_WIDTH_M,
-    HOME_LEADER_WAIT_S,
     HOME_SPEED,
     HOME_TIMEOUT_S,
     HOME_TOLERANCE_DEG,
@@ -88,10 +87,24 @@ def connect_followers(robot: DualPiper) -> None:
     _parallel(pairs, connect)
 
 
+def home_follower(pair: Any) -> None:
+    """Home one deployment follower without connecting its leader arm."""
+    pair._move_to(
+        {pair.follower_name: pair.follower},
+        ZERO_JOINTS,
+        speed=pair.home_speed,
+        timeout=pair.home_timeout_s,
+        tolerance=pair.home_tolerance,
+        hz=50,
+    )
+    print(f"{pair.follower_name}: ZERO 完成")
+    pair._home_gripper(pair.follower_gripper, pair.follower_name)
+
+
 def prepare_followers(robot: DualPiper) -> None:
     """Home and preposition only the two follower arms."""
     pairs = list(robot.pairs.values())
-    _parallel(pairs, lambda pair: pair.home_follower())
+    _parallel(pairs, home_follower)
 
     def preposition(pair) -> None:
         pair.follower.set_follower_mode()
@@ -111,7 +124,7 @@ def prepare_followers(robot: DualPiper) -> None:
 def home_followers(robot: DualPiper) -> None:
     """Return followers to ZERO without moving the leader arms."""
     pairs = list(robot.pairs.values())
-    _parallel(pairs, lambda pair: pair.home_follower())
+    _parallel(pairs, home_follower)
 
 
 def read_state(robot: DualPiper) -> np.ndarray:
@@ -123,6 +136,24 @@ def read_state(robot: DualPiper) -> np.ndarray:
     if result.shape != (14,) or not np.isfinite(result).all():
         raise RuntimeError("Piper returned an invalid 14-dimensional state")
     return result
+
+
+def low_pass_absolute_target(
+    previous: np.ndarray,
+    desired: np.ndarray,
+    *,
+    control_hz: float,
+    time_constant_s: float,
+) -> np.ndarray:
+    """Advance one filter tick between two absolute hardware targets.
+
+    Both delta and absolute policies reach the bridge as absolute targets, so
+    this filter is deliberately independent of the policy action convention.
+    """
+    if time_constant_s == 0:
+        return desired.copy()
+    alpha = -math.expm1(-1.0 / (control_hz * time_constant_s))
+    return previous + alpha * (desired - previous)
 
 
 class FollowerCommandLoop:
@@ -275,9 +306,12 @@ class FollowerCommandLoop:
                     tau = self._smoothing_time_constant_s
                     armed = self._armed
                 if armed:
-                    period = 1.0 / control_hz
-                    alpha = 1.0 if tau == 0 else -math.expm1(-period / tau)
-                    target = previous + alpha * (desired - previous)
+                    target = low_pass_absolute_target(
+                        previous,
+                        desired,
+                        control_hz=control_hz,
+                        time_constant_s=tau,
+                    )
                     now = time.monotonic()
                     for side, offset in (("left", 0), ("right", 7)):
                         pair = self.robot.pairs[side]
@@ -318,12 +352,7 @@ def make_reply(request: dict[str, Any], *, ok: bool, **payload: Any) -> dict[str
     }
 
 
-def serve(
-    endpoint: str,
-    *,
-    initial_control_hz: float,
-    initial_smoothing_time_constant_s: float,
-) -> None:
+def serve(endpoint: str) -> None:
     context = zmq.Context()
     socket = context.socket(zmq.REP)
     socket.setsockopt(zmq.LINGER, 0)
@@ -352,7 +381,6 @@ def serve(
                 home_speed=HOME_SPEED,
                 home_timeout_s=HOME_TIMEOUT_S,
                 home_tolerance_deg=HOME_TOLERANCE_DEG,
-                home_leader_wait_s=HOME_LEADER_WAIT_S,
                 preposition_speed=PREPOSITION_SPEED,
                 preposition_timeout_s=PREPOSITION_TIMEOUT_S,
                 zero_tolerance_deg=ZERO_TOLERANCE_DEG,
@@ -368,10 +396,6 @@ def serve(
             prepare_followers(robot)
             initial_state = read_state(robot)
             command_loop = FollowerCommandLoop(robot, initial_state)
-            command_loop.configure(
-                control_hz=initial_control_hz,
-                smoothing_time_constant_s=initial_smoothing_time_constant_s,
-            )
 
             def shutdown_hardware() -> None:
                 nonlocal command_loop
@@ -385,8 +409,7 @@ def serve(
             stack.callback(shutdown_hardware)
             ready = True
             print(
-                f"hardware bridge ready: {endpoint} | move_js={initial_control_hz:g} Hz "
-                f"| smoothing_tau={initial_smoothing_time_constant_s:g}s "
+                f"hardware bridge ready: {endpoint} | awaiting deployer motion config "
                 f"| joints=rad | grippers=[0, 0.1] m | followers only",
                 flush=True,
             )
@@ -485,25 +508,13 @@ def serve(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
-    parser.add_argument("--control-hz", type=float, default=DEFAULT_CONTROL_HZ)
-    parser.add_argument(
-        "--smoothing-time-constant",
-        type=float,
-        default=DEFAULT_SMOOTHING_TIME_CONSTANT_S,
-        help="absolute-target low-pass time constant in seconds; 0 disables filtering",
-    )
     args = parser.parse_args()
-    if not 1 <= args.control_hz <= 200:
-        parser.error("--control-hz must be in [1, 200]")
-    if not 0 <= args.smoothing_time_constant <= 2:
-        parser.error("--smoothing-time-constant must be in [0, 2]")
-    serve(
-        args.endpoint,
-        initial_control_hz=args.control_hz,
-        initial_smoothing_time_constant_s=args.smoothing_time_constant,
-    )
+    serve(args.endpoint)
 
 
 if __name__ == "__main__":

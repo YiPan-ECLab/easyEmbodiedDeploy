@@ -33,6 +33,14 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
 
     pytorch_compile_mode: str | None = "max-autotune"
+    # Training-time realtime chunking delay augmentation. Zero preserves the
+    # original OpenPI objective.
+    train_time_rtc_max_delay: int = 0
+    # OpenPI's named LoRA variants use fixed ranks upstream. These overrides
+    # let the local trainer expose the same rank/alpha controls as LeRobot.
+    lora_rank: int | None = None
+    lora_alpha: float | None = None
+    gradient_checkpointing: bool = True
 
     def __post_init__(self):
         if self.max_token_len is None:
@@ -46,6 +54,14 @@ class Pi0Config(_model.BaseModelConfig):
                 "max-autotune",
                 "max-autotune-no-cudagraphs",
             ]
+        if self.train_time_rtc_max_delay < 0:
+            raise ValueError("train_time_rtc_max_delay must be >= 0")
+        if self.train_time_rtc_max_delay >= self.action_horizon:
+            raise ValueError("train_time_rtc_max_delay must be smaller than action_horizon")
+        if self.lora_rank is not None and self.lora_rank < 1:
+            raise ValueError("lora_rank must be positive")
+        if self.lora_alpha is not None and self.lora_alpha <= 0:
+            raise ValueError("lora_alpha must be positive")
 
     @property
     @override

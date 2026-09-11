@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import re
 import sys
 import threading
 import time
 from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -18,11 +20,6 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DATASET = ROOT / (
-    "datasets/lerobot/"
-    "Remove_the_shipping_label_and_place_it_on_the_package_on_the_table_10hz_delta/"
-    "lerobot"
-)
 CHECKPOINT = ROOT / (
     "models/finetuned_models/pi05_run_lora_test/checkpoints/005000/pretrained_model"
 )
@@ -33,7 +30,8 @@ DEFAULT_INFERENCE_MODE = "rtc"
 DEFAULT_RTC_MODE = "guided"
 DEFAULT_RTC_HORIZON = 20
 DEFAULT_RTC_QUEUE_THRESHOLD = 40
-DEFAULT_DEVICE = "cuda"
+DEFAULT_DEVICE = "cuda:0"
+DEFAULT_POLICY_HZ = 10.0
 DEFAULT_CONTROL_HZ = 30.0
 DEFAULT_SMOOTHING_TIME_CONSTANT_S = 0.1
 DEFAULT_MAX_STEPS = 30
@@ -181,29 +179,15 @@ def resolve_path(path: Path) -> Path:
     return (path if path.is_absolute() else ROOT / path).resolve()
 
 
-def read_declared_action_mode(dataset_root: Path) -> str | None:
-    report = dataset_root.parent / "processing.json"
-    if not report.is_file():
-        return None
-    try:
-        value = json.loads(report.read_text(encoding="utf-8"))["settings"]["action_mode"]
-    except (KeyError, TypeError, ValueError):
-        return None
-    return "absolute_joint" if value == "absolute" else str(value)
-
-
 def validate_args(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
-    *,
-    dataset_fps: float,
-    declared_action_mode: str | None,
 ) -> float:
-    if args.hz <= 0 or args.hz > 200:
-        parser.error("--hz must be in (0, 200]")
+    if args.control_hz <= 0 or args.control_hz > 200:
+        parser.error("--control-hz must be in (0, 200]")
     if not 0 <= args.smoothing_time_constant <= 2:
         parser.error("--smoothing-time-constant must be in [0, 2]")
-    policy_hz = float(dataset_fps if args.policy_hz is None else args.policy_hz)
+    policy_hz = float(args.policy_hz)
     if policy_hz <= 0 or policy_hz > 200:
         parser.error("--policy-hz must be in (0, 200]")
     if args.max_steps < 0:
@@ -216,11 +200,16 @@ def validate_args(
         parser.error("--rtc-queue-threshold cannot be negative")
     if args.watchdog_timeout < 5:
         parser.error("--watchdog-timeout must be at least 5 seconds")
-    if declared_action_mode and declared_action_mode != args.action_mode:
-        parser.error(
-            f"dataset declares action_mode={declared_action_mode}, "
-            f"but --action-mode={args.action_mode}"
-        )
+    device_match = re.fullmatch(r"cuda(?::(\d+))?", args.device)
+    if args.device != "cpu" and device_match is None:
+        parser.error("--device must be cpu, cuda, or cuda:N (for example cuda:0)")
+    if device_match is not None and torch.cuda.is_available():
+        requested_index = int(device_match.group(1) or 0)
+        if requested_index >= torch.cuda.device_count():
+            parser.error(
+                f"--device={args.device} is unavailable; detected "
+                f"{torch.cuda.device_count()} CUDA device(s)"
+            )
     if args.rtc_mode == "trained" and args.inference_mode != "rtc":
         parser.error("--rtc-mode only applies when --inference-mode=rtc")
     return policy_hz
@@ -228,19 +217,23 @@ def validate_args(
 
 def load_policy(
     checkpoint: Path,
-    dataset_root: Path,
     device: str,
     rtc_config: Any | None,
 ):
     from lerobot.configs import PreTrainedConfig
-    from lerobot.datasets import LeRobotDatasetMetadata
     from lerobot.policies import make_policy, make_pre_post_processors
 
-    from deployer import validate_dataset_contract
+    from deployer import (
+        features_for_rollout,
+        piper_feature_contract,
+        validate_checkpoint_contract,
+    )
 
-    print("[ 10%] loading dataset metadata...", flush=True)
-    metadata = LeRobotDatasetMetadata("local/deploy", root=dataset_root)
-    validate_dataset_contract(metadata.features)
+    print("[ 10%] validating checkpoint feature contract...", flush=True)
+    raw_config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
+    validate_checkpoint_contract(raw_config)
+    feature_contract = piper_feature_contract()
+    features = features_for_rollout(feature_contract)
     config = PreTrainedConfig.from_pretrained(str(checkpoint))
     config.pretrained_path = str(checkpoint)
     config.device = device
@@ -259,7 +252,11 @@ def load_policy(
     thread = threading.Thread(target=pulse, daemon=True)
     thread.start()
     try:
-        policy = make_policy(config, ds_meta=metadata)
+        # LeRobot's factory currently requires a ds_meta or env_cfg object even for
+        # pretrained policies.  This in-memory shim supplies only the fixed Piper
+        # feature contract; it never reads a dataset or provides normalization stats.
+        runtime_features = SimpleNamespace(features=feature_contract, stats={})
+        policy = make_policy(config, ds_meta=runtime_features)
         policy.eval()
     finally:
         done.set()
@@ -278,12 +275,11 @@ def load_policy(
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=config,
         pretrained_path=str(checkpoint),
-        dataset_stats=metadata.stats,
         preprocessor_overrides={"device_processor": {"device": device}},
         postprocessor_overrides={"device_processor": {"device": "cpu"}},
     )
     print("[100%] model, processors and checkpoint normalization ready", flush=True)
-    return policy, preprocessor, postprocessor, metadata
+    return policy, preprocessor, postprocessor, features
 
 
 def make_inference_engine(
@@ -292,14 +288,13 @@ def make_inference_engine(
     policy,
     preprocessor,
     postprocessor,
-    metadata,
+    features,
     policy_hz: float,
     rtc_config,
 ):
-    from deployer import AXES, PiperFeatureRobot, dataset_features_for_rollout
+    from deployer import AXES, PiperFeatureRobot
     from lerobot.rollout.inference.sync import SyncInferenceEngine
 
-    features = dataset_features_for_rollout(metadata.features)
     if args.inference_mode == "sync":
         return SyncInferenceEngine(
             policy=policy,
@@ -372,16 +367,10 @@ def main() -> None:
         help="LeRobot pretrained_model directory (full model or LoRA checkpoint)",
     )
     parser.add_argument(
-        "--dataset-root",
-        type=Path,
-        default=DATASET,
-        help="LeRobot dataset directory used for features, fps and metadata",
-    )
-    parser.add_argument(
         "--action-mode",
         choices=("delta_joint", "absolute_joint"),
         default=DEFAULT_ACTION_MODE,
-        help="action representation; must match processing.json when present",
+        help="action representation used to train the checkpoint",
     )
     parser.add_argument(
         "--inference-mode",
@@ -419,27 +408,34 @@ def main() -> None:
     )
     parser.add_argument(
         "--device",
-        choices=("cuda", "cpu"),
         default=DEFAULT_DEVICE,
-        help="policy inference device",
+        help="policy inference device: cpu, cuda, or one GPU such as cuda:0",
     )
     parser.add_argument(
-        "--hz",
+        "--control-hz",
+        dest="control_hz",
         type=float,
         default=DEFAULT_CONTROL_HZ,
         help="frequency at which each follower receives pyAgxArm.move_js targets",
+    )
+    parser.add_argument(
+        "--hz",
+        dest="control_hz",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--policy-hz",
+        type=float,
+        default=DEFAULT_POLICY_HZ,
+        help="rate for consuming new policy actions",
     )
     parser.add_argument(
         "--smoothing-time-constant",
         type=float,
         default=DEFAULT_SMOOTHING_TIME_CONSTANT_S,
         help="absolute-target low-pass time constant in seconds; 0 disables filtering",
-    )
-    parser.add_argument(
-        "--policy-hz",
-        type=float,
-        default=None,
-        help="policy action consumption rate; defaults to dataset fps",
     )
     parser.add_argument(
         "--max-steps",
@@ -479,26 +475,16 @@ def main() -> None:
     args = parser.parse_args()
 
     checkpoint = resolve_path(args.checkpoint)
-    dataset_root = resolve_path(args.dataset_root)
     if not (checkpoint / "config.json").is_file():
         parser.error(f"checkpoint is missing config.json: {checkpoint}")
     if not (checkpoint / "policy_preprocessor.json").is_file():
         parser.error(f"checkpoint is missing policy processors: {checkpoint}")
-    if not (dataset_root / "meta/info.json").is_file():
-        parser.error(f"dataset is missing meta/info.json: {dataset_root}")
-    if args.device == "cuda" and not torch.cuda.is_available():
+    if not (checkpoint / "policy_postprocessor.json").is_file():
+        parser.error(f"checkpoint is missing policy postprocessor: {checkpoint}")
+    if args.device.startswith("cuda") and not torch.cuda.is_available():
         parser.error("CUDA was requested but torch.cuda.is_available() is false")
 
-    # Metadata is cheap to parse here and is loaded again by LeRobot below.
-    info = json.loads((dataset_root / "meta/info.json").read_text(encoding="utf-8"))
-    dataset_fps = float(info["fps"])
-    declared_action_mode = read_declared_action_mode(dataset_root)
-    policy_hz = validate_args(
-        parser,
-        args,
-        dataset_fps=dataset_fps,
-        declared_action_mode=declared_action_mode,
-    )
+    policy_hz = validate_args(parser, args)
 
     rtc_config = None
     if args.inference_mode == "rtc":
@@ -516,8 +502,8 @@ def main() -> None:
 
     startup = time.perf_counter()
     loaded_at = time.perf_counter()
-    policy, preprocessor, postprocessor, metadata = load_policy(
-        checkpoint, dataset_root, args.device, rtc_config
+    policy, preprocessor, postprocessor, features = load_policy(
+        checkpoint, args.device, rtc_config
     )
     inference_monitor = InferenceLatencyMonitor()
     inference_monitor.install(policy)
@@ -532,7 +518,7 @@ def main() -> None:
         policy=policy,
         preprocessor=preprocessor,
         postprocessor=postprocessor,
-        metadata=metadata,
+        features=features,
         policy_hz=policy_hz,
         rtc_config=rtc_config,
     )
@@ -563,7 +549,7 @@ def main() -> None:
             engine.resume()
         bridge.ping()
         configured = bridge.configure(
-            control_hz=args.hz,
+            control_hz=args.control_hz,
             smoothing_time_constant_s=args.smoothing_time_constant,
             watchdog_timeout_s=args.watchdog_timeout,
         )
@@ -579,19 +565,12 @@ def main() -> None:
         print(
             f"Bridge connected | move_js={configured['control_hz']:g} Hz | "
             f"smoothing_tau={configured['smoothing_time_constant_s']:g}s | "
-            f"policy={policy_hz:g} Hz (dataset={dataset_fps:g} Hz) | "
+            f"policy={policy_hz:g} Hz | "
             f"mode={args.inference_mode}/{args.action_mode} | "
             f"seed={args.seed} | "
             f"max_steps={args.max_steps} | dry_run={args.dry_run}",
             flush=True,
         )
-        if policy_hz != dataset_fps:
-            print(
-                f"WARNING: policy actions are being consumed at {policy_hz:g} Hz, "
-                f"but the dataset was recorded at {dataset_fps:g} Hz",
-                flush=True,
-            )
-
         applied_steps = 0
         observation_count = 0
         waiting_reported = False

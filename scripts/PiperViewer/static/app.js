@@ -19,7 +19,10 @@ const state = {
   frame: 0,
   playing: false,
   speed: 1,
-  timer: null,
+  animationFrame: null,
+  frameLoadPending: false,
+  playbackStartedAt: 0,
+  playbackStartedMediaTime: 0,
   curveSource: "actions",
   side: "left",
   visibleJoints: new Set([0, 1, 2, 3, 4, 5]),
@@ -251,8 +254,9 @@ function updateFrame(index, force = false, imageUrls = null) {
 function stopPlayback() {
   state.playing = false;
   state.playbackToken += 1;
-  clearTimeout(state.timer);
-  state.timer = null;
+  cancelAnimationFrame(state.animationFrame);
+  state.animationFrame = null;
+  state.frameLoadPending = false;
   const button = $("#play-toggle");
   if (button) {
     button.innerHTML = '<i data-lucide="play"></i>';
@@ -260,6 +264,14 @@ function stopPlayback() {
     button.setAttribute("aria-label", "播放");
     icons();
   }
+}
+
+function playbackCycleDuration() {
+  const frames = state.episode?.frames || 0;
+  if (frames <= 1) return 0.05;
+  const lastTime = frameTime(frames - 1);
+  const lastInterval = Math.max(0.001, lastTime - frameTime(frames - 2));
+  return lastTime + lastInterval;
 }
 
 function preloadFrameImages(index) {
@@ -272,27 +284,47 @@ function preloadFrameImages(index) {
   })));
 }
 
-async function scheduleNextFrame(token) {
-  if (!state.playing || !state.episode || token !== state.playbackToken) return;
-  const current = state.frame;
-  const target = current >= state.episode.frames - 1 ? 0 : current + 1;
-  const sourceDelay = target === 0
-    ? 0.05
-    : Math.max(0.01, frameTime(target) - frameTime(current) || 0.05);
-  const started = performance.now();
-  try {
-    const imageUrls = await preloadFrameImages(target);
-    if (!state.playing || token !== state.playbackToken) return;
-    updateFrame(target, true, imageUrls);
-    const elapsed = performance.now() - started;
-    const remaining = Math.max(0, 1000 * sourceDelay / state.speed - elapsed);
-    state.timer = setTimeout(() => scheduleNextFrame(token), remaining);
-  } catch (error) {
-    if (token === state.playbackToken) {
-      stopPlayback();
-      toast(error.message, true);
-    }
+function frameAtMediaTime(mediaTime) {
+  let low = 0;
+  let high = Math.max(0, (state.episode?.frames || 1) - 1);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (frameTime(middle) <= mediaTime) low = middle;
+    else high = middle - 1;
   }
+  return low;
+}
+
+function playbackTick(now, token) {
+  if (!state.playing || !state.episode || token !== state.playbackToken) return;
+  const cycleDuration = playbackCycleDuration();
+  let mediaTime = state.playbackStartedMediaTime
+    + (now - state.playbackStartedAt) * state.speed / 1000;
+  if (mediaTime >= cycleDuration) {
+    mediaTime %= cycleDuration;
+    state.playbackStartedAt = now;
+    state.playbackStartedMediaTime = mediaTime;
+  }
+  const target = frameAtMediaTime(mediaTime);
+  if (target !== state.frame && !state.frameLoadPending) {
+    state.frameLoadPending = true;
+    preloadFrameImages(target)
+      .then((imageUrls) => {
+        if (state.playing && token === state.playbackToken) {
+          updateFrame(target, true, imageUrls);
+        }
+      })
+      .catch((error) => {
+        if (state.playing && token === state.playbackToken) {
+          stopPlayback();
+          toast(error.message, true);
+        }
+      })
+      .finally(() => {
+        if (token === state.playbackToken) state.frameLoadPending = false;
+      });
+  }
+  state.animationFrame = requestAnimationFrame((nextNow) => playbackTick(nextNow, token));
 }
 
 function togglePlayback() {
@@ -304,13 +336,16 @@ function togglePlayback() {
   state.playing = true;
   state.playbackToken += 1;
   const token = state.playbackToken;
+  state.frameLoadPending = false;
+  if (state.frame >= state.episode.frames - 1) updateFrame(0, true);
+  state.playbackStartedAt = performance.now();
+  state.playbackStartedMediaTime = frameTime(state.frame);
   const button = $("#play-toggle");
   button.innerHTML = '<i data-lucide="pause"></i>';
   button.title = "暂停";
   button.setAttribute("aria-label", button.title);
   icons();
-  clearTimeout(state.timer);
-  scheduleNextFrame(token);
+  state.animationFrame = requestAnimationFrame((now) => playbackTick(now, token));
 }
 
 function sourceData() {
@@ -496,6 +531,14 @@ function bindEvents() {
     catch { toast("浏览器未允许访问剪贴板", true); }
   });
   $$("#speed-control button").forEach((button) => button.addEventListener("click", () => {
+    if (state.playing) {
+      const now = performance.now();
+      const elapsed = (now - state.playbackStartedAt) * state.speed / 1000;
+      state.playbackStartedMediaTime = (
+        state.playbackStartedMediaTime + elapsed
+      ) % playbackCycleDuration();
+      state.playbackStartedAt = now;
+    }
     state.speed = Number(button.dataset.speed);
     $$("#speed-control button").forEach((item) => item.classList.toggle("active", item === button));
   }));

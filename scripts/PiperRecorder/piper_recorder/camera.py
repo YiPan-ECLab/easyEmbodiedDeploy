@@ -9,12 +9,19 @@ import cv2
 import numpy as np
 
 CAMERA_NAMES = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
+FRAME_WAIT_TIMEOUT_MS = 100
 
 
 def resize_with_padding(rgb: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     """Resize the full image to fit, then add symmetric black padding."""
+    if rgb.ndim != 3 or rgb.shape[-1] != 3 or rgb.dtype != np.uint8:
+        raise ValueError("相机帧必须是 HxWx3 的 uint8 RGB 图像")
     target_width, target_height = size
+    if target_width <= 0 or target_height <= 0:
+        raise ValueError("目标图像尺寸必须为正数")
     height, width = rgb.shape[:2]
+    if height <= 0 or width <= 0:
+        raise ValueError("相机帧尺寸不能为空")
     scale = min(target_width / width, target_height / height)
     resized_width = max(1, round(width * scale))
     resized_height = max(1, round(height * scale))
@@ -66,15 +73,26 @@ class OrbbecCamera:
     def start(self, device) -> None:
         from pyorbbecsdk import Config, OBFormat, OBSensorType, Pipeline
 
+        if device is None:
+            raise RuntimeError(f"相机 {self.name} ({self.serial}) 未找到设备")
+        self._stop.clear()
+        self._error = None
+        self._latest = None
         pipeline = Pipeline(device)
         sensor_type = OBSensorType.COLOR_SENSOR
-        # Gemini 305 exposes its stereo color cameras as LEFT/RIGHT_COLOR_SENSOR
-        # instead of the single COLOR_SENSOR used by RGB cameras such as 335L.
+        # Stereo models expose separate LEFT/RIGHT_COLOR_SENSOR streams. A
+        # regular RGB camera falls back to COLOR_SENSOR when those are absent.
         if self.name in ("left_eye_in_hand", "right_eye_in_hand"):
+            preferred_sensor = (
+                OBSensorType.LEFT_COLOR_SENSOR
+                if self.name == "left_eye_in_hand"
+                else OBSensorType.RIGHT_COLOR_SENSOR
+            )
             try:
-                pipeline.get_stream_profile_list(sensor_type)
+                pipeline.get_stream_profile_list(preferred_sensor)
+                sensor_type = preferred_sensor
             except Exception:
-                sensor_type = OBSensorType.LEFT_COLOR_SENSOR
+                sensor_type = OBSensorType.COLOR_SENSOR
         try:
             profiles = pipeline.get_stream_profile_list(sensor_type)
         except Exception as exc:
@@ -119,7 +137,10 @@ class OrbbecCamera:
     def _capture_loop(self) -> None:
         try:
             while not self._stop.is_set():
-                frames = self._pipeline.wait_for_frames(500)
+                # Keep the SDK wait bounded well below the recorder's 0.35 s
+                # task-gap limit. A long SDK wait would hide a stalled camera
+                # until several recorder samples had already been missed.
+                frames = self._pipeline.wait_for_frames(FRAME_WAIT_TIMEOUT_MS)
                 if frames is None:
                     color = None
                 elif self._sensor_type.name == "LEFT_COLOR_SENSOR":
@@ -148,14 +169,20 @@ class OrbbecCamera:
             raise RuntimeError(f"相机 {self.name} 彩色流停止") from error
         if frame is None or time.monotonic() - frame.timestamp > self.max_age_s:
             raise RuntimeError(f"相机 {self.name} 没有有效的新帧")
+        # A recorder sample may legitimately reuse the latest camera frame
+        # when the camera cadence is lower than the robot/control cadence.
         return frame
 
     def close(self) -> None:
         self._stop.set()
+        # Stop the pipeline first so wait_for_frames() wakes promptly.
+        if self._pipeline is not None:
+            try:
+                self._pipeline.stop()
+            except Exception:
+                pass
         if self._thread is not None:
             self._thread.join(timeout=1.0)
-        if self._pipeline is not None:
-            self._pipeline.stop()
         self._thread = None
         self._pipeline = None
 
@@ -165,6 +192,8 @@ def open_cameras(
 ) -> dict[str, OrbbecCamera]:
     from pyorbbecsdk import Context, OBLogLevel
 
+    if set(serials) != set(CAMERA_NAMES) or len(set(serials.values())) != len(CAMERA_NAMES):
+        raise ValueError(f"相机配置必须恰好包含 {CAMERA_NAMES} 且序列号不能重复")
     Context.set_logger_to_console(OBLogLevel.ERROR)
     Context.set_logger_to_file(OBLogLevel.NONE, "/tmp")
     context = Context()

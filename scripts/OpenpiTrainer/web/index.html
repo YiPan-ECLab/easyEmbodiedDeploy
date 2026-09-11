@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="theme-color" content="#0b0d0f">
+    <title>PI05 · OpenPI JAX Train Lab</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="ambient ambient-a"></div>
+    <div class="ambient ambient-b"></div>
+
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div>
+          <p class="eyebrow">PI05 TRAINING CONSOLE</p>
+          <h1>OpenPI JAX Train Lab</h1>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <button class="global-stop" id="stopTop" type="button" disabled>
+          <span aria-hidden="true"></span>停止本页训练
+        </button>
+        <div class="connection-pill" id="connectionPill">
+          <span class="status-dot"></span><span id="connectionText">正在连接</span>
+        </div>
+        <button class="icon-button" id="refreshButton" type="button" title="刷新状态" aria-label="刷新">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5M18.5 9A7 7 0 0 0 6.3 6.3L4 11m16 2-2.3 4.7A7 7 0 0 1 5.5 15"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="status-grid" aria-label="训练状态">
+        <article class="metric-card" id="runMetric">
+          <div class="metric-icon run-icon"><span></span></div>
+          <div><p>运行状态</p><strong id="runState">空闲</strong><small id="runMeta">等待配置</small></div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-icon progress-icon"><i id="progressRing"></i></div>
+          <div><p>训练进度</p><strong id="progressValue">0.0%</strong><small id="progressMeta">0 / 0 steps</small></div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-icon loss-icon">∿</div>
+          <div><p>当前损失</p><strong id="lossValue">—</strong><small id="speedMeta">等待首条指标</small></div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-icon gpu-icon">G</div>
+          <div><p>训练设备</p><strong id="gpuValue">GPU 0</strong><small id="gpuMeta">读取显卡状态</small></div>
+        </article>
+      </section>
+
+      <section class="notice hidden" id="externalNotice">
+        <span class="notice-icon">!</span>
+        <div><strong>检测到外部训练</strong><p id="externalText"></p></div>
+      </section>
+
+      <section class="workspace">
+        <article class="panel configuration-panel">
+          <div class="panel-heading">
+            <div><p class="eyebrow">TRAINING PROFILE</p><h2>训练配置</h2></div>
+            <div class="preset-group" role="group" aria-label="训练预设">
+              <button class="chip active" type="button" data-profile="lora">LoRA</button>
+              <button class="chip" type="button" data-profile="full">全量模型</button>
+              <button class="chip" type="button" data-profile="smoke">GPU0 试跑</button>
+            </div>
+          </div>
+
+          <form id="configForm" autocomplete="off">
+            <div class="form-section">
+              <div class="section-title"><span>01</span><h3>数据与模型</h3></div>
+              <label class="field wide">
+                <span>LeRobot 数据集</span>
+                <input id="dataset_root" name="dataset_root" list="datasetOptions" spellcheck="false" required>
+                <datalist id="datasetOptions"></datalist>
+                <small id="datasetHint">读取当前 LeRobot v3 数据；适配器会解码其 lerobot 子目录</small>
+              </label>
+              <label class="field wide">
+                <span>PI05 预训练模型</span>
+                <input id="pretrained" name="pretrained" list="modelOptions" spellcheck="false" required>
+                <datalist id="modelOptions"></datalist>
+                <small id="modelHint">支持本地 base、全量 checkpoint 或 LoRA adapter</small>
+              </label>
+              <label class="field wide">
+                <span>输出目录</span>
+                <input id="output_dir" name="output_dir" spellcheck="false" required>
+                <small>新训练必须使用尚不存在的目录，避免覆盖 checkpoint</small>
+              </label>
+              <label class="field">
+                <span>任务名称</span>
+                <input id="job_name" name="job_name" spellcheck="false" required>
+              </label>
+              <label class="field">
+                <span>动作表示</span>
+                <select id="action_mode" name="action_mode">
+                  <option value="delta_joint">Delta joint</option>
+                  <option value="absolute_joint">Absolute joint</option>
+                </select>
+                <small>必须与 processing.json 一致</small>
+              </label>
+              <label class="field wide optional-field">
+                <span>本地 Repo ID <b title="作为 OpenPI 归一化资产的稳定标识，不会上传">?</b></span>
+                <input id="repo_id" name="repo_id" placeholder="留空时由数据集目录生成" spellcheck="false">
+              </label>
+            </div>
+
+            <div class="form-section">
+              <div class="section-title"><span>02</span><h3>微调策略</h3></div>
+              <label class="field featured-field">
+                <span>更新方式</span>
+                <select id="finetune_mode" name="finetune_mode">
+                  <option value="lora">LoRA adapter</option>
+                  <option value="full">直接更新权重</option>
+                </select>
+                <small id="finetuneHint">只训练少量 adapter 参数</small>
+              </label>
+              <label class="field featured-field">
+                <span>直接微调范围 <b title="LoRA 使用 PI05 的默认专家 q/v 与动作投影目标，此项仅影响直接权重微调">?</b></span>
+                <select id="training_scope" name="training_scope">
+                  <option value="expert_only">动作专家与投影</option>
+                  <option value="vision_frozen">冻结视觉编码器</option>
+                  <option value="full_model">完整模型</option>
+                </select>
+                <small id="scopeHint">LoRA 模式由 PI05 adapter 目标决定</small>
+              </label>
+              <label class="field">
+                <span>归一化</span>
+                <select id="normalization_mode" name="normalization_mode">
+                  <option value="quantiles">Quantiles · q01/q99</option>
+                  <option value="min_max">Min / max</option>
+                  <option value="mean_std">Mean / std</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>计算精度</span>
+                <select id="dtype" name="dtype">
+                  <option value="bfloat16">bfloat16</option>
+                  <option value="float32">float32</option>
+                </select>
+              </label>
+              <label class="field lora-field">
+                <span>LoRA rank</span>
+                <div class="number-control"><input id="lora_rank" name="lora_rank" type="number" min="1" step="1"><i>r</i></div>
+              </label>
+              <label class="field lora-field">
+                <span>LoRA alpha</span>
+                <div class="number-control"><input id="lora_alpha" name="lora_alpha" type="number" min="1" step="1"><i>α</i></div>
+              </label>
+              <label class="toggle-row wide">
+                <span><strong>Gradient checkpointing</strong><small>降低显存占用，增加少量计算时间</small></span>
+                <input id="gradient_checkpointing" name="gradient_checkpointing" type="checkbox"><i aria-hidden="true"></i>
+              </label>
+            </div>
+
+            <div class="form-section rtc-section">
+              <div class="section-title"><span>03</span><h3>动作块与 RTC 训练</h3></div>
+              <label class="field featured-field">
+                <span>RTC 训练方式</span>
+                <select id="rtc_mode" name="rtc_mode">
+                  <option value="normal">Normal · 标准动作块</option>
+                  <option value="trained">Trained RTC · 延迟扰动</option>
+                </select>
+                <small id="rtcHint">部署可使用 guided RTC，无需改变普通 checkpoint</small>
+              </label>
+              <label class="field rtc-delay-field">
+                <span>RTC 最大延迟</span>
+                <div class="number-control"><input id="rtc_max_delay" name="rtc_max_delay" type="number" min="1" max="49" step="1"><i>步</i></div>
+                <small>仅 trained RTC 生效，必须小于 chunk size</small>
+              </label>
+              <label class="field">
+                <span>Action steps <b title="训练数据读取的动作时域长度；不能超过 PI05 chunk size">?</b></span>
+                <div class="number-control"><input id="n_action_steps" name="n_action_steps" type="number" min="1" max="50" step="1"><i>步</i></div>
+              </label>
+              <div class="training-flow wide">
+                <div><strong id="flowDataset">LeRobot dataset</strong><span>图像 · 状态 · 动作</span></div>
+                <i>→</i><div><strong id="flowMode">PI05 + LoRA</strong><span id="flowRtc">Normal action chunk</span></div>
+                <i>→</i><div><strong>Checkpoint</strong><span>processor · weights · config</span></div>
+              </div>
+            </div>
+
+            <div class="form-section">
+              <div class="section-title"><span>04</span><h3>算力与步数</h3></div>
+              <div class="field wide">
+                <span>物理 GPU <b title="可多选；每张被选择的卡上只要已有计算进程，服务端就会拒绝启动">?</b></span>
+                <div class="gpu-picker" id="gpuPicker"><span class="muted">正在读取 GPU…</span></div>
+                <input id="gpu_ids" name="gpu_ids" type="hidden" value="0">
+              </div>
+              <label class="field">
+                <span>设备</span>
+                <select id="device" name="device"><option value="cuda">CUDA</option><option value="cpu">CPU</option></select>
+              </label>
+              <label class="field">
+                <span>Batch size</span>
+                <div class="number-control"><input id="batch_size" name="batch_size" type="number" min="1" step="1"><i>样本</i></div>
+              </label>
+              <label class="field">
+                <span>总训练步数</span>
+                <div class="number-control"><input id="steps" name="steps" type="number" min="1" step="1"><i>steps</i></div>
+              </label>
+              <label class="field">
+                <span>保存间隔</span>
+                <div class="number-control"><input id="save_freq" name="save_freq" type="number" min="1" step="1"><i>steps</i></div>
+              </label>
+              <label class="field">
+                <span>日志间隔</span>
+                <div class="number-control"><input id="log_freq" name="log_freq" type="number" min="1" step="1"><i>steps</i></div>
+              </label>
+              <label class="field">
+                <span>DataLoader workers</span>
+                <input id="num_workers" name="num_workers" type="number" min="0" step="1">
+              </label>
+              <label class="field">
+                <span>随机种子</span>
+                <input id="seed" name="seed" type="number" min="0" step="1">
+              </label>
+              <label class="toggle-row">
+                <span><strong>保存 checkpoint</strong><small>包含最后一步</small></span>
+                <input id="save_checkpoint" name="save_checkpoint" type="checkbox"><i aria-hidden="true"></i>
+              </label>
+            </div>
+
+            <details class="advanced-section">
+              <summary><span>续训与实验记录</span><small>resume · W&B · dry run</small></summary>
+              <div class="advanced-grid">
+                <label class="field wide">
+                  <span>断点配置</span>
+                  <input id="resume_config" name="resume_config" list="resumeOptions" placeholder="留空为新训练；选择 checkpoint 的 train_config.json" spellcheck="false">
+                  <datalist id="resumeOptions"></datalist>
+                  <small>续训时使用 checkpoint 配置，仅以当前页面覆盖运行设备</small>
+                </label>
+                <label class="toggle-row wide">
+                  <span><strong>Weights & Biases</strong><small>关闭后会明确传入 wandb.enable=false</small></span>
+                  <input id="wandb_enabled" name="wandb_enabled" type="checkbox"><i aria-hidden="true"></i>
+                </label>
+                <label class="field wandb-field"><span>W&B project</span><input id="wandb_project" name="wandb_project"></label>
+                <label class="field wandb-field"><span>W&B entity</span><input id="wandb_entity" name="wandb_entity" placeholder="可选"></label>
+                <label class="field wandb-field">
+                  <span>W&B mode</span>
+                  <select id="wandb_mode" name="wandb_mode"><option value="online">Online</option><option value="offline">Offline</option><option value="disabled">Disabled</option></select>
+                </label>
+                <label class="toggle-row wide">
+                  <span><strong>Dry run</strong><small>完整解码首帧并打印最终命令，不加载模型、不创建输出目录</small></span>
+                  <input id="dry_run" name="dry_run" type="checkbox"><i aria-hidden="true"></i>
+                </label>
+              </div>
+            </details>
+          </form>
+        </article>
+
+        <aside class="side-column">
+          <article class="panel launch-panel">
+            <div class="panel-heading compact">
+              <div><p class="eyebrow">RUN CONTROL</p><h2>启动检查</h2></div>
+              <span class="safety-badge"><i></i> Own process only</span>
+            </div>
+            <div class="safety-flow">
+              <div><span>1</span><p><strong>验证数据</strong><small>轴顺序 · 统计量 · 视频首帧</small></p><i id="stepDataset"></i></div>
+              <div><span>2</span><p><strong>锁定显卡</strong><small>物理编号 · 计算进程冲突</small></p><i id="stepGpu"></i></div>
+              <div><span>3</span><p><strong>训练与保存</strong><small>OpenPI · JAX · Orbax</small></p><i id="stepTrain"></i></div>
+            </div>
+            <div class="primary-actions">
+              <button class="button primary" id="startButton" type="button">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7Z"/></svg>开始训练
+              </button>
+              <button class="button danger" id="stopButton" type="button" disabled><span></span>停止训练</button>
+            </div>
+            <div class="secondary-actions">
+              <button class="button ghost" id="validateButton" type="button">深度验证数据</button>
+              <button class="button ghost" id="previewButton" type="button">预览命令</button>
+            </div>
+            <p class="action-note" id="actionNote">启动前会拒绝使用已有计算进程的 GPU。停止按钮只作用于本页面启动的进程组。</p>
+          </article>
+
+          <article class="panel dataset-panel">
+            <div class="panel-heading compact"><div><p class="eyebrow">DATA CONTRACT</p><h2>数据契约</h2></div><span class="state-tag" id="datasetState">未验证</span></div>
+            <div class="dataset-stats">
+              <div><span>Episodes</span><strong id="datasetEpisodes">—</strong></div>
+              <div><span>Frames</span><strong id="datasetFrames">—</strong></div>
+              <div><span>Sample Hz</span><strong id="datasetFps">—</strong></div>
+            </div>
+            <ul class="contract-list" id="contractList">
+              <li><i></i>双臂 Piper state/action 14 维</li>
+              <li><i></i>3 路 224 × 224 RGB 图像</li>
+              <li><i></i>有限且匹配的归一化统计量</li>
+            </ul>
+          </article>
+
+          <article class="panel command-panel">
+            <div class="panel-heading compact"><div><p class="eyebrow">COMMAND PLAN</p><h2>实际执行</h2></div><button class="tiny-button" id="copyCommand" type="button">复制</button></div>
+            <div class="command-meta"><span id="cudaVisibility">CUDA_VISIBLE_DEVICES = 0</span><span id="launcherMode">single process</span></div>
+            <pre id="commandPreview">修改配置后点击“预览命令”</pre>
+          </article>
+        </aside>
+      </section>
+
+      <section class="telemetry-grid">
+        <article class="panel chart-panel">
+          <div class="panel-heading compact">
+            <div><p class="eyebrow">LIVE METRICS</p><h2>训练曲线</h2></div>
+            <div class="chart-legend"><span><i class="loss-dot"></i>Loss</span><span><i class="grad-dot"></i>Grad norm</span></div>
+          </div>
+          <canvas id="metricChart" height="210"></canvas>
+          <div class="chart-empty" id="chartEmpty">指标将在第一个 log step 后显示</div>
+        </article>
+        <article class="panel gpu-panel">
+          <div class="panel-heading compact"><div><p class="eyebrow">DEVICE MONITOR</p><h2>GPU 状态</h2></div><small id="gpuRefreshTime">—</small></div>
+          <div class="gpu-list" id="gpuList"><p class="muted">正在读取 GPU…</p></div>
+        </article>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="panel-heading compact">
+          <div><p class="eyebrow">PROCESS OUTPUT</p><h2>训练日志</h2></div>
+          <div class="log-tools"><label><input id="autoScroll" type="checkbox" checked>自动滚动</label><button class="tiny-button" id="clearLogs" type="button">清空显示</button></div>
+        </div>
+        <div class="terminal" id="terminal"><div class="terminal-placeholder">等待本页面启动训练…</div></div>
+      </section>
+    </main>
+
+    <div class="toast-stack" id="toastStack" aria-live="polite"></div>
+    <dialog id="confirmDialog">
+      <div class="dialog-icon"><span></span></div><h2>停止本页训练？</h2>
+      <p>先发送 SIGINT，让 OpenPI 有机会结束当前 JAX 步骤和 Orbax 保存；超时后才会升级信号。外部训练不会受到影响。</p>
+      <div><button class="button ghost" id="cancelStop" type="button">继续训练</button><button class="button danger" id="confirmStop" type="button"><span></span>确认停止</button></div>
+    </dialog>
+    <script src="/app.js" defer></script>
+  </body>
+</html>

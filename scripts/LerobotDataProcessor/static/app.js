@@ -1,9 +1,335 @@
-const $=id=>document.getElementById(id);let timer=null,lastLogCount=0;const labels={idle:'空闲',running:'处理中',complete:'已完成',failed:'失败',cancelled:'已取消'};
-function payload(){return{input_dir:$('input').value,output_root:$('output').value||null,source_fps:$('source').value?Number($('source').value):null,target_fps:Number($('fps').value),task:$('task').value,action_mode:$('mode').value}}
-function setLocked(locked){['input','output','source','fps','task','mode','inspect','start'].forEach(id=>$(id).disabled=locked);$('cancel').classList.toggle('hidden',!locked);$('start').classList.toggle('hidden',locked)}
-function fmt(s){if(s==null||!isFinite(s))return'—';s=Math.max(0,Math.round(s));return s<60?`${s}s`:`${Math.floor(s/60)}m ${s%60}s`}
-function addLogs(events){if(events.length<lastLogCount){lastLogCount=0;$('log').innerHTML=''}events.slice(lastLogCount).forEach(e=>{let d=document.createElement('p');d.className='log-line';d.innerHTML=`<time>${e.elapsed??0}s · ${e.stage}</time>${e.message||''}${e.file?` · ${e.file}`:''}${e.frame?` · 帧 ${e.frame}/${e.frames}`:''}`;$('log').appendChild(d)});lastLogCount=events.length;$('log').scrollTop=$('log').scrollHeight}
-function render(x){let running=x.status==='running';setLocked(running);$('status').textContent=labels[x.status]||x.status;$('status').className='badge '+x.status;let e=(x.events||[]).at(-1)||{};$('phase').textContent=e.stage||labels[x.status]||'等待开始';$('message').textContent=e.message||x.error||'先检查输入，然后开始处理';$('time').textContent=e.elapsed!=null?fmt(e.elapsed):'—';$('episode-count').textContent=e.episodes?`${Math.min((e.episode||0)+(e.stage==='complete'?0:1),e.episodes)} / ${e.episodes} 条`:'0 / 0 条';$('frame-count').textContent=e.frame?`帧 ${e.frame} / ${e.frames}`:'—';$('total-frames').textContent=x.result?.plan?.output_frames?.toLocaleString()||'—';let pct=e.episodes?100*Math.min(e.episode||0,e.episodes)/e.episodes:0;if(e.frame&&e.frames)pct=100*((e.episode||0)+e.frame/e.frames)/(e.episodes||1);$('bar').style.width=(x.status==='complete'?100:pct)+'%';$('eta').textContent=e.episodes&&e.elapsed&&e.episode?fmt(e.elapsed*(e.episodes-(e.episode||0))/(e.episode||1)):'—';addLogs(x.events||[]);let result=x.result;if(result&&x.status==='complete'){$('result').classList.remove('hidden','error');$('result').textContent=`输出已保存：${result.plan.output_root}`}$('result').classList.toggle('hidden',!result||x.status!=='complete');if(x.error&&x.status!=='running'){$('result').classList.remove('hidden');$('result').classList.add('error');$('result').textContent=x.error}}
-async function refresh(){try{render(await(await fetch('/api/status',{cache:'no-store'})).json())}catch(e){$('message').textContent='无法连接到处理服务'}}
-async function inspect(){let p=payload(),q=new URLSearchParams({input_dir:p.input_dir,target_fps:p.target_fps,action_mode:p.action_mode});if(p.source_fps)q.set('source_fps',p.source_fps);let x=await(await fetch('/api/inspect?'+q)).json();$('plan').classList.remove('hidden');if(x.error){$('plan-summary').textContent='检查失败';$('plantext').textContent=x.error}else{$('plan-summary').textContent=`${x.episodes} 条 · ${x.output_frames.toLocaleString()} 帧`;$('plantext').textContent=`源目录：${x.input_dir}\n源帧数：${x.input_frames.toLocaleString()}\n输出帧数：${x.output_frames.toLocaleString()}\n模式：${p.action_mode}\n目标 FPS：${p.target_fps}\n\n每个文件：\n`+x.files.map(f=>`${f.name}  ${f.source_fps}Hz → ${p.target_fps}Hz，${f.frames} → ${f.output_frames} 帧`).join('\n')}}
-$('inspect').onclick=inspect;$('start').onclick=async()=>{let x=await(await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload())})).json();if(x.error){alert(x.error);return}setLocked(true);if(!timer)timer=setInterval(refresh,700);refresh()};$('cancel').onclick=async()=>{if(!confirm('确定取消当前处理？已完成的中间文件会保留。'))return;$('cancel').disabled=true;$('message').textContent='正在安全取消，请等待当前写入点结束…';await fetch('/api/cancel',{method:'POST'});};$('clear-log').onclick=()=>{$('log').innerHTML='<p class="log-empty">处理日志会显示在这里</p>';lastLogCount=0};fetch('/api/defaults').then(r=>r.json()).then(x=>{$('input').value=x.input_dir;$('task').value=x.task;$('fps').value=x.target_fps}).then(refresh)
+"use strict";
+
+const $ = (id) => document.getElementById(id);
+const ui = {
+  plan: null,
+  defaults: null,
+  lastJob: null,
+  lastEventSeq: 0,
+  locked: false,
+};
+const statusNames = {
+  idle: "空闲", running: "处理中", complete: "已完成",
+  failed: "失败", cancelled: "已取消",
+};
+const stageNames = {
+  checking: "检查输入", loading: "加载 LeRobot", resampling: "准备采样",
+  writing: "写入帧", encoding: "编码视频", finalizing: "生成统计量",
+  complete: "验收完成", failed: "处理失败", cancelled: "已取消",
+};
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>'"]/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
+  })[char]);
+}
+
+function toast(message, error = false) {
+  const node = $("toast");
+  node.textContent = message;
+  node.className = `toast show${error ? " error" : ""}`;
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => { node.className = "toast"; }, 2600);
+}
+
+async function request(path, options = {}) {
+  const response = await fetch(path, { cache: "no-store", ...options });
+  let payload;
+  try { payload = await response.json(); } catch { payload = {}; }
+  if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+  return payload;
+}
+
+function checked(name) {
+  return document.querySelector(`input[name="${name}"]:checked`)?.value || "";
+}
+
+function formPayload() {
+  return {
+    input_dir: $("inputDir").value.trim(),
+    output_root: $("outputRoot").value.trim() || null,
+    task: $("task").value.trim(),
+    source_fps: $("sourceFps").value ? Number($("sourceFps").value) : null,
+    target_fps: Number($("targetFps").value),
+    action_mode: checked("actionMode"),
+    gap_policy: checked("gapPolicy"),
+    repo_id: $("repoId").value.trim() || null,
+    limit: Number($("limit").value || 0),
+  };
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+function updateCommand() {
+  const value = formPayload();
+  const parts = [
+    "CUDA_VISIBLE_DEVICES='' thirdParty/.venvs/lerobot-pi05/bin/python \\",
+    "  scripts/LerobotDataProcessor/convert_piper_hdf5.py \\",
+    `  --input-dir ${shellQuote(value.input_dir)} \\`,
+  ];
+  if (value.output_root) parts.push(`  --output-root ${shellQuote(value.output_root)} \\`);
+  if (value.repo_id) parts.push(`  --repo-id ${shellQuote(value.repo_id)} \\`);
+  parts.push(`  --task ${shellQuote(value.task)} \\`);
+  if (value.source_fps) parts.push(`  --source-fps ${value.source_fps} \\`);
+  parts.push(`  --fps ${value.target_fps} --action-mode ${value.action_mode} \\`);
+  parts.push(`  --gap-policy ${value.gap_policy}${value.limit ? ` --limit ${value.limit}` : ""}`);
+  $("commandPreview").textContent = parts.join("\n");
+}
+
+function formatNumber(value) {
+  return Number.isFinite(Number(value)) ? Number(value).toLocaleString() : "—";
+}
+
+function formatTime(seconds) {
+  if (!Number.isFinite(Number(seconds))) return "—";
+  const value = Math.max(0, Math.round(Number(seconds)));
+  if (value < 60) return `${value}s`;
+  const minutes = Math.floor(value / 60);
+  return `${minutes}m ${String(value % 60).padStart(2, "0")}s`;
+}
+
+function setConnected(connected) {
+  $("connection").className = `connection ${connected ? "online" : "offline"}`;
+  $("connection").querySelector("b").textContent = connected ? "服务已连接" : "连接中断";
+}
+
+function setLocked(locked) {
+  ui.locked = locked;
+  $("configForm").querySelectorAll("input, textarea").forEach((node) => { node.disabled = locked; });
+  $("inspectButton").disabled = locked;
+  $("startButton").classList.toggle("hidden", locked);
+  $("cancelButton").classList.toggle("hidden", !locked);
+  $("cancelButton").disabled = false;
+}
+
+function invalidatePlan() {
+  if (ui.locked) return;
+  ui.plan = null;
+  $("metricQuality").textContent = "需重新检查";
+  $("metricQualityMeta").textContent = "配置已修改";
+  $("stepInspect").className = "";
+  updateCommand();
+}
+
+function renderPlan(plan) {
+  ui.plan = plan;
+  $("inspectionPanel").classList.remove("hidden");
+  $("metricEpisodes").textContent = formatNumber(plan.episodes);
+  $("metricEpisodeMeta").textContent = `${plan.files.length} 个 HDF5`;
+  $("metricInput").textContent = formatNumber(plan.input_frames);
+  $("metricInputMeta").textContent = `${formatNumber(plan.files.reduce((sum, file) => sum + file.source_task_frames, 0))} task`;
+  $("metricOutput").textContent = formatNumber(plan.output_frames);
+  $("metricOutputMeta").textContent = `${formPayload().target_fps} Hz · ${formPayload().action_mode}`;
+  $("metricQuality").textContent = plan.warnings.length ? "有警告" : "检查通过";
+  $("metricQualityMeta").textContent = `${plan.gaps} 个时间空档`;
+  $("stepInspect").className = plan.warnings.length ? "active" : "done";
+  $("writtenFrames").textContent = formatNumber(plan.output_frames);
+  const warnings = $("warningBox");
+  warnings.classList.toggle("hidden", !plan.warnings.length);
+  warnings.textContent = plan.warnings.join("\n");
+  renderFileTable();
+}
+
+function renderFileTable() {
+  if (!ui.plan) return;
+  const query = $("fileSearch").value.trim().toLowerCase();
+  const issuesOnly = $("issuesOnly").checked;
+  const files = ui.plan.files.filter((file) => {
+    const issue = file.gaps || file.warnings?.length;
+    return file.name.toLowerCase().includes(query) && (!issuesOnly || issue);
+  });
+  $("fileTable").innerHTML = files.map((file) => {
+    const issue = file.gaps || file.warnings?.length;
+    return `<tr class="${issue ? "issue" : ""}">
+      <td title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</td>
+      <td>${formatNumber(file.frames)}</td><td>${formatNumber(file.source_task_frames)}</td>
+      <td>${formatNumber(file.source_home_frames)}</td><td>${formatNumber(file.trimmed_idle_frames)}</td>
+      <td>${Number(file.measured_fps).toFixed(3)}</td><td>${formatNumber(file.output_frames)}</td>
+      <td>${(Number(file.max_camera_skew_s) * 1000).toFixed(1)} ms</td>
+      <td>${file.gaps || "0"}</td></tr>`;
+  }).join("") || '<tr><td colspan="9">没有匹配的文件</td></tr>';
+}
+
+async function inspectInput(showMessage = true) {
+  $("inspectButton").disabled = true;
+  $("runNote").textContent = "正在读取全部 HDF5 元数据与质量指标…";
+  $("stepInspect").className = "active";
+  try {
+    const plan = await request("/api/inspect", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(formPayload()),
+    });
+    renderPlan(plan);
+    $("runNote").textContent = plan.warnings.length
+      ? `检查完成，发现 ${plan.warnings.length} 条警告。`
+      : "检查通过，可以开始转换。";
+    if (showMessage) toast(`检查通过：${plan.episodes} 条，预计 ${formatNumber(plan.output_frames)} 帧`);
+    return plan;
+  } catch (error) {
+    ui.plan = null;
+    $("stepInspect").className = "";
+    $("metricQuality").textContent = "检查失败";
+    $("metricQualityMeta").textContent = error.message;
+    $("runNote").textContent = error.message;
+    toast(error.message, true);
+    throw error;
+  } finally {
+    $("inspectButton").disabled = ui.locked;
+  }
+}
+
+function setPipeline(stage, status) {
+  const writing = ["loading", "resampling", "writing", "encoding"].includes(stage);
+  $("stepInspect").className = stage === "checking" ? "active" : "done";
+  $("stepWrite").className = writing ? "active" : (["finalizing", "complete"].includes(stage) ? "done" : "");
+  $("stepValidate").className = stage === "finalizing" ? "active" : (stage === "complete" ? "done" : "");
+  if (["failed", "cancelled"].includes(status)) {
+    [$("stepInspect"), $("stepWrite"), $("stepValidate")].forEach((node) => node.classList.remove("active"));
+  }
+}
+
+function appendEvents(events, jobId) {
+  if (ui.lastJob !== jobId) {
+    ui.lastJob = jobId;
+    ui.lastEventSeq = 0;
+    $("log").replaceChildren();
+  }
+  events.filter((event) => event.seq > ui.lastEventSeq).forEach((event) => {
+    const line = document.createElement("p");
+    const time = document.createElement("time");
+    time.textContent = `${formatTime(event.elapsed)} · ${stageNames[event.stage] || event.stage}`;
+    line.append(time, document.createTextNode(
+      [event.message, event.file, event.frame ? `${event.frame}/${event.frames}` : ""].filter(Boolean).join(" · ")
+    ));
+    $("log").appendChild(line);
+    ui.lastEventSeq = event.seq;
+  });
+  $("log").scrollTop = $("log").scrollHeight;
+}
+
+function renderStatus(state) {
+  const running = state.status === "running";
+  setLocked(running);
+  if (state.plan) renderPlan(state.plan);
+  const badge = $("statusBadge");
+  badge.className = `status ${state.status}`;
+  badge.lastChild.textContent = statusNames[state.status] || state.status;
+  const event = state.events?.at(-1) || {};
+  const stage = event.stage || state.status;
+  setPipeline(stage, state.status);
+  $("phaseLabel").textContent = stageNames[stage] || statusNames[state.status] || "等待开始";
+  $("progressMessage").textContent = state.error || event.message || "输入检查完成后可启动转换。";
+  const episodes = event.episodes || state.plan?.episodes || 0;
+  const episodeProgress = Math.min(event.episode || 0, episodes);
+  let progress = episodes ? episodeProgress / episodes : 0;
+  if (event.frame && event.frames && episodes) progress = (episodeProgress + event.frame / event.frames) / episodes;
+  if (state.status === "complete") progress = 1;
+  $("progressBar").style.width = `${Math.max(0, Math.min(100, progress * 100))}%`;
+  $("progressMain").textContent = `${episodeProgress} / ${episodes} episode`;
+  $("progressFrame").textContent = event.frame ? `${event.frame} / ${event.frames} 帧` : "—";
+  $("elapsed").textContent = formatTime(event.elapsed);
+  $("writtenFrames").textContent = formatNumber(state.plan?.output_frames);
+  $("eta").textContent = progress > 0 && progress < 1 && event.elapsed
+    ? formatTime(event.elapsed * (1 - progress) / progress) : "—";
+  appendEvents(state.events || [], state.job_id);
+  const result = $("resultBox");
+  if (state.status === "complete" && state.result) {
+    const validation = state.result.validation;
+    result.className = `result-box${validation?.valid ? "" : " error"}`;
+    result.innerHTML = `<strong>${validation?.valid ? "转换与 CPU 验收通过" : "输出验收失败"}</strong><br>${escapeHtml(state.result.plan.output_root)}<br><button id="validateAgain" class="text-button" type="button">重新验收输出</button>`;
+    $("validateAgain").onclick = () => validateOutput(state.result.plan.output_root);
+  } else if (["failed", "cancelled"].includes(state.status)) {
+    result.className = "result-box error";
+    result.textContent = state.error || statusNames[state.status];
+  } else {
+    result.className = "result-box hidden";
+    result.textContent = "";
+  }
+}
+
+async function refreshStatus() {
+  try {
+    const state = await request("/api/status");
+    setConnected(true);
+    renderStatus(state);
+  } catch (error) {
+    setConnected(false);
+    $("progressMessage").textContent = error.message;
+  }
+}
+
+async function startConversion() {
+  try {
+    const plan = await inspectInput(false);
+    if (plan.warnings.length && formPayload().gap_policy === "reject") {
+      throw new Error("严格模式不允许带警告的输入")
+    }
+    const response = await request("/api/start", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(formPayload()),
+    });
+    renderPlan(response.plan);
+    setLocked(true);
+    toast(`转换任务 #${response.job_id} 已启动`);
+    await refreshStatus();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function cancelConversion() {
+  if (!window.confirm("确定取消当前转换？当前 episode 写入完成后会安全停止。")) return;
+  $("cancelButton").disabled = true;
+  try {
+    await request("/api/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    $("progressMessage").textContent = "已请求取消，正在等待安全写入点…";
+  } catch (error) {
+    toast(error.message, true);
+    $("cancelButton").disabled = false;
+  }
+}
+
+async function validateOutput(path) {
+  try {
+    const result = await request("/api/validate", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+    toast(result.valid ? `验收通过：${formatNumber(result.metrics.rows)} 帧` : result.errors.join("；"), !result.valid);
+  } catch (error) { toast(error.message, true); }
+}
+
+async function loadDefaults() {
+  ui.defaults = await request("/api/defaults");
+  $("inputDir").value = ui.defaults.input_dir;
+  $("outputRoot").value = ui.defaults.output_root || "";
+  $("task").value = ui.defaults.task;
+  $("sourceFps").value = ui.defaults.source_fps || "";
+  $("targetFps").value = ui.defaults.target_fps;
+  $("repoId").value = ui.defaults.repo_id || "";
+  $("limit").value = ui.defaults.limit;
+  document.querySelector(`input[name="actionMode"][value="${ui.defaults.action_mode}"]`).checked = true;
+  document.querySelector(`input[name="gapPolicy"][value="${ui.defaults.gap_policy}"]`).checked = true;
+  updateCommand();
+}
+
+$("configForm").addEventListener("input", invalidatePlan);
+$("configForm").addEventListener("change", invalidatePlan);
+$("inspectButton").addEventListener("click", () => inspectInput().catch(() => {}));
+$("startButton").addEventListener("click", startConversion);
+$("cancelButton").addEventListener("click", cancelConversion);
+$("refresh").addEventListener("click", refreshStatus);
+$("fileSearch").addEventListener("input", renderFileTable);
+$("issuesOnly").addEventListener("change", renderFileTable);
+$("clearLog").addEventListener("click", () => $("log").replaceChildren());
+$("copyCommand").addEventListener("click", async () => {
+  try { await navigator.clipboard.writeText($("commandPreview").textContent); toast("命令已复制"); }
+  catch { toast("浏览器未允许访问剪贴板", true); }
+});
+
+Promise.all([loadDefaults(), refreshStatus()])
+  .then(() => setConnected(true))
+  .catch((error) => { setConnected(false); toast(error.message, true); });
+setInterval(refreshStatus, 1000);

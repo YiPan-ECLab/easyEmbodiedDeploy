@@ -2,6 +2,7 @@
 """Record dual-Piper demonstrations with pyAgxArm, without normalization."""
 
 import argparse
+import math
 import select
 import sys
 import termios
@@ -15,9 +16,12 @@ from piper_recorder.camera import CAMERA_NAMES, OrbbecCamera, open_cameras
 from piper_recorder.dataset import HOME_PHASE, TASK_PHASE, EpisodeData, write_episode
 from piper_recorder.robot import DualPiper, ticks
 
-RECORD_HZ = 10
+RECORD_HZ = 30
+MAX_TASK_GAP_S = 0.35
+START_JOINT_DELTA_RAD = 0.01
+START_GRIPPER_DELTA_M = 0.002
 IMAGE_SIZE = (224, 224)
-OUTPUT_DIR = Path("/home/py/main/easyEmbodiedDeploy/datasets/hdf5/pyagxarm_recordings")
+OUTPUT_DIR = Path("/home/py/main/easyEmbodiedDeploy/datasets/hdf5/撕下快递单并贴到桌子上的快递上")
 
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
@@ -52,7 +56,6 @@ FIRMWARE_VERSION = "S-V1.9-1"
 HOME_SPEED = 30
 HOME_TIMEOUT_S = 60.0
 HOME_TOLERANCE_DEG = 1.0
-HOME_LEADER_WAIT_S = 5.0
 PREPOSITION_SPEED = 20
 PREPOSITION_TIMEOUT_S = 15.0
 ZERO_TOLERANCE_DEG = 1.0
@@ -86,7 +89,13 @@ def prompt_once(message: str) -> str:
     return answer
 
 
-def print_summary(output_dir: Path) -> None:
+def print_summary(
+    output_dir: Path,
+    record_hz: float = RECORD_HZ,
+    max_task_gap_s: float = MAX_TASK_GAP_S,
+    start_joint_delta_rad: float = START_JOINT_DELTA_RAD,
+    start_gripper_delta_m: float = START_GRIPPER_DELTA_M,
+) -> None:
     print(f"pyAgxArm 固件配置: {FIRMWARE}")
     print("机械臂映射:")
     for side, pair in PIPERS.items():
@@ -98,34 +107,154 @@ def print_summary(output_dir: Path) -> None:
     for name, serial in CAMERA_SERIALS.items():
         print(f"  {name}: {serial}")
     print(
-        f"采集 {RECORD_HZ:g} Hz，RGB {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]}，输出 {output_dir}"
+        f"采集 {record_hz:g} Hz，RGB {IMAGE_SIZE[0]}x{IMAGE_SIZE[1]}，输出 {output_dir}"
+    )
+    print(f"任务阶段最大允许采样间隔: {max_task_gap_s:g} s（超出则本次录制不保存）")
+    print(
+        f"开始动作阈值: 任一关节 {start_joint_delta_rad:g} rad，"
+        f"夹爪 {start_gripper_delta_m:g} m（阈值前静止帧丢弃）"
     )
     print("actions: 关节 rad、夹爪宽度 m，未归一化")
 
 
+def _operator_started(
+    samples: dict,
+    baseline: dict,
+    joint_delta_rad: float,
+    gripper_delta_m: float,
+) -> bool:
+    for side, sample in samples.items():
+        reference_joints, reference_width = baseline[side]
+        if max(
+            abs(current - reference)
+            for current, reference in zip(sample.action.joints, reference_joints)
+        ) >= joint_delta_rad:
+            return True
+        if abs(sample.action.gripper_width - reference_width) >= gripper_delta_m:
+            return True
+    return False
+
+
+def _validate_options(
+    hz: float,
+    max_task_gap_s: float,
+    start_joint_delta_rad: float,
+    start_gripper_delta_m: float,
+) -> None:
+    values = (
+        (hz, "采样频率"),
+        (max_task_gap_s, "空档阈值"),
+        (start_joint_delta_rad, "开始关节动作阈值"),
+        (start_gripper_delta_m, "开始夹爪动作阈值"),
+    )
+    if any(not math.isfinite(value) or value <= 0 for value, _ in values):
+        raise ValueError("采样频率、空档阈值和开始动作阈值必须是有限的正数")
+
+
 def record_episode(
-    robot: DualPiper, cameras: dict[str, OrbbecCamera], hz: float
+    robot: DualPiper,
+    cameras: dict[str, OrbbecCamera],
+    hz: float,
+    *,
+    max_task_gap_s: float = MAX_TASK_GAP_S,
+    start_joint_delta_rad: float = START_JOINT_DELTA_RAD,
+    start_gripper_delta_m: float = START_GRIPPER_DELTA_M,
 ) -> EpisodeData:
+    _validate_options(
+        hz, max_task_gap_s, start_joint_delta_rad, start_gripper_delta_m
+    )
     robot.preposition_and_start()
     episode = EpisodeData()
+    baseline_samples = robot.sample()
+    baseline = {
+        side: (sample.action.joints, sample.action.gripper_width)
+        for side, sample in baseline_samples.items()
+    }
+    recording_started = False
+    discarded_idle_frames = 0
+    previous_timestamp: float | None = None
+    previous_scheduled_at: float | None = None
 
-    def capture(phase: int) -> None:
+    def capture(phase: int, scheduled_at: float) -> bool:
+        nonlocal previous_timestamp, previous_scheduled_at
+        nonlocal recording_started, discarded_idle_frames
+        started_at = time.monotonic()
+        camera_started_at = started_at
         frames = {name: cameras[name].read() for name in CAMERA_NAMES}
-        episode.append(frames, robot.sample(), phase)
+        camera_duration = time.monotonic() - camera_started_at
+        robot_started_at = time.monotonic()
+        samples = robot.sample()
+        robot_duration = time.monotonic() - robot_started_at
+        sample_diagnostics = getattr(robot, "sample_diagnostics", lambda: {})()
+        captured_at = time.monotonic()
+        if phase == TASK_PHASE and not recording_started:
+            if _operator_started(
+                samples, baseline, start_joint_delta_rad, start_gripper_delta_m
+            ):
+                recording_started = True
+                print("\n检测到真人开始操作，正式记录 task 帧")
+            else:
+                discarded_idle_frames += 1
+                return False
+        if phase == HOME_PHASE and not recording_started:
+            return False
+        if phase == TASK_PHASE and previous_timestamp is not None:
+            interval = captured_at - previous_timestamp
+            if interval > max_task_gap_s:
+                scheduled_interval = (
+                    None
+                    if previous_scheduled_at is None
+                    else scheduled_at - previous_scheduled_at
+                )
+                print(
+                    f"\n采样空档 {interval:.3f}s 超过 {max_task_gap_s:g}s，"
+                    "本次录制已停止且不会保存。"
+                )
+                raise RuntimeError(
+                    f"任务阶段采样空档过大: {interval:.3f}s > {max_task_gap_s:g}s; "
+                    f"scheduled_gap={scheduled_interval!r}s; "
+                    f"camera={camera_duration:.3f}s robot={robot_duration:.3f}s; "
+                    f"robot_components={sample_diagnostics}"
+                )
+        episode.append(
+            frames,
+            samples,
+            phase,
+            timestamp=captured_at,
+            scheduled_timestamp=scheduled_at,
+            capture_duration_s=captured_at - started_at,
+            camera_duration_s=camera_duration,
+            robot_duration_s=robot_duration,
+        )
+        if phase == TASK_PHASE:
+            previous_timestamp = captured_at
+            previous_scheduled_at = scheduled_at
+        return True
 
     clear_pending_input()
-    print("录制中，按回车停止...")
+    print("录制中；请在 J6 预定位后开始操作，按回车停止...")
     terminal_bell()
-    for _ in ticks(hz):
+    for scheduled_at in ticks(hz):
         if select.select([sys.stdin], [], [], 0)[0]:
             sys.stdin.readline()
             clear_pending_input()
             break
-        capture(TASK_PHASE)
-        print(f"\r已录制 {len(episode)} 帧", end="", flush=True)
+        captured = capture(TASK_PHASE, scheduled_at)
+        if captured:
+            print(f"\r已录制 {len(episode)} 帧", end="", flush=True)
+        else:
+            print(
+                f"\r等待真人开始操作，已丢弃静止帧 {discarded_idle_frames} 帧",
+                end="",
+                flush=True,
+            )
 
     print("\n四台机械臂回 ZERO，四个夹爪闭合到 0 m，并继续录制...")
-    robot.home(on_sample=lambda: capture(HOME_PHASE), sample_hz=hz)
+    robot.home(
+        on_sample=lambda: capture(HOME_PHASE, time.monotonic()), sample_hz=hz
+    )
+    if not any(phase == TASK_PHASE for phase in episode.phases):
+        raise RuntimeError("没有录到任务阶段帧，不能保存")
     return episode
 
 
@@ -156,7 +285,17 @@ def check_installation() -> None:
     print("静态检查通过；未连接相机或机械臂")
 
 
-def run(output_dir: Path) -> None:
+def run(
+    output_dir: Path,
+    *,
+    record_hz: float = RECORD_HZ,
+    max_task_gap_s: float = MAX_TASK_GAP_S,
+    start_joint_delta_rad: float = START_JOINT_DELTA_RAD,
+    start_gripper_delta_m: float = START_GRIPPER_DELTA_M,
+) -> None:
+    _validate_options(
+        record_hz, max_task_gap_s, start_joint_delta_rad, start_gripper_delta_m
+    )
     aliases = [
         pair[key]
         for pair in PIPERS.values()
@@ -169,7 +308,13 @@ def run(output_dir: Path) -> None:
 
     import pyAgxArm
 
-    print_summary(output_dir)
+    print_summary(
+        output_dir,
+        record_hz,
+        max_task_gap_s,
+        start_joint_delta_rad,
+        start_gripper_delta_m,
+    )
     with ExitStack() as resources:
         cameras = open_cameras(
             CAMERA_SERIALS,
@@ -186,7 +331,6 @@ def run(output_dir: Path) -> None:
             home_speed=HOME_SPEED,
             home_timeout_s=HOME_TIMEOUT_S,
             home_tolerance_deg=HOME_TOLERANCE_DEG,
-            home_leader_wait_s=HOME_LEADER_WAIT_S,
             preposition_speed=PREPOSITION_SPEED,
             preposition_timeout_s=PREPOSITION_TIMEOUT_S,
             zero_tolerance_deg=ZERO_TOLERANCE_DEG,
@@ -209,21 +353,42 @@ def run(output_dir: Path) -> None:
                 return
             instruction = entered or instruction
             print(f"任务: {instruction or '（空）'}")
-            episode = record_episode(robot, cameras, RECORD_HZ)
-            choice = prompt_once("保存本次录制？[回车/Y=保存，n=丢弃]: ").lower()
-            if choice in ("", "y", "yes"):
-                path = write_episode(
-                    episode,
-                    instruction,
-                    output_dir,
-                    pyagxarm_version=pyAgxArm.__version__,
-                    firmware_profile=FIRMWARE,
-                    firmware_version=FIRMWARE_VERSION,
-                    gripper_force=GRIPPER_FORCE_N,
+            try:
+                episode = record_episode(
+                    robot,
+                    cameras,
+                    record_hz,
+                    max_task_gap_s=max_task_gap_s,
+                    start_joint_delta_rad=start_joint_delta_rad,
+                    start_gripper_delta_m=start_gripper_delta_m,
                 )
+            except Exception as exc:  # noqa: BLE001 - keep the recording session alive
+                print(f"本次录制失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+                print("机械臂重新回 ZERO 后继续下一条...")
+                robot.home()
+                continue
+
+            while True:
+                choice = prompt_once("保存本次录制？[回车/Y=保存，n=丢弃]: ").lower()
+                if choice not in ("", "y", "yes"):
+                    print(f"已丢弃 {len(episode)} 帧")
+                    break
+                try:
+                    path = write_episode(
+                        episode,
+                        instruction,
+                        output_dir,
+                        pyagxarm_version=pyAgxArm.__version__,
+                        firmware_profile=FIRMWARE,
+                        firmware_version=FIRMWARE_VERSION,
+                        gripper_force=GRIPPER_FORCE_N,
+                        record_hz=record_hz,
+                    )
+                except Exception as exc:  # noqa: BLE001 - allow retry or discard
+                    print(f"保存失败: {type(exc).__name__}: {exc}", file=sys.stderr)
+                    continue
                 print(f"已保存: {path} ({len(episode)} 帧)")
-            else:
-                print(f"已丢弃 {len(episode)} 帧")
+                break
 
 
 def main() -> int:
@@ -232,12 +397,36 @@ def main() -> int:
     parser.add_argument(
         "--check", action="store_true", help="只检查依赖和 pyAgxArm API，不连接硬件"
     )
+    parser.add_argument(
+        "--hz",
+        type=float,
+        default=RECORD_HZ,
+        help=f"任务采样频率，默认 {RECORD_HZ:g} Hz",
+    )
+    parser.add_argument(
+        "--max-task-gap-s", type=float, default=MAX_TASK_GAP_S,
+        help="任务阶段允许的最大相邻采样间隔，超出则停止且不保存",
+    )
+    parser.add_argument(
+        "--start-joint-delta-rad", type=float, default=START_JOINT_DELTA_RAD,
+        help="开始正式记录所需的任一关节动作幅度，默认 0.01 rad",
+    )
+    parser.add_argument(
+        "--start-gripper-delta-m", type=float, default=START_GRIPPER_DELTA_M,
+        help="开始正式记录所需的夹爪动作幅度，默认 0.002 m",
+    )
     args = parser.parse_args()
     try:
         if args.check:
             check_installation()
         else:
-            run(args.output.expanduser().resolve())
+            run(
+                args.output.expanduser().resolve(),
+                record_hz=args.hz,
+                max_task_gap_s=args.max_task_gap_s,
+                start_joint_delta_rad=args.start_joint_delta_rad,
+                start_gripper_delta_m=args.start_gripper_delta_m,
+            )
     except KeyboardInterrupt:
         print("\n已停止")
     except Exception as exc:  # noqa: BLE001 - CLI boundary prints hardware errors

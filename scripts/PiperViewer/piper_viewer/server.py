@@ -423,6 +423,10 @@ class ViewerHandler(BaseHTTPRequestHandler):
                 self.wfile.write(body)
                 return
             self._static(parsed.path)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # Browsers may cancel a stale image request while scrubbing or
+            # closing the page. The response is no longer writable.
+            return
         except Exception as exc:  # Return useful API errors without stopping the server.
             if parsed.path.startswith("/api/"):
                 self._error(exc)

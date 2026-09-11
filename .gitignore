@@ -7,6 +7,9 @@
 **/.venv/
 **/venv/
 
+# Created by setup_openpi_env.sh from the pinned upstream commit.
+/thirdParty/lerobot-openpi/
+
 # Python/runtime caches.
 **/__pycache__/
 *.py[cod]
@@ -26,6 +29,7 @@
 *.pid
 *.log
 wandb/
+/Log/
 
 # Generated outputs and heavyweight model artifacts outside models/.
 outputs/

@@ -4,22 +4,26 @@ from __future__ import annotations
 
 import argparse
 from tqdm import tqdm
-from processor import Settings, run, scan
+from processor import ACTION_MODES, GAP_POLICIES, Settings, run, scan, validate_lerobot_bundle
 
 # -------- Editable defaults (CLI flags and web form can override these) --------
 DEFAULT_INPUT_DIR = "datasets/hdf5/撕下快递单并贴到桌子上的快递上"
-DEFAULT_OUTPUT_ROOT = None  # Auto: datasets/processed/<task>_<fps>hz_<mode>
+DEFAULT_OUTPUT_ROOT = None  # Auto: datasets/lerobot/<task>_<fps>hz_<mode>
 DEFAULT_REPO_ID = None     # Local identifier; does not upload anything
-TASK_DESCRIPTION = "Remove the shipping label and place it on the package on the table."
-DEFAULT_SOURCE_FPS = None  # Infer from each HDF5's timestamps; or explicitly set 20
-DEFAULT_FPS = 20           # Output FPS, e.g. 10 for 20 -> 10 Hz
-DEFAULT_ACTION_MODE = "absolute"  # "absolute" or "delta_joint" (all 14 action dimensions)
+TASK_DESCRIPTION = "Remove the shipping label and place it on the package on the table"
+DEFAULT_SOURCE_FPS = None  # Infer from each HDF5's timestamps
+DEFAULT_FPS = 10           # Must divide every detected source FPS
+DEFAULT_ACTION_MODE = "delta_joint"  # or "absolute_joint" (all 14 action dimensions)
 DEFAULT_LIMIT = 0          # 0 = all episodes; positive values useful for a small trial
+DEFAULT_GAP_POLICY = "reject"  # reject timestamp gaps; compact is an explicit opt-in
 
 
 def defaults() -> Settings:
-    return Settings(DEFAULT_INPUT_DIR, DEFAULT_OUTPUT_ROOT, TASK_DESCRIPTION, DEFAULT_FPS,
-                    DEFAULT_SOURCE_FPS, DEFAULT_ACTION_MODE, DEFAULT_REPO_ID, DEFAULT_LIMIT)
+    return Settings(input_dir=DEFAULT_INPUT_DIR, output_root=DEFAULT_OUTPUT_ROOT,
+                    task=TASK_DESCRIPTION, target_fps=DEFAULT_FPS,
+                    source_fps=DEFAULT_SOURCE_FPS, action_mode=DEFAULT_ACTION_MODE,
+                    repo_id=DEFAULT_REPO_ID, limit=DEFAULT_LIMIT,
+                    gap_policy=DEFAULT_GAP_POLICY)
 
 
 def main() -> None:
@@ -30,12 +34,28 @@ def main() -> None:
     parser.add_argument("--task", default=TASK_DESCRIPTION)
     parser.add_argument("--source-fps", type=int, default=DEFAULT_SOURCE_FPS)
     parser.add_argument("--fps", type=int, default=DEFAULT_FPS)
-    parser.add_argument("--action-mode", choices=("absolute", "delta_joint"), default=DEFAULT_ACTION_MODE)
+    parser.add_argument("--action-mode", choices=(*ACTION_MODES, "absolute"), default=DEFAULT_ACTION_MODE,
+                        help="absolute_joint 或 delta_joint；absolute 是旧兼容别名")
+    parser.add_argument("--gap-policy", choices=GAP_POLICIES, default=DEFAULT_GAP_POLICY,
+                        help="compact 压缩时间空档，reject 遇到空档直接失败")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--inspect", action="store_true", help="Check input and preview output counts only")
+    parser.add_argument("--validate-output", metavar="PATH",
+                        help="只验收已有 LeRobot bundle，不读取 HDF5 或加载模型")
+    parser.add_argument("--validate-action-mode", choices=(*ACTION_MODES, "absolute"),
+                        help="验收没有 processing.json 时指定 action 表示")
     args = parser.parse_args()
-    settings = Settings(args.input_dir, args.output_root, args.task, args.fps,
-                        args.source_fps, args.action_mode, args.repo_id, args.limit)
+    if args.validate_output:
+        import json
+        expected = ({"action_mode": args.validate_action_mode}
+                    if args.validate_action_mode else None)
+        result = validate_lerobot_bundle(args.validate_output, expected=expected)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        raise SystemExit(0 if result["valid"] else 1)
+    settings = Settings(input_dir=args.input_dir, output_root=args.output_root,
+                        task=args.task, target_fps=args.fps, source_fps=args.source_fps,
+                        action_mode=args.action_mode, repo_id=args.repo_id, limit=args.limit,
+                        gap_policy=args.gap_policy)
     if args.inspect:
         import json
         print(json.dumps(scan(settings), ensure_ascii=False, indent=2))

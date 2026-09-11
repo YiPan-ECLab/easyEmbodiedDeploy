@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Piper · LeRobot Control Deck</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="ambient ambient-a"></div>
+    <div class="ambient ambient-b"></div>
+
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </div>
+        <div>
+          <p class="eyebrow">DUAL ARM RUNTIME</p>
+          <h1>Piper Control Deck</h1>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <button class="global-stop" id="globalStopButton">
+          <span aria-hidden="true"></span>
+          停止并回零
+        </button>
+        <div class="connection-pill" id="connectionPill">
+          <span class="status-dot"></span>
+          <span id="connectionText">正在连接控制台</span>
+        </div>
+        <button class="icon-button" id="refreshButton" title="刷新配置与状态" aria-label="刷新">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5M18.5 9A7 7 0 0 0 6.3 6.3L4 11m16 2-2.3 4.7A7 7 0 0 1 5.5 15"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="status-grid" aria-label="系统状态">
+        <article class="metric-card" id="bridgeMetric">
+          <div class="metric-icon bridge-icon"><span></span></div>
+          <div>
+            <p>硬件桥</p>
+            <strong id="bridgeState">未启动</strong>
+            <small id="bridgeMeta">等待连接</small>
+          </div>
+        </article>
+        <article class="metric-card" id="modelMetric">
+          <div class="metric-icon model-icon">π</div>
+          <div>
+            <p>模型部署</p>
+            <strong id="modelState">未启动</strong>
+            <small id="modelMeta">PI0.5 · RTC</small>
+          </div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-icon queue-icon">
+            <i></i><i></i><i></i>
+          </div>
+          <div>
+            <p>RTC 队列</p>
+            <strong id="queueValue">—</strong>
+            <small id="queueMeta">等待动作</small>
+          </div>
+        </article>
+        <article class="metric-card">
+          <div class="metric-icon pulse-icon">
+            <svg viewBox="0 0 30 20" aria-hidden="true"><path d="M1 10h6l3-7 5 15 4-8h10"/></svg>
+          </div>
+          <div>
+            <p>控制频率</p>
+            <strong><span id="controlValue">30</span> <em>Hz</em></strong>
+            <small id="frequencyMeta">Policy 10 Hz</small>
+          </div>
+        </article>
+      </section>
+
+      <section class="workspace">
+        <article class="panel configuration-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">DEPLOYMENT PROFILE</p>
+              <h2>部署配置</h2>
+            </div>
+            <span class="continuous-badge"><i></i>持续运行</span>
+          </div>
+
+          <form id="configForm" autocomplete="off">
+            <div class="form-section">
+              <div class="section-title"><span>01</span><h3>模型与任务</h3></div>
+              <label class="field wide">
+                <span>Checkpoint</span>
+                <input id="checkpoint" name="checkpoint" list="checkpointOptions" spellcheck="false">
+                <datalist id="checkpointOptions"></datalist>
+                <small id="checkpointHint">支持全量模型与 LoRA checkpoint</small>
+              </label>
+              <label class="field wide">
+                <span>任务指令</span>
+                <textarea id="task" name="task" rows="2"></textarea>
+              </label>
+              <label class="field">
+                <span>动作表示</span>
+                <select id="action_mode" name="action_mode">
+                  <option value="delta_joint">Delta Joint</option>
+                  <option value="absolute_joint">Absolute Joint</option>
+                </select>
+                <small>必须与 checkpoint 的训练动作语义一致</small>
+              </label>
+              <label class="field">
+                <span>推理显卡</span>
+                <select id="device" name="device">
+                  <option value="cuda:0">GPU 0</option>
+                  <option value="cpu">CPU</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="form-section">
+              <div class="section-title"><span>02</span><h3>推理与 RTC</h3></div>
+              <label class="field">
+                <span>推理模式</span>
+                <select id="inference_mode" name="inference_mode">
+                  <option value="rtc">RTC 异步推理</option>
+                  <option value="sync">同步推理</option>
+                </select>
+              </label>
+              <label class="field rtc-field">
+                <span>RTC 模式</span>
+                <select id="rtc_mode" name="rtc_mode">
+                  <option value="guided">Guided</option>
+                  <option value="trained">Trained</option>
+                </select>
+              </label>
+              <label class="field rtc-field">
+                <span>RTC 衔接时域 <b title="新旧 chunk 的衔接动作步数">?</b></span>
+                <div class="number-control"><input id="rtc_horizon" name="rtc_horizon" type="number" min="1" step="1"><i>步</i></div>
+              </label>
+              <label class="field rtc-field">
+                <span>队列补充阈值 <b title="队列剩余动作达到此值时启动下一次推理">?</b></span>
+                <div class="number-control"><input id="rtc_queue_threshold" name="rtc_queue_threshold" type="number" min="0" step="1"><i>步</i></div>
+              </label>
+            </div>
+
+            <div class="form-section frequency-section">
+              <div class="section-title"><span>03</span><h3>动作与底层控制</h3></div>
+              <label class="field featured-field">
+                <span>Policy Hz <b title="从模型 action queue 取得新动作的频率">?</b></span>
+                <div class="number-control"><input id="policy_hz" name="policy_hz" type="number" min="0.001" max="200" step="1"><i>Hz</i></div>
+                <small>新模型动作消费频率</small>
+              </label>
+              <label class="field featured-field">
+                <span>Control Hz <b title="向每个 follower 发送 move_js 目标的频率">?</b></span>
+                <div class="number-control"><input id="control_hz" name="control_hz" type="number" min="1" max="200" step="1"><i>Hz</i></div>
+                <small>move_js 实际发送频率</small>
+              </label>
+              <label class="field featured-field">
+                <span>平滑时间常数 <b title="绝对目标一阶低通，0 表示关闭">?</b></span>
+                <div class="number-control"><input id="smoothing_time_constant" name="smoothing_time_constant" type="number" min="0" max="2" step="0.01"><i>s</i></div>
+                <small id="smoothingHint">30 Hz 下每步逼近 28.35%</small>
+              </label>
+              <div class="frequency-flow wide">
+                <div><strong id="flowPolicy">10 Hz</strong><span>Action queue</span></div>
+                <i>→</i>
+                <div><strong>绝对目标</strong><span>转换 · 限位 · 低通</span></div>
+                <i>→</i>
+                <div><strong id="flowControl">30 Hz</strong><span>move_js × 2</span></div>
+              </div>
+            </div>
+
+            <details class="advanced-section">
+              <summary><span>高级参数</span><small>连接、诊断与复现</small></summary>
+              <div class="advanced-grid">
+                <label class="field wide">
+                  <span>桥接地址</span>
+                  <input id="bridge_endpoint" name="bridge_endpoint" spellcheck="false">
+                </label>
+                <label class="field">
+                  <span>最大策略步数</span>
+                  <div class="number-control"><input id="max_steps" name="max_steps" type="number" min="0" step="1"><i>步</i></div>
+                  <small>0 表示持续运行</small>
+                </label>
+                <label class="field">
+                  <span>随机种子</span>
+                  <input id="seed" name="seed" type="number" min="0" step="1">
+                </label>
+                <label class="field">
+                  <span>RPC 超时</span>
+                  <div class="number-control"><input id="rpc_timeout" name="rpc_timeout" type="number" min="0.1" step="0.1"><i>s</i></div>
+                </label>
+                <label class="field">
+                  <span>看门狗超时</span>
+                  <div class="number-control"><input id="watchdog_timeout" name="watchdog_timeout" type="number" min="5" step="1"><i>s</i></div>
+                </label>
+                <label class="field wide">
+                  <span>诊断 JSONL</span>
+                  <input id="diagnostics_jsonl" name="diagnostics_jsonl" spellcheck="false">
+                </label>
+              </div>
+            </details>
+          </form>
+        </article>
+
+        <aside class="side-column">
+          <article class="panel launch-panel">
+            <div class="panel-heading compact">
+              <div>
+                <p class="eyebrow">RUN CONTROL</p>
+                <h2>流程控制</h2>
+              </div>
+              <span class="safety-badge"><i></i> Follower only</span>
+            </div>
+            <div class="safety-flow">
+              <div><span>1</span><p><strong>硬件桥</strong><small>相机 · 回零 · J6 内旋</small></p><i id="stepBridge"></i></div>
+              <div><span>2</span><p><strong>PI0.5</strong><small>权重 · Processor · RTC</small></p><i id="stepModel"></i></div>
+              <div><span>3</span><p><strong>执行</strong><small>限位 · 低通 · move_js</small></p><i id="stepRun"></i></div>
+            </div>
+            <div class="primary-actions">
+              <button class="button primary" id="startStackButton">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m8 5 11 7-11 7Z"/></svg>
+                启动完整流程
+              </button>
+              <button class="button danger" id="stopButton">
+                <span></span>安全停止
+              </button>
+            </div>
+            <div class="secondary-actions">
+              <button class="button ghost" id="startBridgeButton">仅启动硬件桥</button>
+              <button class="button ghost" id="startModelButton">仅启动模型端</button>
+            </div>
+            <p class="action-note" id="actionNote">启动后先执行 follower 回零和夹爪闭合，再进入推理。</p>
+          </article>
+
+          <article class="panel hardware-panel">
+            <div class="panel-heading compact">
+              <div><p class="eyebrow">SYSTEM</p><h2>计算资源</h2></div>
+            </div>
+            <div id="gpuList" class="gpu-list"><p class="empty-state">正在读取 GPU…</p></div>
+            <div class="hardware-tags">
+              <span>Joints · rad</span><span>Gripper · 0–0.1 m</span><span>Protocol · v3</span>
+            </div>
+          </article>
+
+          <article class="panel command-panel">
+            <div class="panel-heading compact">
+              <div><p class="eyebrow">COMMAND</p><h2>命令预览</h2></div>
+              <button class="text-button" id="copyCommandButton">复制</button>
+            </div>
+            <pre id="commandPreview">正在生成命令…</pre>
+          </article>
+        </aside>
+      </section>
+
+      <section class="telemetry-grid">
+        <article class="panel chart-panel">
+          <div class="panel-heading compact">
+            <div><p class="eyebrow">RTC TELEMETRY</p><h2>队列深度</h2></div>
+            <div class="chart-legend"><i></i><span>Action queue</span></div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="queueChart"></canvas>
+            <p class="chart-empty" id="queueEmpty">启动部署后显示实时队列</p>
+          </div>
+          <div class="chart-stats">
+            <span>当前 <strong id="queueCurrent">—</strong></span>
+            <span>最低 <strong id="queueMinimum">—</strong></span>
+            <span>限位 <strong id="clippedTicks">0</strong></span>
+          </div>
+        </article>
+
+        <article class="panel chart-panel">
+          <div class="panel-heading compact">
+            <div><p class="eyebrow">LOOP LATENCY</p><h2>控制循环</h2></div>
+            <div class="chart-legend latency"><i></i><span>Tick ms</span></div>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="latencyChart"></canvas>
+            <p class="chart-empty" id="latencyEmpty">等待控制循环数据</p>
+          </div>
+          <div class="chart-stats">
+            <span>推理中位数 <strong id="inferenceMedian">—</strong></span>
+            <span>运行饿死 <strong id="starvedTicks">—</strong></span>
+            <span>实测控制 <strong id="achievedHz">—</strong></span>
+          </div>
+        </article>
+      </section>
+
+      <section class="panel log-panel">
+        <div class="panel-heading compact">
+          <div><p class="eyebrow">LIVE OUTPUT</p><h2>运行日志</h2></div>
+          <div class="log-tools">
+            <label class="autoscroll"><input id="autoScroll" type="checkbox" checked><span>自动滚动</span></label>
+            <button class="text-button" id="clearLogsButton">清空</button>
+          </div>
+        </div>
+        <div class="terminal" id="terminal" role="log" aria-live="polite">
+          <div class="terminal-placeholder" id="terminalPlaceholder">
+            <span>&gt;_</span>
+            <p>等待启动命令</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <div class="toast-stack" id="toastStack" aria-live="assertive"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

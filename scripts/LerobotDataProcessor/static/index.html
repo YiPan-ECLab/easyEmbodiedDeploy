@@ -1,3 +1,119 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DataProcessor</title><link rel="stylesheet" href="/styles.css"></head><body>
-<main><header><div><p class="eyebrow">PIPER · LEROBOT</p><h1>DataProcessor</h1><p class="subtitle">HDF5 → 降采样 → 动作表示 → LeRobot v3</p></div><div class="status-wrap"><span id="status" class="badge">空闲</span><span id="elapsed" class="muted">未开始</span></div></header>
-<div class="layout"><section class="content"><section class="card"><div class="card-title"><h2>处理配置</h2><span class="step">1 / 2</span></div><label>输入 HDF5 目录<input id="input" type="text"></label><label>输出目录（留空自动生成）<input id="output" type="text" placeholder="自动生成"></label><div class="row"><label>源 FPS <span class="optional">留空自动检测</span><input id="source" type="number" min="1" placeholder="自动检测"></label><label>目标 FPS<select id="fps"><option>20</option><option>10</option><option>5</option><option>4</option><option>2</option><option>1</option></select></label></div><label>任务描述<textarea id="task" rows="2"></textarea></label><label>动作表示<select id="mode"><option value="absolute">绝对关节动作</option><option value="delta_joint">增量关节动作（降采样后 t+1 − t）</option></select></label><div class="actions"><button id="inspect" class="secondary">检查输入</button><button id="start">开始处理</button><button id="cancel" class="danger hidden">取消处理</button></div><p class="hint">目标 FPS 必须整除每个 HDF5 的实际源 FPS。开始后配置会锁定，避免重复处理。</p></section><section id="plan" class="card hidden"><div class="card-title"><h2>输入检查</h2><span id="plan-summary" class="muted"></span></div><pre id="plantext"></pre></section><section class="card progress-card"><div class="card-title"><h2>当前进度</h2><span id="phase" class="phase">等待开始</span></div><div class="big-progress"><i id="bar"></i></div><div class="progress-numbers"><strong id="episode-count">0 / 0 条</strong><strong id="frame-count">—</strong></div><p id="message" class="message">先检查输入，然后开始处理</p><div class="stats"><div><span>已用时间</span><strong id="time">—</strong></div><div><span>预计剩余</span><strong id="eta">—</strong></div><div><span>输出帧数</span><strong id="total-frames">—</strong></div></div><div id="result" class="result hidden"></div></section></section><aside class="logs card"><div class="card-title"><h2>实时日志</h2><button id="clear-log" class="tiny">清空</button></div><div id="log" class="log" aria-live="polite"><p class="log-empty">处理日志会显示在这里</p></div></aside></div></main><script src="/app.js"></script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <link rel="icon" href="data:,">
+    <title>LeRobot Data Forge</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <div><p class="eyebrow">PIPER DATA PIPELINE</p><h1>LeRobot Data Forge</h1></div>
+      </div>
+      <div class="top-actions">
+        <span id="connection" class="connection"><i></i><b>连接中</b></span>
+        <button id="refresh" class="icon-button" type="button" title="刷新服务状态" aria-label="刷新">↻</button>
+      </div>
+    </header>
+
+    <main class="shell">
+      <section class="metrics" aria-label="数据摘要">
+        <article><span>EP</span><div><small>Episode</small><strong id="metricEpisodes">—</strong><em id="metricEpisodeMeta">等待检查</em></div></article>
+        <article><span>IN</span><div><small>源数据帧</small><strong id="metricInput">—</strong><em id="metricInputMeta">HDF5 task + home</em></div></article>
+        <article><span>OUT</span><div><small>预计输出</small><strong id="metricOutput">—</strong><em id="metricOutputMeta">等待配置</em></div></article>
+        <article><span>QA</span><div><small>质量检查</small><strong id="metricQuality">未检查</strong><em id="metricQualityMeta">严格时序与限位</em></div></article>
+      </section>
+
+      <div class="workspace">
+        <section class="panel config-panel">
+          <div class="panel-head">
+            <div><p class="eyebrow">CONVERSION PROFILE</p><h2>转换配置</h2></div>
+            <span class="cpu-badge"><i></i>CPU only</span>
+          </div>
+          <form id="configForm" autocomplete="off">
+            <fieldset>
+              <legend><b>01</b>路径与任务</legend>
+              <label class="field wide"><span>输入 HDF5 目录</span><input id="inputDir" spellcheck="false" required></label>
+              <label class="field wide"><span>输出 bundle 目录 <small>必须尚不存在</small></span><input id="outputRoot" spellcheck="false" placeholder="留空时自动生成"></label>
+              <label class="field wide"><span>任务指令</span><textarea id="task" rows="2" required></textarea></label>
+            </fieldset>
+
+            <fieldset>
+              <legend><b>02</b>采样与动作</legend>
+              <label class="field"><span>目标频率</span><span class="number-input"><input id="targetFps" type="number" min="1" step="1" required><i>Hz</i></span></label>
+              <label class="field"><span>源频率 <small>留空自动检测</small></span><span class="number-input"><input id="sourceFps" type="number" min="1" step="1" placeholder="Auto"><i>Hz</i></span></label>
+              <div class="field wide"><span>动作表示</span><div class="segmented" id="actionMode">
+                <label><input type="radio" name="actionMode" value="absolute_joint"><b>Absolute</b><small>绝对关节目标</small></label>
+                <label><input type="radio" name="actionMode" value="delta_joint"><b>Delta</b><small>降采样后 t+1 − t</small></label>
+              </div></div>
+              <div class="field wide"><span>时间空档策略</span><div class="segmented compact" id="gapPolicy">
+                <label><input type="radio" name="gapPolicy" value="reject"><b>严格拒绝</b><small>推荐用于最终数据</small></label>
+                <label><input type="radio" name="gapPolicy" value="compact"><b>压缩空档</b><small>保留并生成警告</small></label>
+              </div></div>
+            </fieldset>
+
+            <details>
+              <summary><span>高级配置</span><small>Repo ID 与文件上限</small></summary>
+              <div class="advanced-grid">
+                <label class="field"><span>Repo ID <small>留空自动生成</small></span><input id="repoId" spellcheck="false" placeholder="local/piper_..."></label>
+                <label class="field"><span>最多处理文件 <small>0 表示全部</small></span><input id="limit" type="number" min="0" step="1" value="0"></label>
+              </div>
+            </details>
+          </form>
+        </section>
+
+        <aside class="side-column">
+          <section class="panel run-panel">
+            <div class="panel-head compact"><div><p class="eyebrow">RUN CONTROL</p><h2>执行流程</h2></div><span id="statusBadge" class="status idle"><i></i>空闲</span></div>
+            <ol class="pipeline">
+              <li id="stepInspect"><b>1</b><span><strong>检查源数据</strong><small>阶段、限位、时序、相机</small></span><i></i></li>
+              <li id="stepWrite"><b>2</b><span><strong>写入 LeRobot</strong><small>裁尾、降采样、动作转换</small></span><i></i></li>
+              <li id="stepValidate"><b>3</b><span><strong>CPU 验收</strong><small>Parquet、统计量、三路视频</small></span><i></i></li>
+            </ol>
+            <div class="run-actions">
+              <button id="inspectButton" class="button secondary" type="button"><span>✓</span>检查输入</button>
+              <button id="startButton" class="button primary" type="button"><span>▶</span>开始转换</button>
+              <button id="cancelButton" class="button danger hidden" type="button"><span>■</span>取消任务</button>
+            </div>
+            <p id="runNote" class="run-note">先执行检查，确认计划后再开始转换。</p>
+          </section>
+
+          <section class="panel command-panel">
+            <div class="panel-head compact"><div><p class="eyebrow">REPRODUCIBLE CLI</p><h2>命令预览</h2></div><button id="copyCommand" class="text-button" type="button">复制</button></div>
+            <pre id="commandPreview"></pre>
+          </section>
+        </aside>
+      </div>
+
+      <section id="inspectionPanel" class="panel inspection-panel hidden">
+        <div class="panel-head">
+          <div><p class="eyebrow">INPUT AUDIT</p><h2>输入质量与转换计划</h2></div>
+          <div class="table-tools"><input id="fileSearch" type="search" placeholder="筛选文件名"><label><input id="issuesOnly" type="checkbox">只看异常</label></div>
+        </div>
+        <div id="warningBox" class="warning-box hidden"></div>
+        <div class="table-wrap"><table><thead><tr><th>文件</th><th>源帧</th><th>Task</th><th>Home</th><th>裁尾</th><th>实测 FPS</th><th>输出</th><th>最大相机偏差</th><th>空档</th></tr></thead><tbody id="fileTable"></tbody></table></div>
+      </section>
+
+      <section class="execution-grid">
+        <section class="panel progress-panel">
+          <div class="panel-head compact"><div><p class="eyebrow">LIVE PROGRESS</p><h2>处理进度</h2></div><span id="phaseLabel">等待开始</span></div>
+          <div class="progress-track"><i id="progressBar"></i></div>
+          <div class="progress-copy"><strong id="progressMain">0 / 0 episode</strong><span id="progressFrame">—</span></div>
+          <p id="progressMessage">输入检查完成后可启动转换。</p>
+          <dl><div><dt>已用时间</dt><dd id="elapsed">—</dd></div><div><dt>预计剩余</dt><dd id="eta">—</dd></div><div><dt>预计输出</dt><dd id="writtenFrames">—</dd></div></dl>
+          <div id="resultBox" class="result-box hidden"></div>
+        </section>
+        <section class="panel log-panel">
+          <div class="panel-head compact"><div><p class="eyebrow">EVENT STREAM</p><h2>实时日志</h2></div><button id="clearLog" class="text-button" type="button">清空</button></div>
+          <div id="log" class="log" aria-live="polite"><p class="empty">尚无事件</p></div>
+        </section>
+      </section>
+    </main>
+    <div id="toast" class="toast" role="status"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
