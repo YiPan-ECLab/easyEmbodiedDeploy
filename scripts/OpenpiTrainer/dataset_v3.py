@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,9 @@ import numpy as np
 
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 IMAGE_KEYS = tuple(f"observation.images.{name}" for name in CAMERAS)
+VIDEO_BACKEND = os.environ.get("OPENPI_VIDEO_BACKEND", "torchcodec").strip().lower()
+if VIDEO_BACKEND not in {"torchcodec", "pyav"}:
+    raise ValueError("OPENPI_VIDEO_BACKEND must be torchcodec or pyav")
 
 
 def _read_parquet_files(paths: list[Path], columns: list[str] | None = None):
@@ -104,7 +108,11 @@ class LeRobotV3Dataset:
             path,
             [timestamp],
             tolerance_s=max(1e-4, 0.51 / self.fps),
-            backend="pyav",
+            # TorchCodec avoids the long-lived PyAV/libdav1d decoder growth
+            # seen with AV1 videos when several DataLoader workers prefetch.
+            # Set OPENPI_VIDEO_BACKEND=pyav only for an older environment that
+            # does not provide TorchCodec.
+            backend=VIDEO_BACKEND,
         )
         frame = frames[0]
         if tuple(frame.shape) != (3, 224, 224):
