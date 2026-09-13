@@ -12,6 +12,9 @@ import web_server  # noqa: E402
 
 
 class WebServerTests(unittest.TestCase):
+    def test_web_default_gpu_is_auto(self):
+        self.assertEqual(web_server.DEFAULT_CONFIG["gpu_ids"], "auto")
+
     def test_static_assets_exist(self):
         for name in ("index.html", "styles.css", "app.js"):
             path = web_server.STATIC_DIR / name

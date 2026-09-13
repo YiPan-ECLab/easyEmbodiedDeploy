@@ -133,6 +133,33 @@ class RuntimeTest(unittest.TestCase):
         finally:
             engine.close()
 
+    def test_trained_rtc_conditions_on_measured_latency_not_training_limit(self) -> None:
+        policy = FakePolicy(delay_s=0.01)
+        settings = RTCSettings(
+            mode="trained",
+            horizon=10,
+            queue_threshold=40,
+            policy_hz=100.0,
+            training_max_delay=5,
+        )
+        sampler = PolicyChunkSampler(policy, "task", settings)
+        engine = AsyncRTCActionEngine(sampler, settings)
+        try:
+            self.assertTrue(engine.prefill(observation(), timeout_s=1.0))
+            while engine.queue_size > settings.queue_threshold:
+                self.assertIsNotNone(engine.get_action(observation()))
+            deadline = time.monotonic() + 1.0
+            while len(engine.enqueue_events) < 2 and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertGreaterEqual(len(engine.enqueue_events), 2)
+            event = engine.enqueue_events[-1]
+            # 10 ms at 100 Hz is about one frame; it must not be replaced by
+            # the checkpoint's train-time maximum of five frames.
+            self.assertLess(event["conditioned_delay"], settings.training_max_delay)
+            self.assertGreaterEqual(event["conditioned_delay"], 1)
+        finally:
+            engine.close()
+
     def test_async_prefill_starts_with_an_action_ready(self) -> None:
         policy = FakePolicy(delay_s=0.01)
         settings = RTCSettings(horizon=20, queue_threshold=40, policy_hz=100.0)

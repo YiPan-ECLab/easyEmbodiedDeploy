@@ -77,7 +77,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "gradient_checkpointing": True,
     "save_checkpoint": True,
     "device": "cuda",
-    "gpu_ids": "1",
+    # Resolve to the first locally visible GPU at request time.  A physical
+    # GPU 1 is not present on a single-GPU host, so a fixed index makes the
+    # fresh web form unusable after migration.
+    "gpu_ids": "auto",
     "wandb_enabled": True,
     "wandb_project": "piper-pi05",
     "wandb_entity": "",

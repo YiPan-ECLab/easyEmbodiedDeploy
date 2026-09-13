@@ -384,20 +384,18 @@ class AsyncRTCActionEngine:
                 self._in_flight = True
             has_previous_actions = previous_actions is not None and len(previous_actions) > 0
             if has_previous_actions:
+                # The prefix is conditioned on the measured wall-clock cost
+                # of the preceding inference.  A trained checkpoint can only
+                # condition on prefixes seen during training, so its maximum
+                # is a cap after estimating the runtime delay, never the
+                # runtime delay estimate itself.
+                observed_latency = max(self.sampler.latencies, default=0.0)
+                inference_delay = max(
+                    1,
+                    int(math.ceil(observed_latency * self.settings.policy_hz)),
+                )
                 if self.settings.mode == "trained" and self.settings.training_max_delay > 0:
-                    # A train-time checkpoint needs a valid overlap on the
-                    # first transition even before a measured latency exists.
-                    inference_delay = self.settings.training_max_delay
-                else:
-                    # Use the observed maximum rather than queue depth (or a
-                    # smoothed average).  A single slow JAX call must not
-                    # leave the next prefix under-conditioned and produce a
-                    # visible boundary recoil.
-                    observed_latency = max(self.sampler.latencies, default=0.0)
-                    inference_delay = max(
-                        1,
-                        int(math.ceil(observed_latency * self.settings.policy_hz)),
-                    )
+                    inference_delay = min(inference_delay, self.settings.training_max_delay)
                 inference_delay = min(inference_delay, len(previous_actions), ACTION_HORIZON - 1)
             else:
                 inference_delay = 0

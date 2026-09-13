@@ -182,6 +182,14 @@ class TrainerCoreTests(unittest.TestCase):
         self.assertEqual(command[command.index("--fsdp-devices") + 1], "2")
         self.assertEqual(trainer.build_environment(config)["CUDA_VISIBLE_DEVICES"], "0,2")
 
+    @mock.patch.object(trainer, "available_gpu_indices", return_value=(0,))
+    def test_auto_gpu_selects_gpu_zero_on_single_gpu_host(self, _available):
+        config = trainer.config_from_mapping(
+            raw_config(self.dataset, self.model, self.root / "out", device="cuda", gpu_ids="auto")
+        )
+        self.assertEqual(config.gpu_ids, (0,))
+        self.assertEqual(trainer.build_environment(config)["CUDA_VISIBLE_DEVICES"], "0")
+
 
 if __name__ == "__main__":
     unittest.main()

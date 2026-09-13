@@ -21,7 +21,7 @@ MAX_TASK_GAP_S = 0.35
 START_JOINT_DELTA_RAD = 0.01
 START_GRIPPER_DELTA_M = 0.002
 IMAGE_SIZE = (224, 224)
-OUTPUT_DIR = Path("/home/py/main/easyEmbodiedDeploy/datasets/hdf5/撕下快递单并贴到桌子上的快递上")
+OUTPUT_DIR = Path("/home/py/main/easyEmbodiedDeploy/datasets/hdf5/撕下快递单并贴到桌子上的快递上_test")
 
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480

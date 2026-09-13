@@ -124,7 +124,12 @@ def _integer(value: Any, name: str, *, minimum: int = 0) -> int:
     return number
 
 
-def parse_gpu_ids(value: Any) -> tuple[int, ...]:
+def parse_gpu_ids(value: Any, *, detected: tuple[int, ...] | None = None) -> tuple[int, ...]:
+    if isinstance(value, str) and value.strip().lower() in {"", "auto"}:
+        visible = available_gpu_indices() if detected is None else detected
+        if not visible:
+            raise TrainerConfigError("未检测到 NVIDIA GPU")
+        return (visible[0],)
     if isinstance(value, (list, tuple)):
         parts = [str(item).strip() for item in value]
     else:
@@ -208,14 +213,16 @@ def config_from_mapping(raw: dict[str, Any], *, check_output: bool = True) -> Tr
     device = str(raw.get("device", "cuda")).strip()
     if device not in {"cuda", "cpu"}:
         raise TrainerConfigError("设备必须是 cuda 或 cpu")
-    gpu_ids = parse_gpu_ids(raw.get("gpu_ids", "0")) if device == "cuda" else ()
     detected = available_gpu_indices()
     if device == "cuda":
         if not detected:
             raise TrainerConfigError("未检测到 NVIDIA GPU")
+        gpu_ids = parse_gpu_ids(raw.get("gpu_ids", "auto"), detected=detected)
         missing = sorted(set(gpu_ids).difference(detected))
         if missing:
             raise TrainerConfigError(f"GPU 不存在：{missing}；可用编号：{list(detected)}")
+    else:
+        gpu_ids = ()
 
     action_mode = str(raw.get("action_mode", "delta_joint"))
     normalization_mode = str(raw.get("normalization_mode", "quantiles"))

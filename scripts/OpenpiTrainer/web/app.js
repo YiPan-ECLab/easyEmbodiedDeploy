@@ -20,6 +20,11 @@ let previewTimer = null;
 let statusTimer = null;
 let logsTimer = null;
 
+function firstVisibleGpu() {
+  const gpus = bootstrap?.status?.gpu || [];
+  return gpus.length ? gpus[0].index : 0;
+}
+
 function markProfile(profile) {
   document.querySelectorAll('[data-profile]').forEach((node) => node.classList.toggle('active', node.dataset.profile === profile));
 }
@@ -69,7 +74,10 @@ function setField(name, value) {
 
 function applyConfig(config) {
   for (const [key, value] of Object.entries(config)) setField(key, value);
-  selectedGpus = new Set(String(config.gpu_ids ?? '0').split(',').map(Number).filter(Number.isInteger));
+  const requested = String(config.gpu_ids ?? 'auto').trim().toLowerCase();
+  selectedGpus = requested === 'auto'
+    ? new Set([firstVisibleGpu()])
+    : new Set(requested.split(',').map(Number).filter(Number.isInteger));
   if (!selectedGpus.size) selectedGpus.add(0);
   updateConditionalFields();
 }
@@ -146,7 +154,7 @@ function applyProfile(profile) {
     setField('device','cuda'); selectedGpus = new Set([0]);
     const root = bootstrap?.defaults?.output_dir ? bootstrap.defaults.output_dir.replace(/openpi_pi05_.+$/, '') : '';
     const stamp = new Date().toISOString().replace(/[-:TZ.]/g,'').slice(0,14);
-    setField('output_dir', `${root}openpi_pi05_gpu1_smoke_${stamp}`);
+    setField('output_dir', `${root}openpi_pi05_gpu_smoke_${stamp}`);
   }
   renderGpuPicker(lastStatus?.gpu || bootstrap?.status?.gpu || []);
   updateConditionalFields(); markProfile(profile); updatePreviewSoon();
