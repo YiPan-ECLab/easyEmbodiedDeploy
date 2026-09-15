@@ -209,13 +209,13 @@ async function updatePreview() {
   }
 }
 
-function renderGpu(gpus) {
+function renderGpu(gpus, error = "") {
   const list = $("#gpuList");
   list.replaceChildren();
   if (!gpus || !gpus.length) {
     const empty = document.createElement("p");
     empty.className = "empty-state";
-    empty.textContent = "未读取到 NVIDIA GPU";
+    empty.textContent = error ? `GPU 探测失败：${error}` : "未读取到 NVIDIA GPU";
     list.append(empty);
     return;
   }
@@ -321,7 +321,7 @@ function renderStatus(status) {
     $("#actionNote").textContent = "安全停止等价于 Ctrl-C，并等待 follower 关节与夹爪回 ZERO。";
   }
 
-  renderGpu(status.gpu);
+  renderGpu(status.gpu, status.gpu_error);
   renderCharts(diagnostics.points || []);
 }
 

@@ -91,6 +91,34 @@ class WebConsoleConfigurationTest(unittest.TestCase):
         self.assertEqual(checkpoint["action_mode"], "delta_joint")
         self.assertEqual(checkpoint["n_action_steps"], 10)
 
+    def test_migrated_manifest_falls_back_to_local_checkpoint_directory(self) -> None:
+        manifest_path = self.normal / "training_manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["config"]["output_dir"] = str(self.root / "old-server-only" / "run")
+        manifest_path.write_text(json.dumps(manifest))
+        with mock.patch.object(web_server, "ROOT", self.root):
+            checkpoints = discover_checkpoints()
+        self.assertTrue(any(item["path"] == str(self.normal) for item in checkpoints))
+
+    def test_gpu_status_reports_driver_error(self) -> None:
+        supervisor = web_server.ProcessSupervisor()
+        result = mock.Mock(returncode=9, stdout="", stderr="driver unavailable")
+        with mock.patch.object(web_server.subprocess, "run", return_value=result):
+            self.assertEqual(supervisor._gpu_status(), [])
+        self.assertEqual(supervisor._gpu_error, "driver unavailable")
+
+    def test_gpu_status_parses_valid_rows(self) -> None:
+        supervisor = web_server.ProcessSupervisor()
+        result = mock.Mock(
+            returncode=0,
+            stdout="0, NVIDIA Test, 10, 100, 20\n1, NVIDIA Test 2, 0, 200, 0\n",
+            stderr="",
+        )
+        with mock.patch.object(web_server.subprocess, "run", return_value=result):
+            rows = supervisor._gpu_status()
+        self.assertEqual([row["index"] for row in rows], [0, 1])
+        self.assertIsNone(supervisor._gpu_error)
+
     def test_live_diagnostics_separate_prefill_from_runtime_starvation(self) -> None:
         path = self.root / "diagnostics.jsonl"
         path.write_text(

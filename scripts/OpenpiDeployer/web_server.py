@@ -342,6 +342,7 @@ class ProcessSupervisor:
         self._diagnostics_path: Path | None = None
         self._runtime_summary: dict[str, Any] | None = None
         self._gpu_cache: tuple[float, list[dict[str, Any]]] = (0.0, [])
+        self._gpu_error: str | None = None
         self._last_endpoint = DEFAULT_ENDPOINT
 
     def log(self, source: str, message: str, level: str = "info") -> None:
@@ -647,21 +648,39 @@ class ProcessSupervisor:
                 timeout=2,
                 check=False,
             )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()
+                raise RuntimeError(
+                    detail or f"nvidia-smi exited with status {result.returncode}"
+                )
             rows = []
             for line in result.stdout.splitlines():
                 parts = [part.strip() for part in line.split(",")]
                 if len(parts) == 5:
+                    try:
+                        index = int(parts[0])
+                    except ValueError:
+                        continue
+
+                    def metric(value: str) -> int:
+                        try:
+                            return int(value)
+                        except ValueError:
+                            return 0
+
                     rows.append(
                         {
-                            "index": int(parts[0]),
+                            "index": index,
                             "name": parts[1],
-                            "memory_used_mb": int(parts[2]),
-                            "memory_total_mb": int(parts[3]),
-                            "utilization": int(parts[4]),
+                            "memory_used_mb": metric(parts[2]),
+                            "memory_total_mb": metric(parts[3]),
+                            "utilization": metric(parts[4]),
                         }
                     )
-        except (OSError, ValueError, subprocess.TimeoutExpired):
+            self._gpu_error = None
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             rows = []
+            self._gpu_error = str(exc)
         self._gpu_cache = (now, rows)
         return rows
 
@@ -757,8 +776,29 @@ class ProcessSupervisor:
             "bridge_port_open": port_is_open(endpoint),
             "external_processes": self._external_processes(),
             "gpu": self._gpu_status(),
+            "gpu_error": self._gpu_error,
             "diagnostics": self.diagnostics(),
         }
+
+
+def _numeric_checkpoints(run: Path) -> list[Path]:
+    """Return readable numeric checkpoint directories without propagating stale-path errors."""
+    try:
+        candidates = [
+            child
+            for child in run.iterdir()
+            if child.is_dir() and child.name.isdigit()
+        ]
+    except OSError:
+        return []
+    readable: list[Path] = []
+    for child in candidates:
+        try:
+            if (child / "params/_METADATA").is_file():
+                readable.append(child)
+        except OSError:
+            continue
+    return sorted(readable, key=lambda item: int(item.name))
 
 
 def discover_checkpoints() -> list[dict[str, Any]]:
@@ -767,7 +807,11 @@ def discover_checkpoints() -> list[dict[str, Any]]:
     if not base.is_dir():
         return items
     seen: set[Path] = set()
-    for config_path in sorted(base.rglob("training_manifest.json")):
+    try:
+        manifests = sorted(base.rglob("training_manifest.json"))
+    except OSError:
+        return items
+    for config_path in manifests:
         try:
             manifest = json.loads(config_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -775,19 +819,40 @@ def discover_checkpoints() -> list[dict[str, Any]]:
         if manifest.get("trainer") != "OpenpiTrainer":
             continue
         config = manifest.get("config", {})
-        run = Path(config.get("output_dir", config_path.parent)).resolve()
-        numeric = sorted(
-            (item for item in run.glob("[0-9]*") if item.is_dir() and item.name.isdigit()),
-            key=lambda item: int(item.name),
-        )
-        directory = numeric[-1] if numeric else config_path.parent
-        if directory in seen or not (directory / "params/_METADATA").is_file():
+        local_run = config_path.parent
+        if local_run.name.isdigit():
+            local_run = local_run.parent
+        configured_run = Path(config.get("output_dir", local_run)).expanduser()
+        if not configured_run.is_absolute():
+            configured_run = ROOT / configured_run
+        candidate_runs = [local_run.resolve()]
+        configured_run = configured_run.resolve()
+        if configured_run not in candidate_runs:
+            candidate_runs.append(configured_run)
+
+        directory = None
+        for run in candidate_runs:
+            numeric = _numeric_checkpoints(run)
+            if numeric:
+                directory = numeric[-1]
+                break
+        if directory is None:
+            try:
+                local_is_checkpoint = (config_path.parent / "params/_METADATA").is_file()
+            except OSError:
+                local_is_checkpoint = False
+            directory = config_path.parent if local_is_checkpoint else None
+        if directory is None or directory in seen:
             continue
         seen.add(directory)
+        try:
+            label = str(directory.relative_to(base))
+        except ValueError:
+            label = directory.name
         items.append(
             {
                 "path": str(directory),
-                "label": str(directory.relative_to(base)),
+                "label": label,
                 "policy_type": "OpenPI LoRA" if config.get("finetune_mode") == "lora" else "OpenPI Full",
                 "chunk_size": config.get("action_horizon", 50),
                 "n_action_steps": config.get("n_action_steps", 10),
