@@ -37,7 +37,7 @@
           <form id="configForm" autocomplete="off">
             <fieldset>
               <legend><b>01</b>路径与任务</legend>
-              <label class="field wide"><span>输入 HDF5 目录</span><input id="inputDir" spellcheck="false" required></label>
+              <label class="field wide"><span>输入 HDF5 目录 <small>每行一个目录，按顺序合并</small></span><textarea id="inputDir" rows="3" spellcheck="false" required></textarea></label>
               <label class="field wide"><span>输出 bundle 目录 <small>必须尚不存在</small></span><input id="outputRoot" spellcheck="false" placeholder="留空时自动生成"></label>
               <label class="field wide"><span>任务指令</span><textarea id="task" rows="2" required></textarea></label>
             </fieldset>

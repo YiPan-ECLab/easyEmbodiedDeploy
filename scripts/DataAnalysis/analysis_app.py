@@ -1,10 +1,12 @@
-"""Read-only web service for Piper HDF5 and LeRobot quality analysis."""
+"""Web service for Piper HDF5 and LeRobot quality analysis."""
 
 from __future__ import annotations
 
 import copy
+import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,6 +28,7 @@ DEFAULT_LEROBOT_ROOT = PROJECT_ROOT / "datasets/lerobot"
 LOCK = threading.Lock()
 CANCEL = threading.Event()
 PROCESS: subprocess.Popen | None = None
+DELETE_LOCK = threading.Lock()
 STATE = {
     "job_id": 0,
     "status": "idle",
@@ -82,7 +85,7 @@ def start_analysis(payload: dict) -> int:
     if not target_path.exists():
         raise FileNotFoundError(target_path.resolve())
     with LOCK:
-        if STATE["status"] == "running":
+        if STATE["status"] in ("running", "deleting"):
             raise RuntimeError("已有分析任务正在运行")
         job_id = int(STATE["job_id"]) + 1
         STATE.update(
@@ -176,6 +179,156 @@ def start_analysis(payload: dict) -> int:
     return job_id
 
 
+def _resolved_path(raw: str | Path) -> Path:
+    path = Path(raw).expanduser()
+    return (path if path.is_absolute() else PROJECT_ROOT / path).resolve()
+
+
+def _dataset_root(raw: str | Path) -> tuple[Path, Path]:
+    """Return (bundle_root, LeRobot root) for either supported layout."""
+    bundle = _resolved_path(raw)
+    root = bundle / "lerobot" if (bundle / "lerobot/meta/info.json").is_file() else bundle
+    if not (root / "meta/info.json").is_file():
+        raise FileNotFoundError(f"找不到 LeRobot meta/info.json：{bundle}")
+    return (root.parent if root.name == "lerobot" else root), root
+
+
+def _physical_gap_episodes(report: dict) -> set[int]:
+    """Select only episodes rejected for a source physical time gap."""
+    selected = set()
+    for item in report.get("episodes", []):
+        errors = item.get("errors", [])
+        if any("相邻源采样间隔" in str(error) for error in errors):
+            try:
+                selected.add(int(item["episode"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return selected
+
+
+def _update_processing_manifest(bundle: Path, deleted: set[int]) -> None:
+    """Keep the converter manifest aligned with the reindexed dataset."""
+    manifest_path = bundle / "processing.json"
+    if not manifest_path.is_file():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    plan = manifest.get("plan")
+    if not isinstance(plan, dict) or not isinstance(plan.get("files"), list):
+        return
+    files = plan["files"]
+    kept = [item for index, item in enumerate(files) if index not in deleted]
+    plan["files"] = kept
+    plan["episodes"] = len(kept)
+    plan["input_frames"] = int(sum(int(item.get("frames", 0)) for item in kept))
+    plan["output_frames"] = int(sum(int(item.get("output_frames", 0)) for item in kept))
+    plan["gaps"] = int(sum(int(item.get("gaps", 0)) for item in kept))
+    plan["warnings"] = [
+        f"{item.get('name', '?')}: {warning}"
+        for item in kept for warning in item.get("warnings", [])
+    ]
+    manifest["deleted_episodes"] = sorted(deleted)
+    manifest["episode_index_mapping"] = {
+        str(old): new for new, old in enumerate(index for index in range(len(files)) if index not in deleted)
+    }
+    temporary = manifest_path.with_name(f".{manifest_path.name}.tmp")
+    temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(manifest_path)
+
+
+def delete_error_episodes(payload: dict) -> dict:
+    """Delete reported physical-gap episodes with LeRobot's official editor."""
+    target = str(payload.get("path") or "").strip()
+    if not target:
+        raise ValueError("请先完成 LeRobot 分析")
+    bundle, root = _dataset_root(target)
+    requested_raw = payload.get("episodes")
+    if not isinstance(requested_raw, list) or not requested_raw:
+        raise ValueError("episodes 必须是非空数组")
+    requested = set()
+    for value in requested_raw:
+        if isinstance(value, bool):
+            raise ValueError("episode 索引必须是整数")
+        try:
+            integer = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("episode 索引必须是整数") from exc
+        if isinstance(value, float) and value != integer:
+            raise ValueError("episode 索引必须是整数")
+        requested.add(integer)
+    if any(value < 0 for value in requested):
+        raise ValueError("episode 索引不能为负数")
+
+    with LOCK:
+        if STATE["status"] in ("running", "deleting"):
+            raise RuntimeError("分析任务正在运行，请完成后再删除")
+        report = copy.deepcopy(STATE.get("report"))
+        report_path = _resolved_path(report.get("bundle", "")) if report else None
+    if not report or report_path != bundle:
+        raise RuntimeError("请先对当前 LeRobot 路径完成一次分析")
+    allowed = _physical_gap_episodes(report)
+    invalid = requested - allowed
+    if invalid:
+        raise ValueError(f"只能删除物理时间间隔异常 episode：{sorted(invalid)}")
+
+    with DELETE_LOCK:
+        with LOCK:
+            if STATE["status"] in ("running", "deleting"):
+                raise RuntimeError("分析任务正在运行，请完成后再删除")
+            STATE.update(status="deleting", error=None, events=[{
+                "time": time.time(), "message": f"准备删除 {len(requested)} 个物理间隔异常 episode"
+            }])
+
+        # LeRobotDatasetMetadata.create requires a non-existent destination.
+        temp_dir = Path(tempfile.mkdtemp(prefix=f".{root.name}.delete-", dir=root.parent))
+        temp_dir.rmdir()
+        backup = root.with_name(f".{root.name}.before-delete-{os.getpid()}-{int(time.time())}")
+        manifest_path = bundle / "processing.json"
+        original_manifest = manifest_path.read_bytes() if manifest_path.is_file() else None
+        try:
+            from lerobot.datasets import LeRobotDataset, delete_episodes
+
+            info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
+            repo_id = str(info.get("repo_id") or f"local/{root.name}")
+            dataset = LeRobotDataset(repo_id=repo_id, root=root, download_videos=False)
+            delete_episodes(dataset, sorted(requested), output_dir=temp_dir, repo_id=repo_id)
+            del dataset
+
+            # Validate the generated root without consulting the old manifest.
+            processor_dir = PROJECT_ROOT / "scripts" / "LerobotDataProcessor"
+            sys.path.insert(0, str(processor_dir))
+            try:
+                from processor import validate_lerobot_bundle
+                validation = validate_lerobot_bundle(temp_dir, expected={})
+            finally:
+                with contextlib.suppress(ValueError):
+                    sys.path.remove(str(processor_dir))
+            if not validation["valid"]:
+                raise ValueError("删除后数据集验收失败：" + "；".join(validation["errors"]))
+
+            root.rename(backup)
+            temp_dir.rename(root)
+            _update_processing_manifest(bundle, requested)
+            shutil.rmtree(backup)
+            result = {"deleted": sorted(requested), "remaining": int(info["total_episodes"]) - len(requested),
+                      "path": str(bundle)}
+            with LOCK:
+                STATE.update(status="idle", report=None, error=None, finished_at=time.time(),
+                             events=[{"time": time.time(), "message": "删除完成，请重新分析确认"}])
+            return result
+        except Exception:
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            if backup.exists():
+                if root.exists():
+                    shutil.rmtree(root, ignore_errors=True)
+                backup.rename(root)
+            if original_manifest is not None:
+                manifest_path.write_bytes(original_manifest)
+            with LOCK:
+                STATE.update(status="complete", error="删除失败", finished_at=time.time())
+            raise
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "DataAnalysis/1.0"
 
@@ -229,6 +382,9 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/start":
                 job_id = start_analysis(self.json_body())
                 self.send({"status": "started", "job_id": job_id}, HTTPStatus.ACCEPTED)
+            elif route == "/api/delete-error-episodes":
+                result = delete_error_episodes(self.json_body())
+                self.send(result)
             elif route == "/api/cancel":
                 with LOCK:
                     if STATE["status"] != "running":
@@ -254,7 +410,7 @@ class Server(ThreadingHTTPServer):
 def run_server(host: str, port: int) -> None:
     server = Server((host, port), Handler)
     print(f"DataAnalysis: http://{host}:{server.server_address[1]}")
-    print("Read-only CPU analysis; press Ctrl+C to stop")
+    print("CPU analysis with physical-gap episode deletion; press Ctrl+C to stop")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

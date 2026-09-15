@@ -38,7 +38,7 @@
             <button id="start" class="primary" type="button"><span>▶</span>开始全面检查</button>
             <button id="cancel" class="danger hidden" type="button"><span>■</span>停止检查</button>
           </div>
-          <p id="note">检查不会修改原始文件或 LeRobot 数据集。</p>
+          <p id="note">LeRobot 检查完成后可删除报告标记的物理时间间隔异常 episode；删除会重排并重新验收数据集。</p>
         </section>
 
         <section class="gates">
@@ -57,7 +57,7 @@
       </section>
 
       <section id="report" class="report hidden">
-        <div class="report-head"><div><p>QUALITY REPORT</p><h2 id="reportTitle">分析结果</h2><small id="reportPath"></small></div><div><button id="download" type="button">↓ 导出 JSON</button></div></div>
+        <div class="report-head"><div><p>QUALITY REPORT</p><h2 id="reportTitle">分析结果</h2><small id="reportPath"></small></div><div class="report-actions"><button id="deleteGapEpisodes" class="danger hidden" type="button">删除物理间隔异常 Episode</button><button id="download" type="button">↓ 导出 JSON</button></div></div>
         <div id="sourceSummary" class="source-summary hidden"></div>
         <div id="messages" class="messages hidden"></div>
         <div class="table-tools"><input id="search" type="search" placeholder="筛选文件或 episode"><label><input id="issues" type="checkbox">只看问题</label></div>

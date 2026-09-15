@@ -58,9 +58,17 @@ STATE = {
 def settings_from(payload: dict) -> Settings:
     if not isinstance(payload, dict):
         raise ValueError("请求体必须是 JSON 对象")
+    raw_dirs = payload.get("input_dirs")
+    if isinstance(raw_dirs, str):
+        raw_dirs = raw_dirs.splitlines()
+    if not isinstance(raw_dirs, list) or not any(str(value).strip() for value in raw_dirs):
+        raw_dirs = str(payload.get("input_dir") or DEFAULT_INPUT_DIR).splitlines()
+    input_dirs = [str(value).strip() for value in raw_dirs if str(value).strip()]
+    if not input_dirs:
+        input_dirs = [DEFAULT_INPUT_DIR]
     source_fps = payload.get("source_fps")
     return Settings(
-        input_dir=str(payload.get("input_dir") or DEFAULT_INPUT_DIR),
+        input_dir=input_dirs[0], input_dirs=input_dirs,
         output_root=payload.get("output_root") or DEFAULT_OUTPUT_ROOT,
         task=str(payload.get("task") or TASK_DESCRIPTION),
         target_fps=int(payload.get("target_fps") or DEFAULT_FPS),
@@ -178,6 +186,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "project_root": str(PROJECT_ROOT),
                     "input_dir": DEFAULT_INPUT_DIR,
+                    "input_dirs": [DEFAULT_INPUT_DIR],
                     "output_root": DEFAULT_OUTPUT_ROOT,
                     "repo_id": DEFAULT_REPO_ID,
                     "task": TASK_DESCRIPTION,

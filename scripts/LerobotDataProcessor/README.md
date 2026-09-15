@@ -8,7 +8,7 @@ thirdParty/.venvs/lerobot-pi05/bin/python scripts/LerobotDataProcessor/DataProce
 
 打开 <http://127.0.0.1:8766>。端口被占用时可传 `--port 0` 自动选择空闲端口，或用 `--port 8891` 显式指定。网页支持输入预检、转换启动与取消、逐 episode 进度、日志、结果复验、命令预览和响应式移动端布局。服务强制隐藏 GPU，只执行 CPU 数据处理。
 
-网页会先检查每个 HDF5 的时间戳、轨迹阶段、Piper 限位和相机同步，只有目标 FPS 能整除每个文件的源 FPS 时才允许处理。默认配置是自动识别源频率、`10 Hz + delta_joint + reject`。流程固定为：
+网页的“输入 HDF5 目录”支持每行填写一个目录，多个目录按填写顺序合并成一个 LeRobot 数据集；命令行可重复传入 `--input-dir` 达到同样效果。网页会先检查每个 HDF5 的时间戳、轨迹阶段、Piper 限位和相机同步，只有目标 FPS 能整除每个文件的源 FPS 时才允许处理。默认配置是自动识别源频率、`10 Hz + delta_joint + reject`。流程固定为：
 
 ```text
 原始 HDF5 → 只选 task phase 并裁掉尾部静止帧 → 内存中降采样 →（可选）action[t+1]-action[t] → LeRobot v3
@@ -22,6 +22,7 @@ PiperRecorder 在任务结束后还会记录 `trajectory_phase=1` 的回零过�
 thirdParty/.venvs/lerobot-pi05/bin/python \
   scripts/LerobotDataProcessor/convert_piper_hdf5.py \
   --input-dir datasets/hdf5/撕下快递单并贴到桌子上的快递上 \
+  --input-dir datasets/hdf5/another_recording \
   --fps 10 --action-mode delta_joint --gap-policy reject
 ```
 

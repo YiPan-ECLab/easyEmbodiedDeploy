@@ -58,6 +58,10 @@ function setRunning(running) {
   $("progress").parentElement.classList.toggle("running", running);
 }
 
+function isPhysicalGapEpisode(item) {
+  return (item?.errors || []).some((error) => String(error).includes("相邻源采样间隔"));
+}
+
 function setGateState(status) {
   const gates = document.querySelector(".gates");
   gates.classList.remove("pass", "fail");
@@ -146,6 +150,10 @@ function renderReport(report) {
                     ...(report.warnings || itemWarnings).map((value) => `WARN   ${value}`)];
   $("messages").classList.toggle("hidden", !messages.length);
   $("messages").textContent = messages.join("\n");
+  const deleteButton = $("deleteGapEpisodes");
+  const gapCount = hdf5 ? 0 : report.episodes.filter(isPhysicalGapEpisode).length;
+  deleteButton.classList.toggle("hidden", gapCount === 0);
+  deleteButton.textContent = `删除 ${gapCount} 个物理间隔异常 Episode`;
   if (hdf5) renderHdf5Rows(); else renderLerobotRows();
 }
 
@@ -197,6 +205,28 @@ async function cancel() {
   } catch (error) { toast(error.message, true); $("cancel").disabled = false; }
 }
 
+async function deleteGapEpisodes() {
+  if (!state.report || state.report.files) return;
+  const episodes = state.report.episodes.filter(isPhysicalGapEpisode).map((item) => item.episode);
+  if (!episodes.length) return;
+  if (!window.confirm(`确认删除 ${episodes.length} 个物理时间间隔异常 episode？此操作会重排数据集索引。`)) return;
+  const button = $("deleteGapEpisodes");
+  button.disabled = true;
+  try {
+    await request("/api/delete-error-episodes", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: state.report.bundle, episodes }),
+    });
+    toast(`已删除 ${episodes.length} 个 episode，正在重新分析`);
+    state.report = null;
+    $("report").classList.add("hidden");
+    await start();
+  } catch (error) {
+    toast(error.message, true);
+    button.disabled = false;
+  }
+}
+
 function download() {
   if (!state.report) return;
   const blob = new Blob([JSON.stringify(state.report, null, 2)], { type: "application/json" });
@@ -210,6 +240,7 @@ function download() {
 document.querySelectorAll('input[name="kind"]').forEach((node) => node.addEventListener("change", selectKind));
 $("start").addEventListener("click", start);
 $("cancel").addEventListener("click", cancel);
+$("deleteGapEpisodes").addEventListener("click", deleteGapEpisodes);
 $("download").addEventListener("click", download);
 $("search").addEventListener("input", () => state.report && (state.report.files ? renderHdf5Rows() : renderLerobotRows()));
 $("issues").addEventListener("change", () => state.report && (state.report.files ? renderHdf5Rows() : renderLerobotRows()));

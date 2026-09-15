@@ -101,6 +101,36 @@ def source_indices(demo: h5py.Group, stride: int) -> tuple[np.ndarray, int]:
     return selected, task_end - last_active - 1
 
 
+def source_paths(
+    source_raw: str | list[str] | None,
+    plan_files: list[dict],
+    source_override: str | None,
+) -> tuple[list[Path], list[Path]]:
+    """Resolve source HDF5 files for single- or multi-directory manifests."""
+    raw_dirs = source_override or source_raw
+    if isinstance(raw_dirs, str):
+        raw_dirs = raw_dirs.splitlines()
+    directories = [resolve(value) for value in (raw_dirs or []) if str(value).strip()]
+    if not directories:
+        return [], []
+    if plan_files and not source_override and any(item.get("source_dir") for item in plan_files):
+        files = []
+        for item in plan_files:
+            base = resolve(item.get("source_dir") or directories[0])
+            path = base / str(item.get("name", ""))
+            if path.is_file():
+                files.append(path)
+        return files, directories
+    by_name = {}
+    for directory in directories:
+        for path in sorted((*directory.glob("*.hdf5"), *directory.glob("*.h5"))):
+            by_name.setdefault(path.name, path)
+    expected_names = [item.get("name") for item in plan_files if item.get("name")]
+    if expected_names:
+        return [by_name[name] for name in expected_names if name in by_name], directories
+    return sorted(by_name.values()), directories
+
+
 def probe_video(path: Path) -> dict[str, Any]:
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
@@ -299,15 +329,10 @@ def analyze(raw: str, source_override: str | None) -> dict[str, Any]:
         errors.extend(f"episode {ep}: {error}" for error in ep_errors)
 
     source_metrics = None
-    source_raw = source_override or settings.get("input_dir") or plan.get("input_dir")
+    source_raw = settings.get("input_dirs") or settings.get("input_dir") or plan.get("input_dirs") or plan.get("input_dir")
     if source_raw:
-        source_dir = resolve(source_raw)
-        source_files = sorted((*source_dir.glob("*.hdf5"), *source_dir.glob("*.h5")))
         plan_files = plan.get("files", [])
-        expected_names = [item.get("name") for item in plan_files if item.get("name")]
-        if expected_names:
-            source_by_name = {path.name: path for path in source_files}
-            source_files = [source_by_name[name] for name in expected_names if name in source_by_name]
+        source_files, source_dirs = source_paths(source_raw, plan_files, source_override)
         if len(source_files) != total_episodes:
             errors.append(f"源 HDF5 数量 {len(source_files)} 与 episode 数 {total_episodes} 不一致")
         else:
@@ -371,7 +396,8 @@ def analyze(raw: str, source_override: str | None) -> dict[str, Any]:
                         home_frames=home_count, trimmed_source_idle_frames=idle,
                     )
             source_metrics = {
-                "directory": str(source_dir), "files": len(source_files),
+                "directory": str(source_dirs[0]) if len(source_dirs) == 1 else None,
+                "directories": [str(path) for path in source_dirs], "files": len(source_files),
                 "trimmed_idle_frames": trimmed_idle,
                 "max_action_error": global_action_error,
                 "max_state_error": global_state_error,

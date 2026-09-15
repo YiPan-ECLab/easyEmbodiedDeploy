@@ -84,6 +84,7 @@ input:disabled { color: #747d7b; background: #191d20; }
 .report { margin-top: 14px; }
 .report-head { align-items: flex-start; }
 .report-head small { max-width: 900px; margin-top: 5px; overflow-wrap: anywhere; }
+.report-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
 .report-head button { min-height: 34px; padding: 0 12px; border-color: var(--strong); color: var(--cyan); background: var(--raised); }
 .source-summary { display: grid; grid-template-columns: repeat(5, 1fr); margin-bottom: 14px; border: 1px solid var(--line); border-radius: 5px; }
 .source-summary div { padding: 12px; border-left: 1px solid var(--line); }

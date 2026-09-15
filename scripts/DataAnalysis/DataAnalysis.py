@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch the read-only DataAnalysis web application."""
+"""Launch the DataAnalysis web application."""
 
 import argparse
 

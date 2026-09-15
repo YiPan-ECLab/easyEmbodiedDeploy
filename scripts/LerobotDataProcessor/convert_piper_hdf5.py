@@ -23,12 +23,13 @@ def defaults() -> Settings:
                     task=TASK_DESCRIPTION, target_fps=DEFAULT_FPS,
                     source_fps=DEFAULT_SOURCE_FPS, action_mode=DEFAULT_ACTION_MODE,
                     repo_id=DEFAULT_REPO_ID, limit=DEFAULT_LIMIT,
-                    gap_policy=DEFAULT_GAP_POLICY)
+                    gap_policy=DEFAULT_GAP_POLICY, input_dirs=[DEFAULT_INPUT_DIR])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-dir", default=DEFAULT_INPUT_DIR)
+    parser.add_argument("--input-dir", action="append", dest="input_dirs", default=None,
+                        help="HDF5 目录；可重复传入多个目录，按传入顺序合并")
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT, help="New output bundle directory")
     parser.add_argument("--repo-id", default=DEFAULT_REPO_ID)
     parser.add_argument("--task", default=TASK_DESCRIPTION)
@@ -52,7 +53,8 @@ def main() -> None:
         result = validate_lerobot_bundle(args.validate_output, expected=expected)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         raise SystemExit(0 if result["valid"] else 1)
-    settings = Settings(input_dir=args.input_dir, output_root=args.output_root,
+    input_dirs = args.input_dirs or [DEFAULT_INPUT_DIR]
+    settings = Settings(input_dir=input_dirs[0], input_dirs=input_dirs, output_root=args.output_root,
                         task=args.task, target_fps=args.fps, source_fps=args.source_fps,
                         action_mode=args.action_mode, repo_id=args.repo_id, limit=args.limit,
                         gap_policy=args.gap_policy)

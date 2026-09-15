@@ -13,7 +13,7 @@ const statusNames = {
   failed: "失败", cancelled: "已取消",
 };
 const stageNames = {
-  checking: "检查输入", loading: "加载 LeRobot", resampling: "准备采样",
+  checking: "检查输入", loading: "加载 LeRobot", workers: "分配 CPU worker", resampling: "准备采样",
   writing: "写入帧", encoding: "编码视频", finalizing: "生成统计量",
   complete: "验收完成", failed: "处理失败", cancelled: "已取消",
 };
@@ -44,9 +44,14 @@ function checked(name) {
   return document.querySelector(`input[name="${name}"]:checked`)?.value || "";
 }
 
+function inputDirectories() {
+  return [...new Set($("inputDir").value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean))];
+}
+
 function formPayload() {
   return {
-    input_dir: $("inputDir").value.trim(),
+    input_dir: inputDirectories()[0] || "",
+    input_dirs: inputDirectories(),
     output_root: $("outputRoot").value.trim() || null,
     task: $("task").value.trim(),
     source_fps: $("sourceFps").value ? Number($("sourceFps").value) : null,
@@ -67,8 +72,10 @@ function updateCommand() {
   const parts = [
     "CUDA_VISIBLE_DEVICES='' thirdParty/.venvs/lerobot-pi05/bin/python \\",
     "  scripts/LerobotDataProcessor/convert_piper_hdf5.py \\",
-    `  --input-dir ${shellQuote(value.input_dir)} \\`,
   ];
+  (value.input_dirs.length ? value.input_dirs : [value.input_dir]).forEach((path) => {
+    parts.push(`  --input-dir ${shellQuote(path)} \\`);
+  });
   if (value.output_root) parts.push(`  --output-root ${shellQuote(value.output_root)} \\`);
   if (value.repo_id) parts.push(`  --repo-id ${shellQuote(value.repo_id)} \\`);
   parts.push(`  --task ${shellQuote(value.task)} \\`);
@@ -181,7 +188,7 @@ async function inspectInput(showMessage = true) {
 }
 
 function setPipeline(stage, status) {
-  const writing = ["loading", "resampling", "writing", "encoding"].includes(stage);
+  const writing = ["loading", "workers", "resampling", "writing", "encoding"].includes(stage);
   $("stepInspect").className = stage === "checking" ? "active" : "done";
   $("stepWrite").className = writing ? "active" : (["finalizing", "complete"].includes(stage) ? "done" : "");
   $("stepValidate").className = stage === "finalizing" ? "active" : (stage === "complete" ? "done" : "");

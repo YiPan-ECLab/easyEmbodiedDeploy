@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -50,10 +51,29 @@ HARDWARE_TOLERANCE = 1e-6
 MAX_GAP_FACTOR = 1.5
 MAX_CAMERA_SKEW_S = 0.5
 STATS_KEYS = ("q01", "q99", "mean", "std", "min", "max")
+# Keep HDF5 reads bounded while avoiding one compressed-image read per frame.
+# A block is large enough to amortize HDF5 hyperslab overhead, but small enough
+# for the largest expected Piper episode on the CPU-only conversion path.
+READ_BLOCK_SIZE = 256
+MAX_READ_SPAN = 512
 
 
 class ProcessingCancelled(RuntimeError):
     """Raised when the user cancels between safe processing checkpoints."""
+
+
+def available_cpu_count() -> int:
+    """Return the number of CPUs available to this process.
+
+    ``os.cpu_count()`` reports host CPUs even when a service is restricted by a
+    cpuset/container.  Prefer the process affinity when available and always
+    return at least one usable worker.
+    """
+    try:
+        count = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        count = os.cpu_count() or 1
+    return max(1, int(count))
 
 
 def resolve_path(raw: str | Path) -> Path:
@@ -79,6 +99,7 @@ class Settings:
     repo_id: str | None = None
     limit: int = 0
     gap_policy: str = "reject"
+    input_dirs: list[str] | None = None
 
 
 def canonical_action_mode(value: str) -> str:
@@ -87,7 +108,42 @@ def canonical_action_mode(value: str) -> str:
 
 
 def canonical_settings(settings: Settings) -> Settings:
-    return replace(settings, action_mode=canonical_action_mode(settings.action_mode))
+    raw_dirs = settings.input_dirs
+    if isinstance(raw_dirs, str):
+        raw_dirs = raw_dirs.splitlines()
+    if raw_dirs is None:
+        raw_dirs = [settings.input_dir]
+    dirs = []
+    seen = set()
+    for value in raw_dirs:
+        value = str(value).strip()
+        if value and value not in seen:
+            dirs.append(value)
+            seen.add(value)
+    if not dirs:
+        dirs = [settings.input_dir]
+    return replace(
+        settings,
+        input_dir=dirs[0],
+        input_dirs=dirs,
+        action_mode=canonical_action_mode(settings.action_mode),
+    )
+
+
+def input_directories(settings: Settings) -> list[Path]:
+    """Resolve the ordered, de-duplicated HDF5 directories in a setting."""
+    settings = canonical_settings(settings)
+    paths = []
+    seen = set()
+    for raw in (settings.input_dirs or [settings.input_dir]):
+        path = resolve_path(raw)
+        if path not in seen:
+            paths.append(path)
+            seen.add(path)
+    for path in paths:
+        if not path.is_dir():
+            raise ValueError(f"输入目录不存在：{path}")
+    return paths
 
 
 def _text_attr(value) -> str:
@@ -300,23 +356,32 @@ def scan(settings: Settings) -> dict:
         raise ValueError(f"时间空档策略必须为 {' 或 '.join(GAP_POLICIES)}")
     if not settings.task.strip():
         raise ValueError("请填写任务描述")
-    source = resolve_path(settings.input_dir)
-    if not source.is_dir():
-        raise ValueError(f"输入目录不存在：{source}")
-    paths = sorted(p for p in source.iterdir() if p.is_file() and p.suffix.lower() in (".h5", ".hdf5"))
+    sources = input_directories(settings)
+    paths = [
+        (source, path)
+        for source in sources
+        for path in sorted(source.iterdir())
+        if path.is_file() and path.suffix.lower() in (".h5", ".hdf5")
+    ]
     if settings.limit:
         paths = paths[:settings.limit]
     if not paths:
-        raise ValueError("输入目录中没有 .hdf5/.h5 文件（只扫描当前层）")
-    files = [inspect_file(p, settings) for p in paths]
+        raise ValueError("输入目录中没有 .hdf5/.h5 文件（只扫描各目录当前层）")
+    files = []
+    for source, path in paths:
+        info = inspect_file(path, settings)
+        info["source_dir"] = portable_path(source)
+        files.append(info)
     if any(x["camera_shapes"] != files[0]["camera_shapes"] for x in files):
         raise ValueError("不同 episode 的相机尺寸不一致")
-    default_out = Path("datasets/lerobot") / f"{source.name}_{settings.target_fps}hz_{settings.action_mode}"
+    source_label = sources[0].name if len(sources) == 1 else f"{sources[0].name}_merged"
+    default_out = Path("datasets/lerobot") / f"{source_label}_{settings.target_fps}hz_{settings.action_mode}"
     out = resolve_path(settings.output_root or default_out)
-    if out == source or out in source.parents or source in out.parents:
+    if any(out == source or out in source.parents or source in out.parents for source in sources):
         raise ValueError("输出目录必须与输入目录分开，不能互相包含")
     warnings = [f"{item['name']}: {warning}" for item in files for warning in item["warnings"]]
-    return dict(input_dir=portable_path(source), output_root=portable_path(out), files=files,
+    return dict(input_dir=portable_path(sources[0]), input_dirs=[portable_path(path) for path in sources],
+                output_root=portable_path(out), files=files,
                 episodes=len(files), input_frames=sum(x["frames"] for x in files),
                 output_frames=sum(x["output_frames"] for x in files),
                 gaps=sum(x["gaps"] for x in files),
@@ -571,7 +636,7 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
 
     emit("checking", message="检查全部输入文件与帧率")
     plan = prepared_plan if prepared_plan is not None else scan(settings)
-    source, output = resolve_path(plan["input_dir"]), resolve_path(plan["output_root"])
+    output = resolve_path(plan["output_root"])
     if output.exists():
         raise FileExistsError(f"输出目录已存在，请换一个新目录：{output}")
     # Never overwrite existing output, including an empty directory.
@@ -589,17 +654,23 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
         count = plan["episodes"]
         emit("loading", message="加载 LeRobot，准备写入数据集")
         from lerobot.datasets import LeRobotDataset
+        cpu_count = available_cpu_count()
+        emit("workers", cpu_count=cpu_count,
+             message=f"使用 {cpu_count} 个可用 CPU worker 写入图像；视频编码由 LeRobot 编码器自动调度")
         dataset = LeRobotDataset.create(
             repo_id=plan["repo_id"], root=output / "lerobot", fps=settings.target_fps,
             features=make_features(plan["files"][0]["camera_shapes"]),
-            robot_type="piper_dual", use_videos=True, image_writer_threads=4,
+            robot_type="piper_dual", use_videos=True,
+            image_writer_threads=cpu_count,
         )
         for index, info in enumerate(plan["files"]):
             checkpoint()
-            with h5py.File(source / info["name"], "r") as f:
+            source_dir = resolve_path(info.get("source_dir") or plan["input_dir"])
+            with h5py.File(source_dir / info["name"], "r") as f:
                 demo = f["data/demo_0"]
                 # Stream one HDF5 directly into the current LeRobot episode.
-                # Only the selected frame and its three images are held at a time.
+                # A bounded contiguous read block is held while frames are sent
+                # to LeRobot's asynchronous image writer.
                 selected, _, _ = _task_sample_indices(demo, info["stride"])
                 raw_actions = np.asarray(demo["actions"][selected], dtype=np.float32)
                 if settings.action_mode == "delta_joint":
@@ -610,17 +681,45 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
                 n = len(selected)
                 emit("resampling", episode=index, episodes=count, file=info["name"],
                      frame=0, frames=n, message="降采样并直接写入 LeRobot（不保存中间 HDF5）")
-                for i in range(n):
-                    checkpoint()
-                    dataset.add_frame({
-                        "observation.state": np.asarray(demo["states"][selected[i]], dtype=np.float32),
-                        "action": actions[i],
-                        **{f"observation.images.{c}": demo[f"obs/{c}"][selected[i]] for c in CAMERAS},
-                        "task": settings.task,
-                    })
-                    if i % 20 == 0 or i == n - 1:
-                        emit("writing", episode=index, episodes=count, frame=i + 1, frames=n,
-                             file=info["name"], message="写入图像与状态")
+                # Read contiguous index blocks once.  The previous per-frame
+                # HDF5 indexing caused three independent hyperslab reads for
+                # every sample and left most CPU cores idle.
+                block_start = 0
+                while block_start < n:
+                    block_end = min(block_start + READ_BLOCK_SIZE, n)
+                    # HDF5's fancy indexing repeatedly decompresses the same
+                    # chunks for strided indices.  Read one contiguous span,
+                    # while bounding the raw span for high source/target FPS
+                    # ratios so memory remains predictable.
+                    while (
+                        block_end > block_start + 1
+                        and int(selected[block_end - 1] - selected[block_start]) + 1 > MAX_READ_SPAN
+                    ):
+                        block_end -= 1
+                    block_indices = selected[block_start:block_end]
+                    source_start, source_stop = int(block_indices[0]), int(block_indices[-1]) + 1
+                    local_indices = block_indices - source_start
+                    states = np.asarray(demo["states"][source_start:source_stop], dtype=np.float32)
+                    images = {
+                        camera: np.asarray(demo[f"obs/{camera}"][source_start:source_stop])
+                        for camera in CAMERAS
+                    }
+                    for block_offset, action in enumerate(actions[block_start:block_end]):
+                        i = block_start + block_offset
+                        checkpoint()
+                        dataset.add_frame({
+                            "observation.state": states[local_indices[block_offset]],
+                            "action": action,
+                            **{
+                                f"observation.images.{camera}": images[camera][local_indices[block_offset]]
+                                for camera in CAMERAS
+                            },
+                            "task": settings.task,
+                        })
+                        if i % 20 == 0 or i == n - 1:
+                            emit("writing", episode=index, episodes=count, frame=i + 1, frames=n,
+                                 file=info["name"], message="写入图像与状态")
+                    block_start = block_end
             emit("encoding", episode=index, episodes=count, file=info["name"],
                  message="编码三路视频并统计本 episode，完成后进入下一条")
             dataset.save_episode()

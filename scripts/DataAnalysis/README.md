@@ -1,6 +1,6 @@
 # DataAnalysis
 
-两个只读、CPU-only 的数据质量检查工具，以及共用的本地 Web 前端。失败时退出码为 `1`，适合手工验收或 CI。
+两个 CPU-only 的数据质量检查工具，以及共用的本地 Web 前端。失败时退出码为 `1`，适合手工验收或 CI。
 
 启动 Web 前端：
 
@@ -8,7 +8,7 @@
 thirdParty/.venvs/lerobot-pi05/bin/python scripts/DataAnalysis/DataAnalysis.py
 ```
 
-打开 <http://127.0.0.1:8767>。端口被占用时使用 `--port 0` 自动选择空闲端口，或用 `--port 8892` 显式指定。界面可切换 HDF5/LeRobot、启动或停止检查、筛选异常、查看逐文件或逐 episode 指标，并导出完整 JSON 报告。分析子进程强制使用 CPU，不会占用 GPU。
+打开 <http://127.0.0.1:8767>。端口被占用时使用 `--port 0` 自动选择空闲端口，或用 `--port 8892` 显式指定。界面可切换 HDF5/LeRobot、启动或停止检查、筛选异常、查看逐文件或逐 episode 指标，并导出完整 JSON 报告。LeRobot 报告中的物理时间间隔异常 episode 可批量删除；删除后会用官方 LeRobot 编辑器重排视频、Parquet、元数据和统计量，并自动重新分析。分析子进程强制使用 CPU，不会占用 GPU。
 
 检查 Piper Recorder HDF5 文件或整个目录：
 
