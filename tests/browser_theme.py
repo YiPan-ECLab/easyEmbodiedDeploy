@@ -30,8 +30,22 @@ async def main():
             name = module["id"]
             response = await page.request.post(args.url + "/api/services/start", data={"module": name})
             assert response.ok, await response.text()
-            await page.goto(f"{args.url}/modules/{name}/")
-            await page.wait_for_function("document.body.innerText.length > 80")
+            # Start is asynchronous; a cold console may still return the proxy's
+            # temporary 503 page. Wait as the workbench does before navigating.
+            for _ in range(150):
+                response = await page.request.get(args.url + "/api/status")
+                assert response.ok, await response.text()
+                status = await response.json()
+                current = next(item for item in status["modules"] if item["id"] == name)
+                assert current["state"] != "failed", current
+                if current["state"] == "ready":
+                    break
+                await asyncio.sleep(0.2)
+            else:
+                raise TimeoutError(f"{name} console did not become ready: {current}")
+            response = await page.goto(f"{args.url}/modules/{name}/")
+            assert response is not None and response.ok, name
+            await page.wait_for_function("() => document.body.innerText.length > 80")
             await page.wait_for_timeout(1000)
             if name.endswith("trainer"):
                 bootstrap = await (await page.request.get(f"{args.url}/modules/{name}/api/bootstrap")).json()
