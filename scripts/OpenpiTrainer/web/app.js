@@ -270,7 +270,7 @@ function drawChart(history) {
   const width=Math.max(300,rect.width),height=210;
   canvas.width=Math.round(width*dpr);canvas.height=Math.round(height*dpr);
   const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);ctx.clearRect(0,0,width,height);
-  const pad={l:42,r:16,t:12,b:27};ctx.strokeStyle='rgba(255,255,255,.07)';ctx.lineWidth=1;
+  const pad={l:42,r:16,t:12,b:27};ctx.strokeStyle='rgba(24,54,46,.10)';ctx.lineWidth=1;
   for(let i=0;i<5;i++){const y=pad.t+(height-pad.t-pad.b)*i/4;ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(width-pad.r,y);ctx.stroke()}
   if(!points.length)return;
   const losses=points.map(p=>p.loss).filter(Number.isFinite),grads=points.map(p=>p.grdn).filter(Number.isFinite);
@@ -278,7 +278,7 @@ function drawChart(history) {
   const x=(i)=>pad.l+(width-pad.l-pad.r)*(points.length===1?1:i/(points.length-1));
   const y=(v)=>pad.t+(height-pad.t-pad.b)*(1-(v-min)/(max-min||1));
   const line=(key,color)=>{ctx.beginPath();let begun=false;points.forEach((p,i)=>{if(!Number.isFinite(p[key]))return;begun?(ctx.lineTo(x(i),y(p[key]))):(ctx.moveTo(x(i),y(p[key])),begun=true)});ctx.strokeStyle=color;ctx.lineWidth=1.8;ctx.stroke()};
-  line('loss','#b9f36a');line('grdn','#64dbc4');
+  line('loss','#12664d');line('grdn','#167a83');
   ctx.fillStyle='#69726e';ctx.font='9px monospace';ctx.fillText(max.toPrecision(3),3,pad.t+3);ctx.fillText(min.toPrecision(3),3,height-pad.b+3);
   ctx.fillText(String(points[0].step),pad.l,height-8);ctx.textAlign='right';ctx.fillText(String(points.at(-1).step),width-pad.r,height-8);ctx.textAlign='left';
 }

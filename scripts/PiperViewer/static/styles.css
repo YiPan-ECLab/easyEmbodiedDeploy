@@ -1,13 +1,13 @@
 :root {
   color-scheme: light;
-  --bg: #f4f6f5;
+  --bg: #f3f6f2;
   --surface: #ffffff;
   --surface-muted: #eef1ef;
   --line: #d9dfdc;
   --line-strong: #bdc8c2;
   --text: #17201c;
   --muted: #64716b;
-  --accent: #087f6d;
+  --accent: #12664d;
   --accent-soft: #dcefe9;
   --accent-dark: #075f54;
   --amber: #a85e0b;
@@ -309,3 +309,15 @@ input[type="range"] { width: 100%; height: 18px; margin: 0; accent-color: var(--
   .structure-search { width: 100%; }
   .schema-table th:nth-child(3), .schema-table td:nth-child(3) { display: none; }
 }
+
+/* Match the workbench chrome; retain dark overlays over camera imagery. */
+.topbar { background: #fff; color: #18362e; border-color: #dce6de; }
+.brand-mark { color: #12664d; border-color: #dce6de; background: #eaf3ec; border-radius: 10px; }
+.brand span, .scan-status { color: #63786e; }
+.directory-form { background: #fbfdfb; border-color: #ccdad0; border-radius: 8px; }
+.directory-form input { color: #18362e; }
+.directory-form > svg { color: #63786e; }
+.directory-form .icon-button { border-color: #dce6de; }
+.scan-status.error { color: #ab3434; }
+button, input, select { accent-color: #12664d; }
+[hidden] { display: none !important; }

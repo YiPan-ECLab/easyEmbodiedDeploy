@@ -354,7 +354,7 @@ function drawChart(canvas, values, color, options = {}) {
   let max = options.max ?? Math.max(...values);
   if (max <= min) max = min + 1;
 
-  context.strokeStyle = "rgba(255,255,255,.06)";
+  context.strokeStyle = "rgba(24,54,46,.10)";
   context.lineWidth = 1;
   for (let index = 0; index <= 3; index += 1) {
     const y = padding.top + (chartHeight * index) / 3;
@@ -376,8 +376,8 @@ function drawChart(canvas, values, color, options = {}) {
   context.lineTo(points[0].x, padding.top + chartHeight);
   context.closePath();
   const fill = context.createLinearGradient(0, padding.top, 0, padding.top + chartHeight);
-  fill.addColorStop(0, options.fill || "rgba(185,243,106,.2)");
-  fill.addColorStop(1, "rgba(185,243,106,0)");
+  fill.addColorStop(0, options.fill || "rgba(18,102,77,.2)");
+  fill.addColorStop(1, "rgba(18,102,77,0)");
   context.fillStyle = fill;
   context.fill();
 }
@@ -387,9 +387,9 @@ function renderCharts(points) {
   const latencyValues = points.map((point) => point.tick_ms).filter((value) => Number.isFinite(value) && value > 0);
   $("#queueEmpty").hidden = queueValues.length > 0;
   $("#latencyEmpty").hidden = latencyValues.length > 0;
-  drawChart($("#queueChart"), queueValues, "#b9f36a", { min: 0, max: Math.max(50, ...queueValues), fill: "rgba(185,243,106,.22)" });
+  drawChart($("#queueChart"), queueValues, "#12664d", { min: 0, max: Math.max(50, ...queueValues), fill: "rgba(18,102,77,.22)" });
   const latencyMax = latencyValues.length ? Math.max(...latencyValues) : 100;
-  drawChart($("#latencyChart"), latencyValues, "#64dbc4", { min: 0, max: Math.max(100, latencyMax), fill: "rgba(100,219,196,.2)" });
+  drawChart($("#latencyChart"), latencyValues, "#167a83", { min: 0, max: Math.max(100, latencyMax), fill: "rgba(22,122,131,.2)" });
 }
 
 function appendLogs(entries) {

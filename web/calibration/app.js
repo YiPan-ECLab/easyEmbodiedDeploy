@@ -94,6 +94,46 @@ function updateRig() {
   $('camera').disabled = rig.open || !!defaults?.jobs[$('job').value].camera;
   $('serial').disabled = rig.open;
   $('read-pose').disabled = rig.open || !defaults?.jobs[$('job').value].side;
+  renderIntrinsics();
+}
+
+function renderIntrinsics() {
+  const camera = session?.camera || (rig.open ? rig.camera : null);
+  const intrinsics = camera?.intrinsics;
+  $('intrinsics-context').textContent = session ? `当前记录：${session.name} · ${camera.serial}` : camera ? `已打开相机：${camera.serial} · 新建记录时自动保存` : '打开相机后自动读取出厂内参；选择历史记录可查看已保存值。';
+  $('intrinsics-values').hidden = !intrinsics;
+  $('intrinsics-metrics').replaceChildren();
+  $('intrinsics-source-label').textContent = !intrinsics ? '无需先做内参重标定' : intrinsics.source === 'orbbec_selected_video_profile' ? '正在使用出厂内参 · SDK 视频配置' : '当前使用重标定 / 记录内参';
+  if (intrinsics) {
+    for (const [name, value] of [['fx', intrinsics.K[0][0]], ['fy', intrinsics.K[1][1]], ['cx', intrinsics.K[0][2]], ['cy', intrinsics.K[1][2]]]) {
+      const tile = document.createElement('div');
+      tile.className = 'quality-tile';
+      const label = document.createElement('small');
+      label.textContent = name + ' / px';
+      const number = document.createElement('strong');
+      number.textContent = Number(value).toFixed(3);
+      tile.append(label, number);
+      $('intrinsics-metrics').append(tile);
+    }
+    $('intrinsics-values').textContent = JSON.stringify({
+      resolution: `${camera.width} × ${camera.height}`,
+      sensor: camera.sensor,
+      source: intrinsics.source,
+      model: intrinsics.sdk_model || intrinsics.model,
+      K: intrinsics.K,
+      D: intrinsics.D
+    }, null, 2);
+  }
+  const selected = $('intrinsic-source').value;
+  const compatible = sessions.filter(s => s.solved && s.job === 'intrinsics' && session && ['role', 'serial', 'sensor', 'width', 'height'].every(k => s.camera[k] === session.camera[k]));
+  $('intrinsic-source').replaceChildren(option('', compatible.length ? '选择可选的重标定记录' : '无匹配的重标定记录；不影响使用出厂内参'));
+  compatible.forEach(s => $('intrinsic-source').append(option(s.id, s.name)));
+  if (compatible.some(s => s.id === selected)) $('intrinsic-source').value = selected;
+  $('intrinsic-source').disabled = busy || !compatible.length;
+  $('apply-intrinsics').disabled = busy || !session || !$('intrinsic-source').value;
+  const job = session?.job || $('job').value;
+  const transform = defaults?.jobs[job]?.transform;
+  $('transform-direction').textContent = transform ? `${transform}：把相机坐标变换到${job.endsWith('wrist') ? '对应法兰' : '对应 base'}坐标。p_目标 = T_目标_相机 × p_相机；反向变换取矩阵逆。` : '内参任务求解 K 和畸变 D，不产生相机到机械臂的外参。';
 }
 
 function option(value, label) {
@@ -107,13 +147,11 @@ async function reload() {
   sessions = data.sessions;
   rig = data.rig;
   $('sessions').replaceChildren(option('', '选择记录'));
-  $('intrinsic-source').replaceChildren(option('', '请选择内参记录'));
   const selected = new Set([...document.querySelectorAll('#export-list input:checked')].map(i => i.value));
   $('export-list').replaceChildren();
   for (const s of sessions) {
     $('sessions').append(option(s.id, `${s.name} · ${titles[s.job]} · ${s.sample_count} 张`));
     if (s.solved) {
-      if (s.job === 'intrinsics') $('intrinsic-source').append(option(s.id, `${s.name} · ${s.camera.role}`));
       const label = document.createElement('label');
       label.className = 'inline';
       const check = document.createElement('input');
@@ -171,7 +209,7 @@ function renderSession() {
     tr.append(td);
     $('sample-list').append(tr);
   });
-  $('result').textContent = session.result ? JSON.stringify(session.result, null, 2) : `尚未求解。当前内参来源：${session.camera.intrinsics.source}，畸变模型：${session.camera.intrinsics.model}`;
+  $('result').textContent = JSON.stringify({intrinsics: session.camera.intrinsics, result: session.result || '尚未求解'}, null, 2);
   renderQuality();
   updateRig();
 }
@@ -216,7 +254,8 @@ function renderQuality() {
 function requireSession() {
   if (!session) throw new Error('请先新建或选择标定记录');
 }
-$('job').onchange = changeJob;
+$('job').onchange = () => { changeJob(); updateRig(); };
+$('intrinsic-source').onchange = updateRig;
 $('camera').onchange = () => {
   $('serial').value = defaults.serials[$('camera').value];
 };
@@ -257,7 +296,16 @@ $('create').onclick = () => run(async () => {
   status('记录已创建，当前板参数已保存');
 });
 $('sessions').onchange = () => run(async () => {
-  if (!$('sessions').value) return;
+  if (!$('sessions').value) {
+    session = null;
+    $('session-info').textContent = '新建或选择一份记录后开始采样。';
+    $('sample-count').textContent = '0 个样本';
+    $('sample-list').replaceChildren();
+    $('quality').replaceChildren();
+    $('result').textContent = '尚未选择记录';
+    $('procedure').textContent = procedure($('job').value);
+    return;
+  }
   session = await api(`session?id=${$('sessions').value}`);
   const saved = session.board;
   $('board-kind').value = saved.kind;

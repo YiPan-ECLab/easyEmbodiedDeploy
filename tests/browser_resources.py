@@ -138,6 +138,17 @@ print(json.dumps({'id':s['id']}))
             await page.wait_for_function(
                 "document.getElementById('sample-count').textContent==='20 个样本'"
             )
+            # Intrinsics are visible before solving, even without any custom
+            # intrinsics session. Selecting no session must clear stale data.
+            intrinsics = json.loads(await page.locator("#intrinsics-values").text_content())
+            assert intrinsics["K"][0][0] == 700
+            assert intrinsics["source"] == "test"
+            assert await page.locator("#apply-intrinsics").is_disabled()
+            await page.locator("#sessions").select_option("")
+            await page.wait_for_function("document.getElementById('sample-count').textContent==='0 个样本'")
+            assert await page.locator("#intrinsics-values").is_hidden()
+            await page.locator("#sessions").select_option(identifier)
+            await page.wait_for_function("document.getElementById('sample-count').textContent==='20 个样本'")
             await page.locator("#solve").click()
             await page.wait_for_function(
                 "document.getElementById('result').textContent.includes('T_left_flange_left_camera')"
@@ -173,10 +184,14 @@ print(json.dumps({'id':s['id']}))
                 await page.set_viewport_size({"width": 1440, "height": 1000})
                 await page.goto(args.metrics_url)
                 await page.wait_for_function(
-                    "document.getElementById('inferenceMedian').textContent.includes('ms')"
+                    "() => document.getElementById('inferenceMedian').textContent.includes('ms')"
                 )
                 assert (await page.locator("#starvedTicks").inner_text()).isdigit()
-                assert "Hz" in await page.locator("#achievedHz").inner_text()
+                metrics = await (await context.request.get(args.metrics_url.rstrip("/") + "/api/status")).json()
+                if "--offline-dataset-root" in metrics.get("deployer", {}).get("command", ""):
+                    assert await page.locator("#achievedHz").inner_text() == "—"
+                else:
+                    assert "Hz" in await page.locator("#achievedHz").inner_text()
                 assert "jsonl" in await page.locator("#diagnosticsPath").inner_text()
                 assert not await page.locator("#latencyEmpty").is_visible()
                 assert not await page.locator("#queueEmpty").is_visible()

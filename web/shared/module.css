@@ -1,4 +1,5 @@
 :root {
+  color-scheme: light;
   font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
   color: #18362e;
   background: #f3f6f2;
@@ -361,3 +362,13 @@ summary {
   cursor: pointer;
   color: var(--accent)
 }
+
+input[type=checkbox] { accent-color: var(--accent); }
+.usage-steps { padding-left: 22px; }
+.usage-steps li + li { margin-top: 8px; }
+
+.intrinsics-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 12px 0; }
+.intrinsics-metrics:empty { display: none; }
+.intrinsics-metrics strong { display: block; font-size: 17px; font-variant-numeric: tabular-nums; }
+#intrinsics-values { max-height: 260px; }
+@media (max-width: 650px) { .intrinsics-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
