@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -173,10 +174,13 @@ def analyze_file(path: Path, expected_fps: float, gap_factor: float) -> dict[str
                 task_states = states[task_positions]
                 leading_idle = edge_repeat_count(task_actions, task_states, tail=False)
                 trailing_idle = trailing_action_repeat_count(task_actions)
-                first_delta = np.abs(task_actions[0] - PREPOSITION)
+                baseline = np.asarray(demo.attrs.get("start_baseline", PREPOSITION), dtype=np.float64)
+                joint_threshold = float(demo.attrs.get("start_joint_delta_rad", 0.01))
+                gripper_threshold = float(demo.attrs.get("start_gripper_delta_m", 0.002))
+                first_delta = np.abs(task_actions[0] - baseline)
                 first_started = bool(
-                    np.max(first_delta[np.r_[0:6, 7:13]]) >= 0.01
-                    or np.max(first_delta[[6, 13]]) >= 0.002
+                    np.max(first_delta[np.r_[0:6, 7:13]]) >= joint_threshold - 1e-9
+                    or np.max(first_delta[[6, 13]]) >= gripper_threshold - 1e-9
                 )
                 metrics.update(
                     leading_idle_frames=leading_idle,
@@ -320,7 +324,8 @@ def main() -> int:
     )
     parser.add_argument("--json", dest="json_path", help="write the full JSON report")
     args = parser.parse_args()
-    if args.expected_fps <= 0 or args.gap_factor <= 1:
+    if (not math.isfinite(args.expected_fps) or not math.isfinite(args.gap_factor)
+            or args.expected_fps <= 0 or args.gap_factor <= 1):
         parser.error("--expected-fps must be positive and --gap-factor must exceed 1")
     root, files = resolve_files(args.path)
     results = [analyze_file(path, args.expected_fps, args.gap_factor) for path in files]

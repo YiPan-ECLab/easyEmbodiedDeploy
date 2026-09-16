@@ -28,3 +28,10 @@ CUDA_VISIBLE_DEVICES='' thirdParty/.venvs/lerobot-pi05/bin/python \
 
 LeRobot 工具默认从旁边的 `processing.json` 找到源 HDF5，并逐 episode 重算
 固定网格降采样、示教动作尾帧裁剪以及 absolute/delta 动作，同时核对 Parquet、任务与 episode 元数据、官方统计量和三路视频。源目录移动后可用 `--source-dir` 指定。
+
+统一入口为 `python3 workbench.py` → “质量分析”。异常 episode 清理成功后保留
+`.<数据集目录名>.before-delete-<进程号>-<时间戳>` 原始备份，返回值与提示显示具体路径。
+备份包含删除前的数据及 `processing.json`；确认新数据无误后可自行删除备份。
+恢复时先停止该数据集的转换/分析/训练，将当前数据集移走，将备份恢复为原目录名；
+若 `processing.json` 位于外层 bundle，还需将备份内的原始清单复制回外层。
+不会允许删除全部 episode，也不会使用上一任务的过期报告进行删除。

@@ -21,6 +21,8 @@ from pyAgxArm.api.constants import ROBOT_JOINT_LIMIT_PRESET_RAD
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts/PiperRecorder"))
+sys.path.insert(0, str(ROOT / "src"))
+from easy_embodied_deploy.resources import hardware_lease
 
 from piper_recorder.camera import open_cameras  # noqa: E402
 from piper_recorder.robot import DualPiper, ZERO_JOINTS, verify_can_interface  # noqa: E402
@@ -353,11 +355,15 @@ def make_reply(request: dict[str, Any], *, ok: bool, **payload: Any) -> dict[str
 
 
 def serve(endpoint: str) -> None:
+    with hardware_lease():
+        _serve(endpoint)
+
+
+def _serve(endpoint: str) -> None:
     context = zmq.Context()
     socket = context.socket(zmq.REP)
     socket.setsockopt(zmq.LINGER, 0)
     socket.setsockopt(zmq.RCVTIMEO, 200)
-    socket.bind(endpoint)
     ready = False
     command_loop: FollowerCommandLoop | None = None
     watchdog_timeout_s = DEFAULT_WATCHDOG_TIMEOUT_S
@@ -365,6 +371,7 @@ def serve(endpoint: str) -> None:
     sequence = 0
 
     try:
+        socket.bind(endpoint)
         with ExitStack() as stack:
             cameras = open_cameras(
                 CAMERA_SERIALS,
@@ -393,10 +400,6 @@ def serve(endpoint: str) -> None:
             )
             stack.callback(robot.close)
             connect_followers(robot)
-            prepare_followers(robot)
-            initial_state = read_state(robot)
-            command_loop = FollowerCommandLoop(robot, initial_state)
-
             def shutdown_hardware() -> None:
                 nonlocal command_loop
                 if command_loop is not None:
@@ -407,6 +410,9 @@ def serve(endpoint: str) -> None:
 
             # Registered after robot.close(), so homing runs before CAN disconnect.
             stack.callback(shutdown_hardware)
+            prepare_followers(robot)
+            initial_state = read_state(robot)
+            command_loop = FollowerCommandLoop(robot, initial_state)
             ready = True
             print(
                 f"hardware bridge ready: {endpoint} | awaiting deployer motion config "
@@ -456,7 +462,7 @@ def serve(endpoint: str) -> None:
                         control_hz = float(request["control_hz"])
                         smoothing_tau = float(request["smoothing_time_constant_s"])
                         watchdog = float(request["watchdog_timeout_s"])
-                        if watchdog < 5:
+                        if not math.isfinite(watchdog) or watchdog < 5:
                             raise ValueError("watchdog_timeout_s must be at least 5 seconds")
                         command_loop.configure(
                             control_hz=control_hz,

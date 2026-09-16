@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import mimetypes
 import os
@@ -22,6 +21,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from easy_embodied_deploy.http import LocalHandlerMixin, json_safe, read_json
+from easy_embodied_deploy.system import gpu_status
+from easy_embodied_deploy.contracts import boolean
 
 from trainer import (
     DEFAULT_DATASET,
@@ -95,6 +100,8 @@ class ConsoleError(RuntimeError):
 
 
 def normalize_web_config(raw: dict[str, Any] | None, *, check_output: bool) -> TrainingConfig:
+    if raw is not None and not isinstance(raw, dict):
+        raise ConsoleError("训练配置必须是 JSON 对象")
     values = DEFAULT_CONFIG.copy()
     if raw:
         values.update({key: value for key, value in raw.items() if key in values})
@@ -176,7 +183,10 @@ def discover_resume_configs() -> list[dict[str, Any]]:
         if payload.get("trainer") != "OpenpiTrainer":
             continue
         config = payload.get("config", {})
-        output_dir = str(config.get("output_dir", ""))
+        # Discover the local checkpoint tree, not a historical path embedded
+        # by a different machine in the manifest.
+        run_dir = config_path.parent.parent if (config_path.parent / "params").is_dir() else config_path.parent
+        output_dir = str(run_dir)
         if not output_dir or output_dir in seen_outputs:
             continue
         seen_outputs.add(output_dir)
@@ -192,55 +202,6 @@ def discover_resume_configs() -> list[dict[str, Any]]:
         )
     return result
 
-
-def gpu_status() -> list[dict[str, Any]]:
-    query = [
-        "nvidia-smi",
-        "--query-gpu=index,uuid,name,memory.used,memory.total,utilization.gpu,temperature.gpu",
-        "--format=csv,noheader,nounits",
-    ]
-    try:
-        result = subprocess.run(query, check=True, capture_output=True, text=True, timeout=3)
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return []
-    gpus: list[dict[str, Any]] = []
-    by_uuid: dict[str, dict[str, Any]] = {}
-    for row in csv.reader(result.stdout.splitlines(), skipinitialspace=True):
-        if len(row) != 7:
-            continue
-        item = {
-            "index": int(row[0]),
-            "uuid": row[1],
-            "name": row[2],
-            "memory_used_mb": int(row[3]),
-            "memory_total_mb": int(row[4]),
-            "utilization": int(row[5]),
-            "temperature": int(row[6]),
-            "processes": [],
-        }
-        gpus.append(item)
-        by_uuid[item["uuid"]] = item
-    try:
-        processes = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
-                "--format=csv,noheader,nounits",
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        for row in csv.reader(processes.stdout.splitlines(), skipinitialspace=True):
-            if len(row) != 4 or row[0] not in by_uuid:
-                continue
-            by_uuid[row[0]]["processes"].append(
-                {"pid": int(row[1]), "name": Path(row[2]).name, "memory_mb": int(row[3])}
-            )
-    except (FileNotFoundError, subprocess.SubprocessError, ValueError):
-        pass
-    return gpus
 
 
 def external_training_processes(excluded_pgid: int | None = None) -> list[dict[str, Any]]:
@@ -279,6 +240,7 @@ class ManagedTraining:
     last_metrics: dict[str, float] = field(default_factory=dict)
     metrics: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=1200))
     dry_run: bool = False
+    ended_at: float | None = None
 
 
 class TrainingSupervisor:
@@ -286,6 +248,8 @@ class TrainingSupervisor:
         self._lock = threading.RLock()
         self._training: ManagedTraining | None = None
         self._starting = False
+        self._generation = 0
+        self._closed = False
         self._logs: deque[dict[str, Any]] = deque(maxlen=5000)
         self._next_log_id = 1
         self._dataset_report: dict[str, Any] | None = None
@@ -331,9 +295,10 @@ class TrainingSupervisor:
 
     def start(self, raw: dict[str, Any]) -> None:
         with self._lock:
-            if self._is_running() or self._starting:
+            if self._closed or self._is_running() or self._starting:
                 raise ConsoleError("本控制台已有训练在运行")
             self._starting = True
+            generation = self._generation
         try:
             config = normalize_web_config(raw, check_output=True)
             dataset_root, normalization_mode, action_mode = validation_contract(config)
@@ -344,33 +309,35 @@ class TrainingSupervisor:
                 decode_sample=False,
             )
             self._assert_gpu_available(config)
-            dry_run = bool(raw.get("dry_run", False))
+            dry_run = boolean(raw.get("dry_run", False), "dry_run", ConsoleError)
             command = wrapper_command(config, dry_run=dry_run)
             environment = build_environment(config)
-            process = subprocess.Popen(
-                command,
-                cwd=PROJECT_ROOT,
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                errors="replace",
-                bufsize=1,
-                start_new_session=True,
-            )
-            total_steps = config.steps
-            if config.resume_config is not None:
-                saved = _read_json(config.resume_config)
-                total_steps = int(saved.get("config", saved).get("steps", total_steps))
-            managed = ManagedTraining(
-                process=process,
-                config=config,
-                command=command,
-                started_at=time.time(),
-                total_steps=total_steps,
-                dry_run=dry_run,
-            )
             with self._lock:
+                if self._closed or generation != self._generation:
+                    raise ConsoleError("启动已取消")
+                process = subprocess.Popen(
+                    command,
+                    cwd=PROJECT_ROOT,
+                    env=environment,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                    bufsize=1,
+                    start_new_session=True,
+                )
+                total_steps = config.steps
+                if config.resume_config is not None:
+                    saved = _read_json(config.resume_config)
+                    total_steps = int(saved.get("config", saved).get("steps", total_steps))
+                managed = ManagedTraining(
+                    process=process,
+                    config=config,
+                    command=command,
+                    started_at=time.time(),
+                    total_steps=total_steps,
+                    dry_run=dry_run,
+                )
                 self._training = managed
                 self._dataset_report = report
                 self._logs.clear()
@@ -406,12 +373,15 @@ class TrainingSupervisor:
             if not line:
                 continue
             with self._lock:
-                self._parse_training_line(managed, line)
+                if managed.state != "stopping":
+                    self._parse_training_line(managed, line)
             level = "error" if any(word in line.lower() for word in ("error", "traceback", "out of memory")) else "info"
             self.log("train", line, level)
+        managed.process.stdout.close()
         exit_code = managed.process.wait()
         with self._lock:
             managed.exit_code = exit_code
+            managed.ended_at = time.time()
             if managed.state == "stopping":
                 managed.state = "stopped"
             elif exit_code == 0:
@@ -424,8 +394,11 @@ class TrainingSupervisor:
 
     def stop(self) -> None:
         with self._lock:
+            self._generation += 1
             managed = self._training
             if managed is None or managed.process.poll() is not None:
+                return
+            if managed.state == "stopping":
                 return
             managed.state = "stopping"
         self.log("system", "发送 SIGINT，等待训练进程退出")
@@ -450,6 +423,7 @@ class TrainingSupervisor:
                 os.killpg(managed.process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            managed.process.wait()
 
         threading.Thread(target=terminate, daemon=True).start()
 
@@ -483,7 +457,7 @@ class TrainingSupervisor:
                     "total_steps": managed.total_steps,
                     "exit_code": managed.exit_code,
                     "eta": managed.eta,
-                    "elapsed_s": max(0, time.time() - managed.started_at),
+                    "elapsed_s": max(0, (managed.ended_at or time.time()) - managed.started_at),
                     "seconds_per_step": managed.seconds_per_step,
                     "metrics": dict(managed.last_metrics),
                     "history": list(managed.metrics),
@@ -491,6 +465,8 @@ class TrainingSupervisor:
                     "command": shlex.join(managed.command),
                     "dry_run": managed.dry_run,
                 }
+            if self._starting:
+                training["state"] = "validating"
         return {
             "training": training,
             "dataset": dataset_report,
@@ -499,6 +475,9 @@ class TrainingSupervisor:
         }
 
     def shutdown(self) -> None:
+        with self._lock:
+            self._closed = True
+            self._generation += 1
         if self._is_running():
             self.stop()
             deadline = time.time() + 30
@@ -515,14 +494,14 @@ class ConsoleHTTPServer(ThreadingHTTPServer):
         super().__init__(address, ConsoleHandler)
 
 
-class ConsoleHandler(BaseHTTPRequestHandler):
+class ConsoleHandler(LocalHandlerMixin, BaseHTTPRequestHandler):
     server: ConsoleHTTPServer
 
     def log_message(self, format: str, *args: Any) -> None:
         return
 
     def _json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode()
+        body = json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -531,14 +510,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self) -> dict[str, Any]:
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except (ValueError, json.JSONDecodeError) as exc:
-            raise ConsoleError("请求 JSON 无效") from exc
-        if not isinstance(payload, dict):
-            raise ConsoleError("请求体必须是 JSON object")
-        return payload
+        return read_json(self, ConsoleError)
 
     def _static(self, path: str) -> None:
         relative = "index.html" if path == "/" else path.lstrip("/")
@@ -598,7 +570,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     action_mode=action_mode,
                     decode_sample=False,
                 )
-                dry_run = bool((body.get("config") or {}).get("dry_run", False))
+                dry_run = boolean((body.get("config") or {}).get("dry_run", False), "dry_run", ConsoleError)
                 self._json(
                     {
                         "ok": True,
@@ -658,7 +630,7 @@ def main() -> None:
     args = parser.parse_args()
     supervisor = TrainingSupervisor()
     server = ConsoleHTTPServer((args.host, args.port), supervisor)
-    print(f"OpenPI JAX Trainer: http://{args.host}:{args.port}", flush=True)
+    print(f"OpenPI JAX Trainer: http://{args.host}:{server.server_address[1]}", flush=True)
     print("Ctrl-C 会停止本页面启动的训练；不会触碰旧 Trainer 或外部训练。", flush=True)
     try:
         server.serve_forever(poll_interval=0.2)

@@ -17,6 +17,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from easy_embodied_deploy.statistics import statistics_close
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 AXES = [
     f"{side}_{axis}"
@@ -124,7 +126,9 @@ def source_paths(
     by_name = {}
     for directory in directories:
         for path in sorted((*directory.glob("*.hdf5"), *directory.glob("*.h5"))):
-            by_name.setdefault(path.name, path)
+            if path.name in by_name and by_name[path.name] != path:
+                raise ValueError(f"源目录中有同名文件 {path.name}，不能按文件名推断 episode 来源；请保留 processing.json 中的 source_dir")
+            by_name[path.name] = path
     expected_names = [item.get("name") for item in plan_files if item.get("name")]
     if expected_names:
         return [by_name[name] for name in expected_names if name in by_name], directories
@@ -135,7 +139,7 @@ def probe_video(path: Path) -> dict[str, Any]:
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
          "stream=width,height,r_frame_rate,nb_frames", "-of", "json", str(path)],
-        check=False, capture_output=True, text=True,
+        check=False, capture_output=True, text=True, timeout=30,
     )
     if result.returncode:
         raise ValueError(f"ffprobe 失败: {path}: {result.stderr.strip()}")
@@ -147,7 +151,7 @@ def probe_video(path: Path) -> dict[str, Any]:
     }
 
 
-def analyze(raw: str, source_override: str | None) -> dict[str, Any]:
+def _analyze(raw: str, source_override: str | None) -> dict[str, Any]:
     bundle, root = lerobot_root(raw)
     errors: list[str] = []
     warnings: list[str] = []
@@ -252,7 +256,7 @@ def analyze(raw: str, source_override: str | None) -> dict[str, Any]:
                 continue
             difference = float(np.max(np.abs(stored - calculated)))
             maximum_error = max(maximum_error, difference)
-            if not np.allclose(stored, calculated, rtol=2e-5, atol=2e-5):
+            if not statistics_close(stored, calculated, name, values):
                 errors.append(f"stats {key}/{name} 与 parquet 全量重算不一致，最大误差 {difference:g}")
         statistics[key] = {"max_recompute_error": maximum_error}
 
@@ -429,6 +433,12 @@ def analyze(raw: str, source_override: str | None) -> dict[str, Any]:
                 errors.append(f"{key} 视频 FPS 错误")
         videos[key] = {"files": len(paths), "frames": frames_found}
 
+    # Source checks also belong to episode rows, including deletion eligibility.
+    for item in episode_results:
+        prefix = f"episode {item['episode']}: "
+        item["errors"] = list(dict.fromkeys([
+            *item["errors"], *(error[len(prefix):] for error in errors if error.startswith(prefix))
+        ]))
     summary = {
         "episodes": total_episodes, "frames": total_frames, "fps": fps,
         "action_mode": mode,
@@ -452,6 +462,24 @@ def analyze(raw: str, source_override: str | None) -> dict[str, Any]:
         "errors": errors, "warnings": warnings,
         "episodes": episode_results,
     }
+
+
+def analyze(raw: str, source_override: str | None) -> dict[str, Any]:
+    """Malformed datasets produce a usable failure report, including strict JSON."""
+    from easy_embodied_deploy.http import json_safe
+    try:
+        return json_safe(_analyze(raw, source_override))
+    except (ValueError, TypeError, KeyError, IndexError, OverflowError, OSError) as exc:
+        return {
+            "status": "FAIL", "bundle": str(Path(raw).expanduser().resolve()),
+            "summary": {"episodes": 0, "frames": 0, "fps": 0, "action_mode": None,
+                        "leading_idle_frames": 0, "trailing_idle_frames": 0,
+                        "max_action_joint_step_rad": 0.0, "max_action_gripper_step_m": 0.0,
+                        "max_state_joint_step_rad": 0.0, "errors": 1, "warnings": 0},
+            "source_verification": None, "videos": {}, "statistics": {},
+            "errors": [f"数据结构无法解析：{type(exc).__name__}: {exc}"],
+            "warnings": [], "episodes": [],
+        }
 
 
 def print_report(report: dict[str, Any]) -> None:
@@ -498,7 +526,7 @@ def main() -> int:
     print_report(report)
     if args.json_path:
         Path(args.json_path).write_text(
-            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+            json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
         )
     return 0 if report["status"] == "PASS" else 1
 

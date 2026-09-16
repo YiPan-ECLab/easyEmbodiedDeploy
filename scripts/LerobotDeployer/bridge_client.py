@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -28,7 +29,7 @@ class PiperBridge:
         *,
         timeout_s: float = 5.0,
     ) -> None:
-        if timeout_s <= 0:
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
             raise ValueError("timeout_s must be positive")
         self.endpoint = endpoint
         self.timeout_ms = max(1, round(timeout_s * 1000))

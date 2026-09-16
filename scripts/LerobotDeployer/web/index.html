@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>Piper · LeRobot Control Deck</title>
-    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="styles.css">
   </head>
   <body>
     <div class="ambient ambient-a"></div>
@@ -192,6 +192,7 @@
                   <span>看门狗超时</span>
                   <div class="number-control"><input id="watchdog_timeout" name="watchdog_timeout" type="number" min="5" step="1"><i>s</i></div>
                 </label>
+                <label class="field"><span>Dry run（推理但不发动作）</span><input id="dry_run" name="dry_run" type="checkbox"><small>硬件仍执行连接、回零和预定位。</small></label>
                 <label class="field wide">
                   <span>诊断 JSONL</span>
                   <input id="diagnostics_jsonl" name="diagnostics_jsonl" spellcheck="false">
@@ -303,6 +304,6 @@
     </main>
 
     <div class="toast-stack" id="toastStack" aria-live="assertive"></div>
-    <script src="/app.js"></script>
+    <script src="app.js"></script>
   </body>
 </html>

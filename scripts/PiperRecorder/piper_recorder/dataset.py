@@ -32,6 +32,7 @@ GRIPPER_BOUNDARY_TOLERANCE_M = HARDWARE_TOLERANCE_M
 
 @dataclass
 class EpisodeData:
+    recording_metadata: dict = field(default_factory=dict, kw_only=True)
     timestamps: list[float] = field(default_factory=list)
     phases: list[int] = field(default_factory=list)
     camera_timestamps: list[list[float]] = field(default_factory=list)
@@ -281,6 +282,8 @@ def write_episode(
             demo = data.create_group("demo_0")
             demo.attrs["num_samples"] = len(episode)
             demo.attrs["language"] = instruction
+            for key, value in episode.recording_metadata.items():
+                demo.attrs[key] = value
             demo.attrs["gripper_force_n"] = gripper_force
             if record_hz is not None:
                 demo.attrs["record_hz"] = float(record_hz)

@@ -30,6 +30,12 @@ def _read_parquet_files(paths: list[Path], columns: list[str] | None = None):
 
 def _fixed_vectors(table, key: str, width: int) -> np.ndarray:
     column = table.column(key).combine_chunks()
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    if column.null_count or not (pa.types.is_list(column.type) or pa.types.is_fixed_size_list(column.type)):
+        raise ValueError(f"{key} 必须是无空值的向量列")
+    if not np.all(np.asarray(pc.list_value_length(column)) == width):
+        raise ValueError(f"{key} 每一行必须恰好 {width} 维")
     values = np.asarray(column.values, dtype=np.float32)
     result = values.reshape(len(column), width)
     if not np.isfinite(result).all():
@@ -49,6 +55,8 @@ class LeRobotV3Dataset:
         if info.get("codebase_version") != "v3.0":
             raise ValueError(f"只支持 LeRobot v3.0，检测到 {info.get('codebase_version')!r}")
         self.fps = float(info["fps"])
+        if not np.isfinite(self.fps) or self.fps <= 0:
+            raise ValueError("数据集 fps 必须为有限正数")
         self._video_path_template = str(
             info.get("video_path", "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4")
         )
@@ -75,13 +83,21 @@ class LeRobotV3Dataset:
         if len(self._states) != int(info["total_frames"]):
             raise ValueError(f"帧数不一致：info={info['total_frames']} parquet={len(self._states)}")
 
-        self._episode_end = np.empty(len(self), dtype=np.int64)
+        if len(self._episodes) != int(info["total_episodes"]) or len(self._episodes) != len(episodes):
+            raise ValueError("episode 元数据数量不一致或存在重复索引")
+        self._episode_end = np.zeros(len(self), dtype=np.int64)
         for episode_index, row in self._episodes.items():
             start = int(row["dataset_from_index"])
             end = int(row["dataset_to_index"])
             if start < 0 or end <= start or end > len(self):
                 raise ValueError(f"episode {episode_index} 的帧范围无效：[{start}, {end})")
+            if np.any(self._episode_end[start:end]) or not np.all(self._episode_indices[start:end] == episode_index):
+                raise ValueError(f"episode {episode_index} 范围重叠或与数据不一致")
             self._episode_end[start:end] = end
+        if not len(self) or np.any(self._episode_end == 0):
+            raise ValueError("episode 元数据未完整覆盖数据帧")
+        if not np.isfinite(self._timestamps).all() or any(int(index) not in self._tasks for index in np.unique(self._task_indices)):
+            raise ValueError("数据时间戳或任务索引无效")
 
     def __len__(self) -> int:
         return len(self._states)

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import math
 import re
 import sys
 import threading
@@ -183,12 +184,12 @@ def validate_args(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
 ) -> float:
-    if args.control_hz <= 0 or args.control_hz > 200:
+    if not 0 < args.control_hz <= 200:
         parser.error("--control-hz must be in (0, 200]")
     if not 0 <= args.smoothing_time_constant <= 2:
         parser.error("--smoothing-time-constant must be in [0, 2]")
     policy_hz = float(args.policy_hz)
-    if policy_hz <= 0 or policy_hz > 200:
+    if not 0 < policy_hz <= 200:
         parser.error("--policy-hz must be in (0, 200]")
     if args.max_steps < 0:
         parser.error("--max-steps cannot be negative")
@@ -198,7 +199,9 @@ def validate_args(
         parser.error("--rtc-horizon must be positive")
     if args.rtc_queue_threshold < 0:
         parser.error("--rtc-queue-threshold cannot be negative")
-    if args.watchdog_timeout < 5:
+    if not math.isfinite(args.rpc_timeout) or args.rpc_timeout <= 0:
+        parser.error("--rpc-timeout must be finite and positive")
+    if not math.isfinite(args.watchdog_timeout) or args.watchdog_timeout < 5:
         parser.error("--watchdog-timeout must be at least 5 seconds")
     device_match = re.fullmatch(r"cuda(?::(\d+))?", args.device)
     if args.device != "cpu" and device_match is None:
@@ -484,6 +487,12 @@ def main() -> None:
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         parser.error("CUDA was requested but torch.cuda.is_available() is false")
 
+    sys.path.insert(0, str(ROOT / "src"))
+    from easy_embodied_deploy.contracts import checkpoint_action_mode
+    try:
+        checkpoint_action_mode(checkpoint, args.action_mode)
+    except (ValueError, OSError, TypeError) as exc:
+        parser.error(str(exc))
     policy_hz = validate_args(parser, args)
 
     rtc_config = None

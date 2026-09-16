@@ -285,7 +285,7 @@ function appendLogs(items) {
 
 async function pollStatus() {
   try {
-    const status=await request('/api/status');renderStatus(status);
+    const status=await request('api/status');renderStatus(status);
     $('connectionPill').className='connection-pill online';$('connectionText').textContent='控制台已连接';
   } catch(error) {
     $('connectionPill').className='connection-pill error';$('connectionText').textContent='连接中断';
@@ -293,13 +293,13 @@ async function pollStatus() {
 }
 
 async function pollLogs() {
-  try {const data=await request(`/api/logs?after=${lastLogId}`);appendLogs(data.items);lastLogId=data.last_id;} catch {}
+  try {const data=await request(`api/logs?after=${lastLogId}`);appendLogs(data.items);lastLogId=data.last_id;} catch {}
   finally {logsTimer=setTimeout(pollLogs,850)}
 }
 
 async function preview(silent=false) {
   try {
-    const result=await post('/api/preview',{config:formConfig()});
+    const result=await post('api/preview',{config:formConfig()});
     $('commandPreview').textContent=result.lerobot;
     $('cudaVisibility').textContent=`CUDA_VISIBLE_DEVICES = ${result.cuda_visible_devices || '(hidden)'}`;
     $('launcherMode').textContent=result.config.gpu_ids.length>1?'torchrun · DDP':'single process';
@@ -312,32 +312,32 @@ function updatePreviewSoon(){clearTimeout(previewTimer);previewTimer=setTimeout(
 
 async function validateDatasetDeep() {
   const button=$('validateButton');button.disabled=true;button.textContent='正在解码首帧…';
-  try {const result=await post('/api/validate',{config:formConfig()});renderDataset(result.dataset);toast('数据元数据、统计量和首帧解码全部通过','success');}
+  try {const result=await post('api/validate',{config:formConfig()});renderDataset(result.dataset);toast('数据元数据、统计量和首帧解码全部通过','success');}
   catch(error){$('stepDataset').className='failed';toast(error.message,'error')}
   finally{button.disabled=false;button.textContent='深度验证数据'}
 }
 
 async function startTraining() {
   const config=formConfig();
-  try {await post('/api/start',{config});toast(config.dry_run?'Dry run 已启动':'训练已在隔离进程中启动','success');await pollOnce();}
+  try {await post('api/start',{config});toast(config.dry_run?'Dry run 已启动':'训练已在隔离进程中启动','success');await pollOnce();}
   catch(error){toast(error.message,'error')}
 }
 
-async function pollOnce(){try{renderStatus(await request('/api/status'))}catch{}}
+async function pollOnce(){try{renderStatus(await request('api/status'))}catch{}}
 
 function openStop(){if(!$('stopButton').disabled)$('confirmDialog').showModal()}
 async function confirmStop(){
   $('confirmDialog').close();
-  try{await post('/api/stop');toast('已发送 SIGINT，正在等待本页训练退出','success');await pollOnce()}catch(error){toast(error.message,'error')}
+  try{await post('api/stop');toast('已发送 SIGINT，正在等待本页训练退出','success');await pollOnce()}catch(error){toast(error.message,'error')}
 }
 
 async function clearLogs(){
-  try{await post('/api/logs/clear');$('terminal').innerHTML='<div class="terminal-placeholder">日志显示已清空…</div>';lastLogId=0;toast('日志显示已清空','success')}catch(error){toast(error.message,'error')}
+  try{await post('api/logs/clear');$('terminal').innerHTML='<div class="terminal-placeholder">日志显示已清空…</div>';lastLogId=0;toast('日志显示已清空','success')}catch(error){toast(error.message,'error')}
 }
 
 async function initialize() {
   try {
-    bootstrap=await request('/api/bootstrap');fillDiscoveries(bootstrap);applyConfig(bootstrap.defaults);
+    bootstrap=await request('api/bootstrap');fillDiscoveries(bootstrap);applyConfig(bootstrap.defaults);
     updateDatasetSelection();renderStatus(bootstrap.status);renderGpuPicker(bootstrap.status.gpu);renderGpuList(bootstrap.status.gpu);renderExternal(bootstrap.status.external_training);
     $('connectionPill').className='connection-pill online';$('connectionText').textContent='控制台已连接';
     preview(true);pollStatus();pollLogs();

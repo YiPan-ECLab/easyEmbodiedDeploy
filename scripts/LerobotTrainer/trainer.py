@@ -9,7 +9,7 @@ import math
 import os
 import re
 import subprocess
-import sys
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -112,9 +112,11 @@ def _bool(value: Any, name: str) -> bool:
 
 
 def _integer(value: Any, name: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool):
+        raise TrainerConfigError(f"{name} 必须是整数")
     try:
         number = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise TrainerConfigError(f"{name} 必须是整数") from exc
     if isinstance(value, float) and not value.is_integer():
         raise TrainerConfigError(f"{name} 必须是整数")
@@ -453,18 +455,24 @@ def validation_contract(config: TrainingConfig) -> tuple[Path, str, str]:
     normalization_mode = reverse_modes.get(action_normalization, config.normalization_mode)
 
     action_mode = config.action_mode
+    checkpoint_action_mode = None
     manifest_path = config.resume_config.parent / "training_manifest.json"
     if manifest_path.is_file():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            action_mode = manifest.get("config", {}).get("action_mode", action_mode)
+            checkpoint_action_mode = manifest.get("config", {}).get("action_mode")
+            action_mode = checkpoint_action_mode or action_mode
         except (OSError, ValueError, TypeError):
             pass
     processing_path = root.parent / "processing.json"
     if processing_path.is_file():
         try:
             processing = json.loads(processing_path.read_text(encoding="utf-8"))
-            action_mode = processing.get("settings", {}).get("action_mode", action_mode)
+            declared = processing.get("settings", {}).get("action_mode", action_mode)
+            declared = "absolute_joint" if declared == "absolute" else declared
+            if checkpoint_action_mode and declared != action_mode:
+                raise TrainerConfigError("恢复数据集的动作语义与 checkpoint 不一致")
+            action_mode = declared
         except (OSError, ValueError, TypeError) as exc:
             raise TrainerConfigError(f"恢复数据集 processing.json 无法读取：{exc}") from exc
         if action_mode == "absolute":
@@ -654,13 +662,15 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 
 def write_training_manifest(
-    config: TrainingConfig, report: dict[str, Any], command: list[str]
+    config: TrainingConfig, report: dict[str, Any], command: list[str], *, status: str = "completed"
 ) -> None:
     if config.resume_config is not None:
         return
     manifest = {
         "schema_version": 2,
-        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": datetime.now(timezone.utc).isoformat() if status == "completed" else None,
         "trainer": "LerobotTrainer",
         "config": config_for_json(config),
         "dataset": report,
@@ -745,13 +755,12 @@ def main() -> int:
 
     config.output_dir.parent.mkdir(parents=True, exist_ok=True)
     try:
-        result = subprocess.run(
-            command,
-            cwd=PROJECT_ROOT,
-            env=build_environment(config),
-            check=False,
-        )
-        return_code = result.returncode
+        process = subprocess.Popen(command, cwd=PROJECT_ROOT, env=build_environment(config))
+        while process.poll() is None and not config.output_dir.is_dir():
+            time.sleep(0.1)
+        if config.output_dir.is_dir():
+            write_training_manifest(config, report, command, status="running")
+        return_code = process.wait()
     except KeyboardInterrupt:
         return_code = 130
     if return_code == 0:

@@ -159,7 +159,7 @@ function renderReport(report) {
 
 async function refresh() {
   try {
-    const value = await request("/api/status");
+    const value = await request("api/status");
     setConnection(true);
     state.status = value.status;
     const running = value.status === "running";
@@ -185,7 +185,7 @@ async function refresh() {
 
 async function start() {
   try {
-    const response = await request("/api/start", {
+    const response = await request("api/start", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(formPayload()),
     });
@@ -200,7 +200,7 @@ async function start() {
 async function cancel() {
   $("cancel").disabled = true;
   try {
-    await request("/api/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    await request("api/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     $("runMessage").textContent = "正在停止分析…";
   } catch (error) { toast(error.message, true); $("cancel").disabled = false; }
 }
@@ -213,11 +213,11 @@ async function deleteGapEpisodes() {
   const button = $("deleteGapEpisodes");
   button.disabled = true;
   try {
-    await request("/api/delete-error-episodes", {
+    const result = await request("api/delete-error-episodes", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: state.report.bundle, episodes }),
     });
-    toast(`已删除 ${episodes.length} 个 episode，正在重新分析`);
+    toast(`已删除 ${episodes.length} 个 episode；原始备份：${result.backup}。正在重新分析`);
     state.report = null;
     $("report").classList.add("hidden");
     await start();
@@ -245,7 +245,7 @@ $("download").addEventListener("click", download);
 $("search").addEventListener("input", () => state.report && (state.report.files ? renderHdf5Rows() : renderLerobotRows()));
 $("issues").addEventListener("change", () => state.report && (state.report.files ? renderHdf5Rows() : renderLerobotRows()));
 
-request("/api/defaults").then((value) => {
+request("api/defaults").then((value) => {
   state.defaults = value;
   $("expectedFps").value = value.expected_fps;
   $("gapFactor").value = value.gap_factor;

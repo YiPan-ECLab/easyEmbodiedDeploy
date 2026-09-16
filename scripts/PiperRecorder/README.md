@@ -128,3 +128,19 @@ J5 `[-1.221730, 1.221730]`、J6 `[-2.094396, 2.094396]` rad；两台 follower
 | `trajectory_phase` | `(T,)` | 枚举：`0=task`，`1=home` |
 | `rewards` | `(T,)` | 无量纲；Recorder 当前写 0 |
 | `dones` | `(T,)` | 布尔值；仅最后一帧为 true |
+
+## Web 与脚踏板
+
+统一入口：在仓库根目录运行 `python3 workbench.py`，选择“Piper 采集”。
+独立入口：`thirdParty/.venvs/piper-home/bin/python scripts/PiperRecorder/web_server.py`。
+
+页面直接驱动原 `record.py` 的指令、预定位、等待动作、采集、回零和保存阶段。
+回车在指令阶段开始、采集阶段结束、确认阶段保存；丢弃使用页面按钮。
+留空沿用指令，`:q` 仍可在指令阶段退出。采样率、启动阈值、gap 判定、动作单位、
+task/home 分段和归零轨迹保持原流程。新增 `--web-control` 是内部结构化输入通道，
+日常 CLI 仍使用原终端输入。
+
+点击页面使其获得焦点后再踩踏板。阶段切换时丢弃过期输入，长按只接受一次。
+保存失败后可以重试或丢弃，设备异常显示在阶段提示和日志中。
+“结束会话并归位”会等待正在进行的归零，丢弃当前未保存 episode 后退出。
+Web 服务退出也会请求该清理流程。

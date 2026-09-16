@@ -9,7 +9,6 @@ import math
 import os
 import re
 import subprocess
-import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -113,9 +112,11 @@ def _bool(value: Any, name: str) -> bool:
 
 
 def _integer(value: Any, name: str, *, minimum: int = 0) -> int:
+    if isinstance(value, bool):
+        raise TrainerConfigError(f"{name} 必须是整数")
     try:
         number = int(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise TrainerConfigError(f"{name} 必须是整数") from exc
     if isinstance(value, float) and not value.is_integer():
         raise TrainerConfigError(f"{name} 必须是整数")
@@ -456,7 +457,11 @@ def validation_contract(config: TrainingConfig) -> tuple[Path, str, str]:
     if processing_path.is_file():
         try:
             processing = json.loads(processing_path.read_text(encoding="utf-8"))
-            action_mode = processing.get("settings", {}).get("action_mode", action_mode)
+            declared = processing.get("settings", {}).get("action_mode", action_mode)
+            declared = "absolute_joint" if declared == "absolute" else declared
+            if declared != action_mode:
+                raise TrainerConfigError("恢复数据集的动作语义与 checkpoint 不一致")
+            action_mode = declared
         except (OSError, ValueError, TypeError) as exc:
             raise TrainerConfigError(f"恢复数据集 processing.json 无法读取：{exc}") from exc
         if action_mode == "absolute":

@@ -37,9 +37,14 @@ from processor import (  # noqa: E402
     validate_lerobot_bundle,
 )
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from easy_embodied_deploy.http import LocalHandlerMixin, read_json
+
 STATIC_ROOT = Path(__file__).parent / "static"
 STATE_LOCK = threading.Lock()
 CANCEL_EVENT = threading.Event()
+WORKER: threading.Thread | None = None
 STATE = {
     "job_id": 0,
     "status": "idle",
@@ -66,16 +71,25 @@ def settings_from(payload: dict) -> Settings:
     input_dirs = [str(value).strip() for value in raw_dirs if str(value).strip()]
     if not input_dirs:
         input_dirs = [DEFAULT_INPUT_DIR]
-    source_fps = payload.get("source_fps")
+    def integer(key, default):
+        value = payload.get(key, default)
+        if value in (None, ""):
+            return default
+        if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+            raise ValueError(f"{key} 必须为整数")
+        try:
+            return int(value)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise ValueError(f"{key} 必须为整数") from exc
     return Settings(
         input_dir=input_dirs[0], input_dirs=input_dirs,
         output_root=payload.get("output_root") or DEFAULT_OUTPUT_ROOT,
         task=str(payload.get("task") or TASK_DESCRIPTION),
-        target_fps=int(payload.get("target_fps") or DEFAULT_FPS),
-        source_fps=int(source_fps) if source_fps else DEFAULT_SOURCE_FPS,
+        target_fps=integer("target_fps", DEFAULT_FPS),
+        source_fps=integer("source_fps", DEFAULT_SOURCE_FPS),
         action_mode=str(payload.get("action_mode") or DEFAULT_ACTION_MODE),
         repo_id=payload.get("repo_id") or DEFAULT_REPO_ID,
-        limit=int(payload.get("limit") or DEFAULT_LIMIT),
+        limit=integer("limit", DEFAULT_LIMIT),
         gap_policy=str(payload.get("gap_policy") or DEFAULT_GAP_POLICY),
     )
 
@@ -86,6 +100,7 @@ def state_snapshot() -> dict:
 
 
 def start_job(settings: Settings, plan: dict) -> int:
+    global WORKER
     with STATE_LOCK:
         if STATE["status"] == "running":
             raise RuntimeError("已有转换任务正在运行")
@@ -134,11 +149,12 @@ def start_job(settings: Settings, plan: dict) -> int:
                         finished_at=time.time(),
                     )
 
-    threading.Thread(target=worker, name=f"data-processor-{job_id}", daemon=True).start()
+    WORKER = threading.Thread(target=worker, name=f"data-processor-{job_id}", daemon=False)
+    WORKER.start()
     return job_id
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(LocalHandlerMixin, BaseHTTPRequestHandler):
     server_version = "DataProcessor/2.0"
 
     def send_payload(
@@ -165,13 +181,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
     def read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0 or length > 1_000_000:
-            raise ValueError("请求体为空或超过 1 MB")
-        value = json.loads(self.rfile.read(length))
-        if not isinstance(value, dict):
-            raise ValueError("请求体必须是 JSON 对象")
-        return value
+        return read_json(self)
 
     def api_error(self, exc: Exception, status: HTTPStatus = HTTPStatus.BAD_REQUEST) -> None:
         self.send_payload({"error": f"{type(exc).__name__}: {exc}"}, status)
@@ -276,5 +286,8 @@ def run_server(host: str = "127.0.0.1", port: int = 8766) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        CANCEL_EVENT.set()
+        if WORKER:
+            WORKER.join()
         server.server_close()
         print("DataProcessor stopped")

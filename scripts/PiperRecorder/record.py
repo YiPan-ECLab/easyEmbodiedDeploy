@@ -10,6 +10,9 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from easy_embodied_deploy.resources import hardware_lease
+
 from pyAgxArm import PiperFW
 
 from piper_recorder.camera import CAMERA_NAMES, OrbbecCamera, open_cameras
@@ -21,7 +24,7 @@ MAX_TASK_GAP_S = 0.35
 START_JOINT_DELTA_RAD = 0.01
 START_GRIPPER_DELTA_M = 0.002
 IMAGE_SIZE = (224, 224)
-OUTPUT_DIR = Path("/home/py/main/easyEmbodiedDeploy/datasets/hdf5/撕下快递单并贴到桌子上的快递上_test")
+OUTPUT_DIR = Path(__file__).resolve().parents[2] / "datasets/hdf5/撕下快递单并贴到桌子上的快递上_test"
 
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
@@ -159,10 +162,13 @@ def record_episode(
     max_task_gap_s: float = MAX_TASK_GAP_S,
     start_joint_delta_rad: float = START_JOINT_DELTA_RAD,
     start_gripper_delta_m: float = START_GRIPPER_DELTA_M,
+    operator=None,
 ) -> EpisodeData:
     _validate_options(
         hz, max_task_gap_s, start_joint_delta_rad, start_gripper_delta_m
     )
+    if operator:
+        operator.phase("preposition")
     robot.preposition_and_start()
     episode = EpisodeData()
     baseline_samples = robot.sample()
@@ -170,6 +176,12 @@ def record_episode(
         side: (sample.action.joints, sample.action.gripper_width)
         for side, sample in baseline_samples.items()
     }
+    episode.recording_metadata.update(
+        start_joint_delta_rad=start_joint_delta_rad,
+        start_gripper_delta_m=start_gripper_delta_m,
+        start_baseline=[value for side in ("left", "right")
+                        for value in (*baseline[side][0], baseline[side][1])],
+    )
     recording_started = False
     discarded_idle_frames = 0
     previous_timestamp: float | None = None
@@ -193,6 +205,8 @@ def record_episode(
             ):
                 recording_started = True
                 print("\n检测到真人开始操作，正式记录 task 帧")
+                if operator:
+                    operator.update("recording")
             else:
                 discarded_idle_frames += 1
                 return False
@@ -234,12 +248,18 @@ def record_episode(
     clear_pending_input()
     print("录制中；请在 J6 预定位后开始操作，按回车停止...")
     terminal_bell()
+    if operator:
+        operator.phase("waiting_motion", accepts=("finish",))
     for scheduled_at in ticks(hz):
-        if select.select([sys.stdin], [], [], 0)[0]:
-            sys.stdin.readline()
+        should_stop = operator.stop_requested() if operator else bool(select.select([sys.stdin], [], [], 0)[0])
+        if should_stop:
+            if not operator:
+                sys.stdin.readline()
             clear_pending_input()
             break
         captured = capture(TASK_PHASE, scheduled_at)
+        if operator:
+            operator.update(frames=len(episode), discarded_idle_frames=discarded_idle_frames)
         if captured:
             print(f"\r已录制 {len(episode)} 帧", end="", flush=True)
         else:
@@ -250,6 +270,8 @@ def record_episode(
             )
 
     print("\n四台机械臂回 ZERO，四个夹爪闭合到 0 m，并继续录制...")
+    if operator:
+        operator.phase("homing_review", frames=len(episode))
     robot.home(
         on_sample=lambda: capture(HOME_PHASE, time.monotonic()), sample_hz=hz
     )
@@ -292,6 +314,7 @@ def run(
     max_task_gap_s: float = MAX_TASK_GAP_S,
     start_joint_delta_rad: float = START_JOINT_DELTA_RAD,
     start_gripper_delta_m: float = START_GRIPPER_DELTA_M,
+    operator=None,
 ) -> None:
     _validate_options(
         record_hz, max_task_gap_s, start_joint_delta_rad, start_gripper_delta_m
@@ -316,6 +339,9 @@ def run(
         start_gripper_delta_m,
     )
     with ExitStack() as resources:
+        resources.enter_context(hardware_lease())
+        if operator:
+            operator.phase("initializing")
         cameras = open_cameras(
             CAMERA_SERIALS,
             resources,
@@ -344,11 +370,14 @@ def run(
         resources.callback(robot.close)
         robot.connect()
         print("四台机械臂回 ZERO，四个夹爪闭合到 0 m...")
+        if operator:
+            operator.phase("homing")
         robot.home()
 
         instruction = ""
         while True:
-            entered = prompt_once("\n任务指令（可留空，回车沿用，:q 退出）: ")
+            prompt = "\n任务指令（可留空，回车沿用，:q 退出）: "
+            entered = operator.prompt("instruction", prompt) if operator else prompt_once(prompt)
             if entered == ":q":
                 return
             instruction = entered or instruction
@@ -361,19 +390,27 @@ def run(
                     max_task_gap_s=max_task_gap_s,
                     start_joint_delta_rad=start_joint_delta_rad,
                     start_gripper_delta_m=start_gripper_delta_m,
+                    operator=operator,
                 )
             except Exception as exc:  # noqa: BLE001 - keep the recording session alive
                 print(f"本次录制失败: {type(exc).__name__}: {exc}", file=sys.stderr)
                 print("机械臂重新回 ZERO 后继续下一条...")
+                if operator:
+                    operator.phase("homing", error=f"{type(exc).__name__}: {exc}")
                 robot.home()
+                if isinstance(exc, EOFError):
+                    raise
                 continue
 
             while True:
-                choice = prompt_once("保存本次录制？[回车/Y=保存，n=丢弃]: ").lower()
+                prompt = "保存本次录制？[回车/Y=保存，n=丢弃]: "
+                choice = (operator.prompt("review", prompt) if operator else prompt_once(prompt)).lower()
                 if choice not in ("", "y", "yes"):
                     print(f"已丢弃 {len(episode)} 帧")
                     break
                 try:
+                    if operator:
+                        operator.phase("saving", frames=len(episode))
                     path = write_episode(
                         episode,
                         instruction,
@@ -388,11 +425,14 @@ def run(
                     print(f"保存失败: {type(exc).__name__}: {exc}", file=sys.stderr)
                     continue
                 print(f"已保存: {path} ({len(episode)} 帧)")
+                if operator:
+                    operator.phase("saved", path=str(path), frames=len(episode))
                 break
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--web-control", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--output", type=Path, default=OUTPUT_DIR, help="HDF5 输出目录")
     parser.add_argument(
         "--check", action="store_true", help="只检查依赖和 pyAgxArm API，不连接硬件"
@@ -420,12 +460,17 @@ def main() -> int:
         if args.check:
             check_installation()
         else:
+            operator = None
+            if args.web_control:
+                from piper_recorder.control import WebOperator
+                operator = WebOperator()
             run(
                 args.output.expanduser().resolve(),
                 record_hz=args.hz,
                 max_task_gap_s=args.max_task_gap_s,
                 start_joint_delta_rad=args.start_joint_delta_rad,
                 start_gripper_delta_m=args.start_gripper_delta_m,
+                operator=operator,
             )
     except KeyboardInterrupt:
         print("\n已停止")

@@ -164,7 +164,7 @@ async function inspectInput(showMessage = true) {
   $("runNote").textContent = "正在读取全部 HDF5 元数据与质量指标…";
   $("stepInspect").className = "active";
   try {
-    const plan = await request("/api/inspect", {
+    const plan = await request("api/inspect", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(formPayload()),
     });
@@ -258,7 +258,7 @@ function renderStatus(state) {
 
 async function refreshStatus() {
   try {
-    const state = await request("/api/status");
+    const state = await request("api/status");
     setConnected(true);
     renderStatus(state);
   } catch (error) {
@@ -273,7 +273,7 @@ async function startConversion() {
     if (plan.warnings.length && formPayload().gap_policy === "reject") {
       throw new Error("严格模式不允许带警告的输入")
     }
-    const response = await request("/api/start", {
+    const response = await request("api/start", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(formPayload()),
     });
@@ -290,7 +290,7 @@ async function cancelConversion() {
   if (!window.confirm("确定取消当前转换？当前 episode 写入完成后会安全停止。")) return;
   $("cancelButton").disabled = true;
   try {
-    await request("/api/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    await request("api/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     $("progressMessage").textContent = "已请求取消，正在等待安全写入点…";
   } catch (error) {
     toast(error.message, true);
@@ -300,7 +300,7 @@ async function cancelConversion() {
 
 async function validateOutput(path) {
   try {
-    const result = await request("/api/validate", {
+    const result = await request("api/validate", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path }),
     });
@@ -309,7 +309,7 @@ async function validateOutput(path) {
 }
 
 async function loadDefaults() {
-  ui.defaults = await request("/api/defaults");
+  ui.defaults = await request("api/defaults");
   $("inputDir").value = ui.defaults.input_dir;
   $("outputRoot").value = ui.defaults.output_root || "";
   $("task").value = ui.defaults.task;

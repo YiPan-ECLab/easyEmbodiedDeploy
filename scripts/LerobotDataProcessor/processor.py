@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import time
 import threading
+import sys
 from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from pathlib import Path
@@ -22,6 +23,8 @@ import h5py
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from easy_embodied_deploy.statistics import statistics_close
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 AXES = [f"{side}_{axis}" for side in ("left", "right")
         for axis in ("j1", "j2", "j3", "j4", "j5", "j6", "gripper")]
@@ -348,8 +351,14 @@ def inspect_file(path: Path, settings: Settings) -> dict:
 
 def scan(settings: Settings) -> dict:
     settings = canonical_settings(settings)
-    if settings.target_fps <= 0 or settings.limit < 0:
+    if (isinstance(settings.target_fps, bool) or not isinstance(settings.target_fps, int)
+            or isinstance(settings.limit, bool) or not isinstance(settings.limit, int)
+            or settings.target_fps <= 0 or settings.limit < 0):
         raise ValueError("目标帧率必须为正整数，文件上限不能为负数")
+    if settings.source_fps is not None and (
+        isinstance(settings.source_fps, bool) or not isinstance(settings.source_fps, int) or settings.source_fps <= 0
+    ):
+        raise ValueError("源帧率必须为正整数，自动检测请留空")
     if settings.action_mode not in ACTION_MODES:
         raise ValueError(f"动作模式必须为 {' 或 '.join(ACTION_MODES)}")
     if settings.gap_policy not in GAP_POLICIES:
@@ -427,7 +436,7 @@ def _ffprobe_video(path: Path) -> dict:
     command = ["ffprobe", "-v", "error", "-select_streams", "v:0",
                "-show_entries", "stream=width,height,r_frame_rate,nb_frames",
                "-of", "json", str(path)]
-    result = subprocess.run(command, check=False, capture_output=True, text=True)
+    result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
     if result.returncode:
         raise ValueError(f"无法读取视频 {path.name}: {result.stderr.strip()}")
     payload = json.loads(result.stdout)
@@ -557,7 +566,7 @@ def validate_lerobot_bundle(bundle_root: str | Path, *, expected: dict | None = 
                 _validate_piper_range(action_values, "action")
             except ValueError as exc:
                 errors.append(str(exc))
-        if action_values.shape == (rows, 14):
+        if action_values.shape == (rows, 14) and rows and np.isfinite(action_values).all():
             metrics["max_action_joint_l2"] = float(np.max(_joint_l2(action_values)))
         statistics = {}
         for key in ("observation.state", "action"):
@@ -575,7 +584,7 @@ def validate_lerobot_bundle(bundle_root: str | Path, *, expected: dict | None = 
                     continue
                 difference = float(np.max(np.abs(stored - expected_values)))
                 maximum_error = max(maximum_error, difference)
-                if not np.allclose(stored, expected_values, rtol=2e-5, atol=2e-5):
+                if not statistics_close(stored, expected_values, name, values):
                     errors.append(f"{key}/{name} 与 parquet 全量重算不一致")
             statistics[key] = {"max_recompute_error": maximum_error}
         metrics["statistics"] = statistics
@@ -635,6 +644,7 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
             raise ProcessingCancelled("用户取消了处理")
 
     emit("checking", message="检查全部输入文件与帧率")
+    checkpoint()
     plan = prepared_plan if prepared_plan is not None else scan(settings)
     output = resolve_path(plan["output_root"])
     if output.exists():
@@ -723,6 +733,7 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
             emit("encoding", episode=index, episodes=count, file=info["name"],
                  message="编码三路视频并统计本 episode，完成后进入下一条")
             dataset.save_episode()
+            checkpoint()
         emit("finalizing", message="保存 LeRobot 元数据与官方统计量")
         dataset.finalize()
         stats = dataset.meta.stats
@@ -737,6 +748,7 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
                       "total_frames": plan["output_frames"], "episodes": plan["episodes"]},
         )
         manifest["validation"] = validation
+        checkpoint()
         if not validation["valid"]:
             raise ValueError("输出验收失败：" + "；".join(validation["errors"]))
         manifest["status"] = "complete"

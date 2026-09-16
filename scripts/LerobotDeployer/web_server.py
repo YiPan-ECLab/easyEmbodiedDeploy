@@ -23,6 +23,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from easy_embodied_deploy.http import LocalHandlerMixin, json_safe, read_json
+from easy_embodied_deploy.contracts import boolean, checkpoint_action_mode
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPT_DIR.parents[1]
@@ -75,9 +80,11 @@ def _number(
     maximum: float | None = None,
     integer: bool = False,
 ) -> int | float:
+    if isinstance(value, bool):
+        raise ConsoleError(f"{name} 必须是数字")
     try:
         numeric = float(value)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise ConsoleError(f"{name} 必须是数字") from exc
     if not (float("-inf") < numeric < float("inf")):
         raise ConsoleError(f"{name} 必须是有限数字")
@@ -120,6 +127,8 @@ def port_is_open(endpoint: str) -> bool:
 
 
 def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
+    if raw is not None and not isinstance(raw, dict):
+        raise ConsoleError("部署配置必须为对象")
     config = DEFAULT_CONFIG.copy()
     if raw:
         config.update({key: value for key, value in raw.items() if key in config})
@@ -190,7 +199,7 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         "watchdog_timeout": _number(
             config["watchdog_timeout"], "看门狗超时", minimum=5
         ),
-        "dry_run": bool(config.get("dry_run", False)),
+        "dry_run": boolean(config.get("dry_run", False), "dry_run", ConsoleError),
     }
 
     diagnostics = str(config.get("diagnostics_jsonl", "")).strip()
@@ -214,6 +223,14 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         checkpoint_config.get("rtc_training_max_delay", 0) or 0
     ) <= 0:
         raise ConsoleError("该 checkpoint 没有 trained RTC 能力，请使用 guided")
+    delay = int(checkpoint_config.get("rtc_training_max_delay", 0) or 0)
+    if rtc_mode == "trained" and (normalized["rtc_horizon"] < delay or threshold < delay
+            or (chunk_size and normalized["rtc_horizon"] > chunk_size - delay)):
+        raise ConsoleError(f"trained RTC 要求 horizon/threshold >= {delay}，且 horizon <= {chunk_size - delay}")
+    try:
+        checkpoint_action_mode(checkpoint, action_mode)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ConsoleError(str(exc)) from exc
     return normalized
 
 
@@ -305,6 +322,9 @@ class ProcessSupervisor:
         self._runtime_summary: dict[str, Any] | None = None
         self._gpu_cache: tuple[float, list[dict[str, Any]]] = (0.0, [])
         self._last_endpoint = DEFAULT_ENDPOINT
+        self._generation = 0
+        self._closed = False
+        self._stop_thread = None
 
     def log(self, source: str, message: str, level: str = "info") -> None:
         clean = ANSI_ESCAPE.sub("", message).replace("\r", "").rstrip("\n")
@@ -326,6 +346,8 @@ class ProcessSupervisor:
         self, name: str, command: list[str], env: dict[str, str]
     ) -> ManagedProcess:
         with self._lock:
+            if self._closed or self._operation == "stopping":
+                raise ConsoleError("控制台正在停止，不能启动新进程")
             existing = self._processes.get(name)
             if existing is not None and existing.running:
                 raise ConsoleError(f"{name} 已经在运行")
@@ -359,7 +381,11 @@ class ProcessSupervisor:
                 continue
             self.log(managed.name, line)
             with self._lock:
-                if managed.name == "bridge" and "hardware bridge ready:" in line:
+                if managed.state == "stopping" and "Returning followers and grippers to ZERO" not in line:
+                    continue
+                if managed.name == "bridge" and "Returning followers and grippers to ZERO" in line:
+                    managed.state = "homing"
+                elif managed.name == "bridge" and "hardware bridge ready:" in line:
                     managed.state = "ready"
                     managed.ready.set()
                 elif managed.name == "deployer":
@@ -378,6 +404,7 @@ class ProcessSupervisor:
                             self._runtime_summary = json.loads(line.split(": ", 1)[1])
                         except ValueError:
                             pass
+        managed.process.stdout.close()
         exit_code = managed.process.wait()
         with self._lock:
             managed.exit_code = exit_code
@@ -390,6 +417,13 @@ class ProcessSupervisor:
             managed.ready.set()
         level = "success" if exit_code == 0 else "error"
         self.log(managed.name, f"进程退出，状态码 {exit_code}", level)
+        # A load failure happens before the model creates its RPC client.
+        # The console still owns the bridge and must return it to ZERO.
+        if managed.name == "deployer":
+            with self._lock:
+                cleanup = self._operation != "stopping" and self._managed_running("bridge")
+            if cleanup:
+                self.stop_all()
 
     def _managed_running(self, name: str) -> bool:
         process = self._processes.get(name)
@@ -424,7 +458,7 @@ class ProcessSupervisor:
                 if not any(character.isspace() for character in argument)
             }
             matched = script_names.intersection(
-                {"LerobotDeployer.py", "hardware_bridge.py"}
+                {"LerobotDeployer.py", "OpenpiDeployer.py", "hardware_bridge.py"}
             )
             if matched:
                 matches.append(
@@ -432,7 +466,7 @@ class ProcessSupervisor:
                         "pid": pid,
                         "kind": (
                             "deployer"
-                            if "LerobotDeployer.py" in matched
+                            if matched.intersection({"LerobotDeployer.py", "OpenpiDeployer.py"})
                             else "bridge"
                         ),
                         "command": shlex.join(args),
@@ -442,6 +476,7 @@ class ProcessSupervisor:
 
     def start_bridge(self, endpoint: str) -> ManagedProcess:
         with self._lock:
+            generation = self._generation
             if self._managed_running("bridge"):
                 raise ConsoleError("硬件桥已经由此控制台启动")
         if port_is_open(endpoint):
@@ -449,9 +484,14 @@ class ProcessSupervisor:
         with self._lock:
             self._last_endpoint = endpoint
         command, env = bridge_command(endpoint)
-        return self._spawn("bridge", command, env)
+        with self._lock:
+            if generation != self._generation:
+                raise ConsoleError("启动已取消")
+            return self._spawn("bridge", command, env)
 
     def start_deployment(self, raw: dict[str, Any] | None) -> ManagedProcess:
+        with self._lock:
+            generation = self._generation
         config = normalize_config(raw)
         with self._lock:
             self._last_endpoint = config["bridge_endpoint"]
@@ -461,10 +501,16 @@ class ProcessSupervisor:
         external = [
             item
             for item in self._external_processes()
-            if "LerobotDeployer.py" in item["command"]
+            if item["kind"] == "deployer"
         ]
         if external:
             raise ConsoleError(f"检测到外部 Deployer 进程 PID {external[0]['pid']}")
+        with self._lock:
+            bridge = self._processes.get("bridge")
+            if bridge is None or not bridge.running or bridge.state != "ready":
+                raise ConsoleError("请先由此控制台启动硬件桥；不会接管外部桥")
+            if config["bridge_endpoint"] not in bridge.command:
+                raise ConsoleError("所选桥接地址与当前硬件桥不一致")
         if not port_is_open(config["bridge_endpoint"]):
             raise ConsoleError("硬件桥尚未就绪")
         command, env = deployment_command(config)
@@ -475,53 +521,103 @@ class ProcessSupervisor:
                 else None
             )
             self._runtime_summary = None
-        return self._spawn("deployer", command, env)
+        with self._lock:
+            if generation != self._generation:
+                raise ConsoleError("启动已取消")
+            return self._spawn("deployer", command, env)
 
     def start_stack(self, raw: dict[str, Any] | None) -> None:
+        with self._lock:
+            requested_generation = self._generation
         config = normalize_config(raw)
         with self._lock:
+            if requested_generation != self._generation:
+                raise ConsoleError("启动已取消")
+        with self._lock:
+            if requested_generation != self._generation:
+                raise ConsoleError("启动已取消")
             if self._orchestrator is not None and self._orchestrator.is_alive():
                 raise ConsoleError("完整启动流程正在进行")
             if self._managed_running("deployer"):
                 raise ConsoleError("模型部署已经在运行")
             if self._external_processes():
                 raise ConsoleError("检测到外部桥接或部署进程，请先停止后再由 Web 接管")
+            if self._closed or self._operation in {"starting_stack", "stopping"}:
+                raise ConsoleError("启动或停止操作正在进行")
+            generation = self._generation
             self._operation = "starting_stack"
             self._operation_error = None
 
         def orchestrate() -> None:
+            created_bridge = False
             try:
                 with self._lock:
+                    if generation != self._generation:
+                        return
                     bridge = self._processes.get("bridge")
-                if bridge is None or not bridge.running:
-                    bridge = self.start_bridge(config["bridge_endpoint"])
+                    if bridge is None or not bridge.running:
+                        bridge = self.start_bridge(config["bridge_endpoint"])
+                        created_bridge = True
+                    elif config["bridge_endpoint"] not in bridge.command:
+                        raise ConsoleError("所选桥接地址与当前硬件桥不一致")
                 if bridge.state != "ready":
                     self.log("system", "等待硬件桥完成相机初始化、回零和 J6 预置…")
-                    if not bridge.ready.wait(timeout=150):
-                        raise ConsoleError("硬件桥 150 秒内未就绪")
+                    deadline = time.monotonic() + 150
+                    while not bridge.ready.wait(timeout=0.2):
+                        with self._lock:
+                            if generation != self._generation:
+                                return
+                        if time.monotonic() >= deadline:
+                            raise ConsoleError("硬件桥 150 秒内未就绪")
                 if not bridge.running or bridge.state not in {"ready", "starting"}:
                     raise ConsoleError("硬件桥启动失败，请查看日志")
-                self.start_deployment(config)
                 with self._lock:
+                    if generation != self._generation:
+                        return
+                    self.start_deployment(config)
                     self._operation = "running"
             except Exception as exc:
                 with self._lock:
+                    if generation != self._generation:
+                        return
                     self._operation = "failed"
                     self._operation_error = str(exc)
                 self.log("system", f"完整启动失败：{exc}", "error")
+                if created_bridge:
+                    self._signal_process("bridge", timeout=90)
 
-        self._orchestrator = threading.Thread(
-            target=orchestrate, daemon=True, name="stack-orchestrator"
-        )
-        self._orchestrator.start()
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._orchestrator = threading.Thread(
+                target=orchestrate, daemon=True, name="stack-orchestrator"
+            )
+            self._orchestrator.start()
 
     def _signal_process(self, name: str, timeout: float = 12.0) -> None:
         with self._lock:
             managed = self._processes.get(name)
             if managed is None or not managed.running:
                 return
+            homing = managed.state == "homing"
             managed.state = "stopping"
             pid = managed.process.pid
+        if name == "bridge":
+            # A model normally sends RPC stop itself. Let that ongoing home
+            # finish instead of interrupting it with another SIGINT.
+            try:
+                managed.process.wait(timeout=timeout if homing else 0.5)
+                return
+            except subprocess.TimeoutExpired:
+                with self._lock:
+                    homing = homing or managed.state == "homing"
+                if homing:
+                    try:
+                        managed.process.wait(timeout=timeout)
+                        return
+                    except subprocess.TimeoutExpired:
+                        self.log("system", "硬件桥回零超时，保留进程等待检查", "error")
+                        return
         self.log("system", f"向 {name} 发送安全停止信号")
         try:
             os.killpg(pid, signal.SIGINT)
@@ -540,22 +636,26 @@ class ProcessSupervisor:
         self.log("system", f"{name} 未响应 SIGTERM，强制终止", "error")
         try:
             os.killpg(pid, signal.SIGKILL)
+            managed.process.wait(timeout=5)
         except ProcessLookupError:
             pass
 
     def stop_all(self, *, asynchronous: bool = True) -> None:
-        def stop() -> None:
-            with self._lock:
-                self._operation = "stopping"
-            self._signal_process("deployer")
-            self._signal_process("bridge")
-            with self._lock:
-                self._operation = "idle"
-
-        if asynchronous:
-            threading.Thread(target=stop, daemon=True, name="safe-stop").start()
-        else:
-            stop()
+        with self._lock:
+            self._generation += 1
+            self._operation = "stopping"
+            previous = self._stop_thread
+            if previous is None or not previous.is_alive():
+                def stop() -> None:
+                    self._signal_process("deployer", timeout=90)
+                    self._signal_process("bridge", timeout=90)
+                    with self._lock:
+                        self._operation = "idle"
+                previous = threading.Thread(target=stop, daemon=True, name="safe-stop")
+                self._stop_thread = previous
+                previous.start()
+        if not asynchronous:
+            previous.join()
 
     def clear_logs(self) -> None:
         with self._lock:
@@ -736,14 +836,14 @@ class ConsoleHTTPServer(ThreadingHTTPServer):
         self.supervisor = supervisor
 
 
-class ConsoleHandler(BaseHTTPRequestHandler):
+class ConsoleHandler(LocalHandlerMixin, BaseHTTPRequestHandler):
     server: ConsoleHTTPServer
 
     def log_message(self, _format: str, *_args: Any) -> None:
         return
 
     def _json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
-        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        encoded = json.dumps(json_safe(payload), ensure_ascii=False, allow_nan=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
@@ -752,21 +852,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def _body(self) -> dict[str, Any]:
-        try:
-            size = int(self.headers.get("Content-Length", "0"))
-        except ValueError as exc:
-            raise ConsoleError("Content-Length 无效") from exc
-        if size > 1_000_000:
-            raise ConsoleError("请求体过大")
-        if size == 0:
-            return {}
-        try:
-            body = json.loads(self.rfile.read(size).decode("utf-8"))
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise ConsoleError("请求 JSON 无效") from exc
-        if not isinstance(body, dict):
-            raise ConsoleError("请求体必须是 JSON 对象")
-        return body
+        return read_json(self, ConsoleError)
 
     def _static(self, path: str) -> None:
         routes = {
@@ -876,15 +962,15 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
-    if not 1 <= args.port <= 65535:
-        parser.error("--port must be in [1, 65535]")
+    if not 0 <= args.port <= 65535:
+        parser.error("--port must be in [0, 65535]")
     for required in (PIPER_PYTHON, LEROBOT_PYTHON, BRIDGE_SCRIPT, DEPLOYER_SCRIPT):
         if not required.exists():
             parser.error(f"required path is missing: {required}")
     supervisor = ProcessSupervisor()
     server = ConsoleHTTPServer((args.host, args.port), supervisor)
     shown_host = "127.0.0.1" if args.host == "0.0.0.0" else args.host
-    print(f"LerobotDeployer Web: http://{shown_host}:{args.port}", flush=True)
+    print(f"LerobotDeployer Web: http://{shown_host}:{server.server_address[1]}", flush=True)
     print("Ctrl-C 会安全停止由本页面启动的 Deployer 和硬件桥。", flush=True)
     try:
         server.serve_forever(poll_interval=0.25)
@@ -892,6 +978,7 @@ def main() -> None:
         print("\n正在关闭 Web 控制台…", flush=True)
     finally:
         server.server_close()
+        supervisor._closed = True
         supervisor.stop_all(asynchronous=False)
 
 

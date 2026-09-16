@@ -36,3 +36,8 @@ Deployer 会先在未连接硬件时编译普通采样和所选 RTC 采样图，
 ```bash
 thirdParty/.venvs/openpi-jax/bin/python -m unittest discover -s scripts/OpenpiDeployer/tests -v
 ```
+
+统一入口为 `python3 workbench.py` → “OpenPI 部署”。高级参数中的“离线验证数据集”
+对应 CLI `--offline-dataset-root`，填写后启动流程跳过硬件桥；留空则使用原真机流程。
+`Dry run` 对应 `--dry-run`：推理与目标检查照常进行，但不发送模型动作；使用真机输入时
+硬件桥仍执行原回零和预定位。页面不会接管其他控制台或外部命令启动的硬件桥。

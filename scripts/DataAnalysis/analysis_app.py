@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import contextlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -20,6 +21,9 @@ from urllib.parse import urlparse
 
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from easy_embodied_deploy.http import LocalHandlerMixin, read_json
+
 ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = ROOT.parents[1]
 STATIC_ROOT = ROOT / "static"
@@ -28,6 +32,7 @@ DEFAULT_LEROBOT_ROOT = PROJECT_ROOT / "datasets/lerobot"
 LOCK = threading.Lock()
 CANCEL = threading.Event()
 PROCESS: subprocess.Popen | None = None
+WORKER: threading.Thread | None = None
 DELETE_LOCK = threading.Lock()
 STATE = {
     "job_id": 0,
@@ -73,6 +78,7 @@ def add_event(job_id: int, message: str) -> None:
 
 
 def start_analysis(payload: dict) -> int:
+    global WORKER
     kind = str(payload.get("kind") or "")
     target = str(payload.get("path") or "").strip()
     if kind not in ("hdf5", "lerobot"):
@@ -84,6 +90,11 @@ def start_analysis(payload: dict) -> int:
         target_path = PROJECT_ROOT / target_path
     if not target_path.exists():
         raise FileNotFoundError(target_path.resolve())
+    if kind == "hdf5":
+        for key, default, minimum in (("expected_fps", 30, 0), ("gap_factor", 1.5, 1)):
+            value = float(payload.get(key, default))
+            if not math.isfinite(value) or value <= minimum:
+                raise ValueError(f"{key} 必须是大于 {minimum} 的有限数值")
     with LOCK:
         if STATE["status"] in ("running", "deleting"):
             raise RuntimeError("已有分析任务正在运行")
@@ -175,7 +186,8 @@ def start_analysis(payload: dict) -> int:
             report_path.unlink(missing_ok=True)
             log_path.unlink(missing_ok=True)
 
-    threading.Thread(target=worker, name=f"data-analysis-{job_id}", daemon=True).start()
+    WORKER = threading.Thread(target=worker, name=f"data-analysis-{job_id}", daemon=True)
+    WORKER.start()
     return job_id
 
 
@@ -262,6 +274,7 @@ def delete_error_episodes(payload: dict) -> dict:
         if STATE["status"] in ("running", "deleting"):
             raise RuntimeError("分析任务正在运行，请完成后再删除")
         report = copy.deepcopy(STATE.get("report"))
+        report_job_id = STATE["job_id"]
         report_path = _resolved_path(report.get("bundle", "")) if report else None
     if not report or report_path != bundle:
         raise RuntimeError("请先对当前 LeRobot 路径完成一次分析")
@@ -272,22 +285,26 @@ def delete_error_episodes(payload: dict) -> dict:
 
     with DELETE_LOCK:
         with LOCK:
-            if STATE["status"] in ("running", "deleting"):
+            if STATE["status"] in ("running", "deleting") or STATE["job_id"] != report_job_id:
                 raise RuntimeError("分析任务正在运行，请完成后再删除")
             STATE.update(status="deleting", error=None, events=[{
                 "time": time.time(), "message": f"准备删除 {len(requested)} 个物理间隔异常 episode"
             }])
 
         # LeRobotDatasetMetadata.create requires a non-existent destination.
-        temp_dir = Path(tempfile.mkdtemp(prefix=f".{root.name}.delete-", dir=root.parent))
-        temp_dir.rmdir()
-        backup = root.with_name(f".{root.name}.before-delete-{os.getpid()}-{int(time.time())}")
+        temp_dir = None
+        backup = root.with_name(f".{root.name}.before-delete-{os.getpid()}-{time.time_ns()}")
         manifest_path = bundle / "processing.json"
-        original_manifest = manifest_path.read_bytes() if manifest_path.is_file() else None
+        original_manifest = None
         try:
+            original_manifest = manifest_path.read_bytes() if manifest_path.is_file() else None
+            temp_dir = Path(tempfile.mkdtemp(prefix=f".{root.name}.delete-", dir=root.parent))
+            temp_dir.rmdir()
             from lerobot.datasets import LeRobotDataset, delete_episodes
 
             info = json.loads((root / "meta/info.json").read_text(encoding="utf-8"))
+            if len(requested) >= int(info["total_episodes"]):
+                raise ValueError("不能删除全部 episode；请保留至少一条有效数据")
             repo_id = str(info.get("repo_id") or f"local/{root.name}")
             dataset = LeRobotDataset(repo_id=repo_id, root=root, download_videos=False)
             delete_episodes(dataset, sorted(requested), output_dir=temp_dir, repo_id=repo_id)
@@ -306,17 +323,22 @@ def delete_error_episodes(payload: dict) -> dict:
                 raise ValueError("删除后数据集验收失败：" + "；".join(validation["errors"]))
 
             root.rename(backup)
+            if original_manifest is not None and bundle != root:
+                (backup / "processing.json").write_bytes(original_manifest)
             temp_dir.rename(root)
+            if original_manifest is not None:
+                manifest_path.write_bytes(original_manifest)
             _update_processing_manifest(bundle, requested)
-            shutil.rmtree(backup)
+            # Retain the complete original. Deleting it here makes rollback
+            # destructive if rmtree only partially succeeds (disk/IO failure).
             result = {"deleted": sorted(requested), "remaining": int(info["total_episodes"]) - len(requested),
-                      "path": str(bundle)}
+                      "path": str(bundle), "backup": str(backup)}
             with LOCK:
                 STATE.update(status="idle", report=None, error=None, finished_at=time.time(),
-                             events=[{"time": time.time(), "message": "删除完成，请重新分析确认"}])
+                             events=[{"time": time.time(), "message": f"删除完成，原始备份保留在 {backup}；请重新分析确认"}])
             return result
         except Exception:
-            if temp_dir.exists():
+            if temp_dir is not None and temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
             if backup.exists():
                 if root.exists():
@@ -329,7 +351,7 @@ def delete_error_episodes(payload: dict) -> dict:
             raise
 
 
-class Handler(BaseHTTPRequestHandler):
+class Handler(LocalHandlerMixin, BaseHTTPRequestHandler):
     server_version = "DataAnalysis/1.0"
 
     def send(self, payload, status=HTTPStatus.OK, content_type="application/json; charset=utf-8") -> None:
@@ -348,13 +370,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def json_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
-        if length <= 0 or length > 1_000_000:
-            raise ValueError("请求体为空或过大")
-        value = json.loads(self.rfile.read(length))
-        if not isinstance(value, dict):
-            raise ValueError("请求体必须为 JSON 对象")
-        return value
+        return read_json(self)
 
     def do_GET(self) -> None:  # noqa: N802
         route = urlparse(self.path).path
@@ -416,9 +432,12 @@ def run_server(host: str, port: int) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        CANCEL.set()
         with LOCK:
             process = PROCESS
         if process and process.poll() is None:
             process.terminate()
+        if WORKER:
+            WORKER.join(timeout=10)
         server.server_close()
         print("DataAnalysis stopped")

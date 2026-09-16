@@ -1,6 +1,7 @@
 """Dual leader-follower Piper control through pyAgxArm."""
 
 import math
+import re
 import subprocess
 import threading
 import time
@@ -64,17 +65,25 @@ def verify_can_interface(name: str) -> None:
     flags = first_line.split("<", 1)[-1].split(">", 1)[0].split(",")
     if result.returncode or "UP" not in flags or "bitrate 1000000" not in result.stdout:
         raise RuntimeError(f"{name} 不是 UP / 1 Mbps")
-    print(f"  {name}: UP / 1 Mbps")
+    state = re.search(r"\bcan state ([A-Z-]+)", result.stdout)
+    if state is None or state.group(1) != "ERROR-ACTIVE":
+        raise RuntimeError(f"{name} CAN 总线异常: {state.group(1) if state else 'UNKNOWN'}；请检查接线、终端电阻和设备供电")
+    print(f"  {name}: UP / 1 Mbps / ERROR-ACTIVE")
 
 
 def _message_values(message, length: int, name: str) -> tuple[float, ...]:
     if message is None or len(message.msg) != length:
         raise RuntimeError(f"缺少有效的{name}反馈")
-    return tuple(float(value) for value in message.msg)
+    values = tuple(float(value) for value in message.msg)
+    if not all(math.isfinite(value) for value in values):
+        raise RuntimeError(f"{name}反馈含 NaN/Inf")
+    return values
 
 
 def _normalize_gripper_width(value: float, maximum: float, name: str) -> float:
     value = float(value)
+    if not math.isfinite(value):
+        raise RuntimeError(f"{name}夹爪反馈含 NaN/Inf")
     return min(maximum, max(GRIPPER_LIMITS_M[0], value))
 
 
@@ -214,18 +223,26 @@ class PiperPair:
 
         deadline = time.monotonic() + timeout
         settled = 0
+        positions = {}
         for now in ticks(hz):
             ready = True
             for name, arm in arms.items():
                 arm.move_j(list(target))
                 self._check_status(arm, name)
                 actual = _message_values(arm.get_joint_angles(), 6, f"{name} 关节")
+                positions[name] = actual
                 ready &= max(abs(a - b) for a, b in zip(actual, target)) <= tolerance
             settled = settled + 1 if ready else 0
             if settled >= 3:
                 return
             if now >= deadline:
-                raise RuntimeError(f"{', '.join(arms)} 运动到目标超时")
+                actual_degrees = {name: [round(math.degrees(v), 2) for v in values]
+                                  for name, values in positions.items()}
+                target_degrees = [round(math.degrees(v), 2) for v in target]
+                raise RuntimeError(
+                    f"{', '.join(arms)} 运动到目标超时；实际角度(deg)={actual_degrees}，"
+                    f"目标(deg)={target_degrees}"
+                )
 
     def _follower_width(self) -> float:
         status = self.follower_gripper.get_gripper_status()
@@ -240,6 +257,7 @@ class PiperPair:
     def _enter_leader_control_mode(self, timeout: float = 5.0):
         previous = self.leader.get_joint_angles()
         previous_timestamp = 0.0 if previous is None else previous.timestamp
+        fresh_samples = 0
         self._leader_is_follower = True
         deadline = time.monotonic() + timeout
         for now in ticks(20):
@@ -248,7 +266,14 @@ class PiperPair:
             self.leader.set_follower_mode()
             joints = self.leader.get_joint_angles()
             if joints is not None and joints.timestamp > previous_timestamp:
-                return joints
+                previous_timestamp = joints.timestamp
+                fresh_samples += 1
+                # A single frame can still be queued from the preceding mode.
+                # Require fresh feedback across three repeated mode requests.
+                if fresh_samples >= 3:
+                    return joints
+            else:
+                fresh_samples = 0
             if now >= deadline:
                 raise RuntimeError(
                     f"{self.leader_name} 切换 follower 后没有关节反馈"
@@ -363,6 +388,9 @@ class PiperPair:
 
     @staticmethod
     def _clamp_joints(values) -> tuple[float, ...]:
+        values = tuple(float(value) for value in values)
+        if len(values) != 6 or not all(math.isfinite(value) for value in values):
+            raise RuntimeError("关节目标必须是有限的六维数值")
         return tuple(
             min(high, max(low, float(value)))
             for value, (low, high) in zip(values, JOINT_LIMITS_RAD)
@@ -512,7 +540,8 @@ class PiperPair:
                 arm.set_speed_percent(self.home_speed)
                 self._wait_enabled(arm, name)
             try:
-                start_barrier.wait(timeout=5.0)
+                # A peer can spend 5 s switching modes and 5 s enabling each arm.
+                start_barrier.wait(timeout=16.0)
             except threading.BrokenBarrierError as exc:
                 raise RuntimeError("左右两组机械臂回零启动同步失败") from exc
 
@@ -573,6 +602,9 @@ class PiperPair:
                 )
                 for future in futures:
                     future.result()
+        except BaseException:
+            start_barrier.abort()
+            raise
         finally:
             self._restore_teaching()
         print(f"{self.side}: 主从臂和两个夹爪回零完成")
@@ -616,8 +648,14 @@ class DualPiper:
     def _run_parallel(self, operation: Callable[[PiperPair], None]) -> None:
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(operation, pair) for pair in self.pairs.values()]
+            errors = []
             for future in futures:
-                future.result()
+                try:
+                    future.result()
+                except Exception as exc:
+                    errors.append(str(exc))
+            if errors:
+                raise RuntimeError("；".join(errors))
 
     def connect(self) -> None:
         print("四臂 CAN 接口预检...")
@@ -653,8 +691,14 @@ class DualPiper:
                     on_sample()
                     if all(future.done() for future in futures):
                         break
+            errors = []
             for future in futures:
-                future.result()
+                try:
+                    future.result()
+                except Exception as exc:
+                    errors.append(str(exc))
+            if errors:
+                raise RuntimeError("；".join(errors))
 
     def close(self) -> None:
         error = None

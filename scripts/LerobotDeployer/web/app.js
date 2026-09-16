@@ -19,7 +19,7 @@ const fieldIds = [
   "inference_mode", "rtc_mode", "rtc_horizon", "rtc_queue_threshold",
   "policy_hz", "control_hz", "smoothing_time_constant", "bridge_endpoint",
   "max_steps", "seed", "rpc_timeout", "watchdog_timeout",
-  "diagnostics_jsonl",
+  "diagnostics_jsonl", "dry_run",
 ];
 
 const numericFields = new Set([
@@ -35,13 +35,13 @@ function formatNumber(value, digits = 1) {
 
 function processStateLabel(state) {
   return {
-    stopped: "未启动",
     starting: "启动中",
     ready: "已就绪",
     loading: "加载模型",
     prefilling: "RTC 预填充",
     running: "执行中",
     stopping: "正在停止",
+    homing: "正在回零",
     stopped: "已停止",
     completed: "已完成",
     failed: "运行失败",
@@ -113,7 +113,7 @@ function populateDevices(gpus, preferredDevice = null) {
 
 function applyConfig(config) {
   for (const id of fieldIds) {
-    if (config[id] !== undefined && $(`#${id}`)) $(`#${id}`).value = config[id];
+    if (config[id] !== undefined && $(`#${id}`)) { if (id === "dry_run") $(`#${id}`).checked = config[id]; else $(`#${id}`).value = config[id]; }
   }
   updateFormState();
   schedulePreview();
@@ -123,6 +123,7 @@ function collectConfig() {
   const config = {};
   for (const id of fieldIds) {
     const input = $(`#${id}`);
+    if (id === "dry_run") { config[id] = input.checked; continue; }
     config[id] = numericFields.has(id) ? Number(input.value) : input.value.trim();
   }
   return config;
@@ -130,6 +131,7 @@ function collectConfig() {
 
 function updateFormState() {
   const rtc = $("#inference_mode").value === "rtc";
+  if (!rtc) $("#rtc_mode").value = "guided";
   for (const field of $$(".rtc-field")) {
     field.classList.toggle("disabled", !rtc);
     for (const input of field.querySelectorAll("input, select")) input.disabled = !rtc;
@@ -159,7 +161,7 @@ function schedulePreview() {
 
 async function updatePreview() {
   try {
-    const payload = await request("/api/preview", {
+    const payload = await request("api/preview", {
       method: "POST",
       body: JSON.stringify({ config: collectConfig() }),
     });
@@ -265,9 +267,9 @@ function renderStatus(status) {
 
   const ownRunning = status.bridge.running || status.deployer.running;
   const externalRunning = Boolean((status.external_processes || []).length || externalBridge);
-  $("#startStackButton").disabled = ownRunning || externalRunning || status.operation === "starting_stack";
-  $("#startBridgeButton").disabled = status.bridge.running || externalBridge;
-  $("#startModelButton").disabled = status.deployer.running || !status.bridge_port_open || Boolean(externalDeployer);
+  $("#startStackButton").disabled = ownRunning || externalRunning || ["starting_stack", "stopping"].includes(status.operation);
+  $("#startBridgeButton").disabled = status.operation === "stopping" || status.bridge.running || externalBridge;
+  $("#startModelButton").disabled = status.deployer.running || !bridgeActive || Boolean(externalDeployer) || status.operation === "stopping";
   $("#stopButton").disabled = !ownRunning;
   $("#globalStopButton").disabled = !ownRunning;
 
@@ -365,27 +367,31 @@ function appendLogs(entries) {
 }
 
 async function pollStatus() {
+  if (app.pollStatusBusy) return;
+  app.pollStatusBusy = true;
   try {
-    const status = await request("/api/status");
+    const status = await request("api/status");
     renderStatus(status);
   } catch (error) {
     setConnection(false, "控制台连接中断");
-  }
+  } finally { app.pollStatusBusy = false; }
 }
 
 async function pollLogs() {
+  if (app.pollLogsBusy) return;
+  app.pollLogsBusy = true;
   try {
-    const payload = await request(`/api/logs?after=${app.lastLogId}`);
+    const payload = await request(`api/logs?after=${app.lastLogId}`);
     appendLogs(payload.entries || []);
     app.lastLogId = payload.latest_id ?? app.lastLogId;
-  } catch (_) { /* status poll owns connection indicator */ }
+  } catch (_) { /* status poll owns connection indicator */ } finally { app.pollLogsBusy = false; }
 }
 
 async function runAction(path, successMessage) {
   const buttons = [$("#startStackButton"), $("#startBridgeButton"), $("#startModelButton")];
   buttons.forEach((button) => { button.disabled = true; });
   try {
-    const body = path === "/api/bridge/start"
+    const body = path === "api/bridge/start"
       ? { endpoint: $("#bridge_endpoint").value.trim() }
       : { config: collectConfig() };
     await request(path, { method: "POST", body: JSON.stringify(body) });
@@ -400,7 +406,7 @@ async function safeStop() {
   $("#stopButton").disabled = true;
   $("#globalStopButton").disabled = true;
   try {
-    await request("/api/stop", { method: "POST", body: "{}" });
+    await request("api/stop", { method: "POST", body: "{}" });
     toast("已发送安全停止，正在等待机械臂回零");
     await pollStatus();
   } catch (error) {
@@ -410,7 +416,7 @@ async function safeStop() {
 
 async function bootstrap() {
   try {
-    const payload = await request("/api/bootstrap");
+    const payload = await request("api/bootstrap");
     // Continuous execution is the only Web-console preset. Keep this
     // explicit so a long-running server process with an older in-memory
     // default cannot restore a bounded run after a page refresh.
@@ -432,9 +438,9 @@ function bindEvents() {
     updateFormState();
     schedulePreview();
   });
-  $("#startStackButton").addEventListener("click", () => runAction("/api/stack/start", "完整启动流程已开始"));
-  $("#startBridgeButton").addEventListener("click", () => runAction("/api/bridge/start", "硬件桥正在启动"));
-  $("#startModelButton").addEventListener("click", () => runAction("/api/deployment/start", "模型端正在启动"));
+  $("#startStackButton").addEventListener("click", () => runAction("api/stack/start", "完整启动流程已开始"));
+  $("#startBridgeButton").addEventListener("click", () => runAction("api/bridge/start", "硬件桥正在启动"));
+  $("#startModelButton").addEventListener("click", () => runAction("api/deployment/start", "模型端正在启动"));
   $("#stopButton").addEventListener("click", safeStop);
   $("#globalStopButton").addEventListener("click", safeStop);
   $("#refreshButton").addEventListener("click", async () => {
@@ -443,7 +449,7 @@ function bindEvents() {
   });
   $("#clearLogsButton").addEventListener("click", async () => {
     try {
-      await request("/api/logs/clear", { method: "POST", body: "{}" });
+      await request("api/logs/clear", { method: "POST", body: "{}" });
       $("#terminal").replaceChildren();
       app.lastLogId = 0;
       toast("日志已清空");

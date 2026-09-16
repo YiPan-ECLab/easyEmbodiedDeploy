@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="color-scheme" content="dark">
     <title>Piper · OpenPI JAX Control Deck</title>
-    <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="styles.css">
   </head>
   <body>
     <div class="ambient ambient-a"></div>
@@ -220,6 +220,7 @@
                   <span>看门狗超时</span>
                   <div class="number-control"><input id="watchdog_timeout" name="watchdog_timeout" type="number" min="5" step="1"><i>s</i></div>
                 </label>
+                <label class="field wide"><span>离线验证数据集（可选）</span><input id="offline_dataset_root" name="offline_dataset_root" placeholder="留空使用真机；填写路径则不连接硬件"><small>使用本地 LeRobot 数据验证模型推理；无需硬件桥。</small></label>
                 <label class="field wide">
                   <span>诊断 JSONL</span>
                   <input id="diagnostics_jsonl" name="diagnostics_jsonl" spellcheck="false">
@@ -336,6 +337,6 @@
     </main>
 
     <div class="toast-stack" id="toastStack" aria-live="assertive"></div>
-    <script src="/app.js"></script>
+    <script src="app.js"></script>
   </body>
 </html>

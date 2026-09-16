@@ -106,7 +106,8 @@ def _validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) ->
         parser.error("--n-action-steps must be in [0, 50]")
     if args.rtc_max_guidance_weight < 0 or not np.isfinite(args.rtc_max_guidance_weight):
         parser.error("--rtc-max-guidance-weight must be finite and nonnegative")
-    if args.rpc_timeout <= 0 or args.watchdog_timeout < 5:
+    if (not np.isfinite(args.rpc_timeout) or not np.isfinite(args.watchdog_timeout)
+            or args.rpc_timeout <= 0 or args.watchdog_timeout < 5):
         parser.error("RPC timeout must be positive and watchdog timeout at least 5 seconds")
     match = re.fullmatch(r"cuda(?::(\d+))?", args.device)
     if args.device != "cpu" and match is None:
@@ -398,7 +399,7 @@ def main() -> int:
                 target=target,
                 limited=limited,
             )
-            deadline += 1.0 / args.policy_hz
+            deadline = max(deadline + 1.0 / args.policy_hz, time.perf_counter())
             time.sleep(max(0.0, deadline - time.perf_counter()))
     except KeyboardInterrupt:
         print("Interrupted; stopping policy and returning Piper followers to zero...", flush=True)

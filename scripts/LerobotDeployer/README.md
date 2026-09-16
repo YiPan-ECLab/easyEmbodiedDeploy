@@ -189,3 +189,8 @@ scripts/LerobotDeployer/LerobotDeployer.py --help
 桥直接读取 pyAgxArm 的 Piper 关节限位，单位为 rad：J1 `[-2.617994, 2.617994]`、J2 `[0, 3.141593]`、J3 `[-2.967060, 0]`、J4 `[-1.745330, 1.745330]`、J5 `[-1.221730, 1.221730]`、J6 `[-2.094396, 2.094396]`。左右夹爪目标均限制在 `[0, 0.1] m`。
 
 按 Ctrl-C 后，推理端停止 inference engine，读取并打印 RTC 和真实 `move_js` 诊断，通知硬件桥停止控制，然后让两个 follower 的关节和夹爪回 ZERO。
+
+统一入口为 `python3 workbench.py` → “LeRobot 部署”。高级参数增加 `Dry run`，
+对应 CLI `--dry-run`，只验证推理与目标，不发送模型动作；硬件连接、回零和预定位仍正常执行。
+若 checkpoint 包含 `training_manifest.json`，部署前会核对动作模式；无清单的旧模型保留原手动选择方式。
+页面只管理本控制台启动的硬件桥，不会接管外部桥。

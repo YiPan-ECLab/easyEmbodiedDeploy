@@ -11,11 +11,15 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 import cv2
 import h5py
 import numpy as np
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
+from easy_embodied_deploy.http import LocalHandlerMixin
 
 
 STATIC_ROOT = Path(__file__).resolve().parent.parent / "static"
@@ -27,7 +31,7 @@ def _plain(value: Any) -> Any:
     if isinstance(value, (bytes, np.bytes_)):
         return value.decode("utf-8", errors="replace")
     if isinstance(value, np.generic):
-        return value.item()
+        return _plain(value.item())
     if isinstance(value, np.ndarray):
         return [_plain(item) for item in value.tolist()]
     if isinstance(value, (list, tuple)):
@@ -44,7 +48,7 @@ def _attrs(obj: h5py.Group | h5py.Dataset | h5py.File) -> dict[str, Any]:
 
 
 def _safe_hdf5_path(raw: str) -> Path:
-    path = Path(unquote(raw)).expanduser().resolve()
+    path = Path(raw).expanduser().resolve()
     if path.suffix.lower() not in HDF5_SUFFIXES:
         raise ValueError("只支持 .hdf5 和 .h5 文件")
     if not path.is_file():
@@ -355,7 +359,7 @@ def read_frame(path: Path, demo_name: str | None, camera: str, index: int) -> by
         return value
 
 
-class ViewerHandler(BaseHTTPRequestHandler):
+class ViewerHandler(LocalHandlerMixin, BaseHTTPRequestHandler):
     server_version = "PiperViewer/1.0"
 
     @property
@@ -448,7 +452,7 @@ class ViewerServer(ThreadingHTTPServer):
 
 def run_server(host: str, port: int, directory: Path) -> int:
     server = ViewerServer((host, port), directory)
-    print(f"Piper HDF5 Viewer: http://{host}:{port}")
+    print(f"Piper HDF5 Viewer: http://{host}:{server.server_address[1]}")
     print(f"初始目录: {server.default_directory}")
     print("按 Ctrl+C 停止")
     try:

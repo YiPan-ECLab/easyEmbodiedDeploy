@@ -1,0 +1,21 @@
+name: Local console checks
+on: [push, pull_request]
+jobs:
+  cpu-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Compile project Python
+        run: python -m compileall -q src scripts tests workbench.py
+      - name: Test HTTP, resource ownership and process cancellation
+        run: python -m unittest discover -s tests -p test_runtime_boundaries.py -v
+      - name: Parse browser scripts and launch scripts
+        run: |
+          while IFS= read -r -d '' script; do node --check "$script"; done < <(find web scripts -name '*.js' -not -path '*/vendor/*' -print0)
+          for script in scripts/*/setup.sh thirdParty/setup_envs.sh thirdParty/setup_openpi_env.sh; do bash -n "$script"; done

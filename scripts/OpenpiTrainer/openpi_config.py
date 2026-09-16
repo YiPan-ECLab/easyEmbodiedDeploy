@@ -163,7 +163,10 @@ def write_norm_stats(dataset_root: str | Path, output_parent: str | Path, repo_i
             q99 = np.asarray(raw["q99"], dtype=np.float32)
         selected[target] = normalize.NormStats(mean=mean, std=std, q01=q01, q99=q99)
     identifier = asset_id(repo_id, mode)
-    parent = Path(output_parent).resolve() / ".openpi_assets"
+    # Separate concurrent runs whose datasets share a repo_id. Checkpoints
+    # still use the portable identifier; only the source cache is content addressed.
+    digest = hashlib.sha256(json.dumps(source, sort_keys=True).encode()).hexdigest()[:20]
+    parent = Path(output_parent).resolve() / ".openpi_assets" / digest
     normalize.save(parent / identifier, selected)
     return parent, identifier
 

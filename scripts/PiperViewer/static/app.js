@@ -31,7 +31,7 @@ const state = {
 };
 
 async function api(path, params = {}) {
-  const url = new URL(path, window.location.origin);
+  const url = new URL(path, window.location.href);
   Object.entries(params).forEach(([key, value]) => {
     if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, value);
   });
@@ -93,7 +93,7 @@ async function scanDirectory(directory) {
   setScanStatus("正在扫描...");
   $("#file-list").innerHTML = '<div class="list-message">正在读取 HDF5 文件...</div>';
   try {
-    const result = await api("/api/files", { directory });
+    const result = await api("api/files", { directory });
     state.files = result.files;
     $("#directory-input").value = result.directory;
     localStorage.setItem("piperViewerDirectory", result.directory);
@@ -147,7 +147,7 @@ async function selectFile(path, demo = null) {
   $("#empty-state p").textContent = path;
   $("#episode-view").classList.add("hidden");
   try {
-    const episode = await api("/api/episode", { path, demo });
+    const episode = await api("api/episode", { path, demo });
     if (token !== state.loadToken) return;
     state.episode = episode;
     state.curveSource = "actions";
@@ -215,7 +215,7 @@ function renderCameras() {
 
 function frameImageUrl(camera, frame) {
   const params = new URLSearchParams({ path: state.episode.path, demo: state.episode.demo, camera: camera.name, index: frame });
-  return `/api/frame?${params}`;
+  return `api/frame?${params}`;
 }
 
 function frameTime(index) {
@@ -566,7 +566,7 @@ async function init() {
   icons();
   bindEvents();
   try {
-    const config = await api("/api/config");
+    const config = await api("api/config");
     const directory = localStorage.getItem("piperViewerDirectory") || config.default_directory;
     $("#directory-input").value = directory;
     await scanDirectory(directory);
