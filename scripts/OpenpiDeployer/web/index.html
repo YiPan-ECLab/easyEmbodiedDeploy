@@ -223,7 +223,7 @@
                 <label class="field wide"><span>离线验证数据集（可选）</span><input id="offline_dataset_root" name="offline_dataset_root" placeholder="留空使用真机；填写路径则不连接硬件"><small>使用本地 LeRobot 数据验证模型推理；无需硬件桥。</small></label>
                 <label class="field wide">
                   <span>诊断 JSONL</span>
-                  <input id="diagnostics_jsonl" name="diagnostics_jsonl" spellcheck="false">
+                  <input id="diagnostics_jsonl" name="diagnostics_jsonl" spellcheck="false" placeholder="留空自动保存每次运行到 outputs/openpi_deployer/">
                 </label>
                 <label class="field"><span>RTC 屏蔽夹爪</span><input id="rtc_mask_grippers" name="rtc_mask_grippers" type="checkbox" checked></label>
                 <label class="field"><span>启动前 JIT Warmup</span><input id="warmup" name="warmup" type="checkbox" checked></label>
@@ -298,7 +298,7 @@
             <span>最低 <strong id="queueMinimum">—</strong></span>
             <span>限位 <strong id="clippedTicks">0</strong></span>
           </div>
-          <p class="chart-help">当前：最近 tick 取动作后的剩余步数；最低：本次诊断窗口的最小队列；限位：目标被硬件关节/夹爪范围截断的 tick 数。</p>
+          <p class="chart-help">当前：最近 tick 取动作后的剩余步数；最低：本次运行的最小队列；限位：目标被硬件关节/夹爪范围截断的 tick 数。</p>
         </article>
 
         <article class="panel chart-panel">
@@ -311,11 +311,12 @@
             <p class="chart-empty" id="latencyEmpty">等待控制循环数据</p>
           </div>
           <div class="chart-stats">
-            <span>推理中位数 <strong id="inferenceMedian">—</strong></span>
+            <span>推理中位数 <strong id="inferenceMedian">—</strong><small id="inferenceMeta">等待模型推理</small></span>
             <span>运行饿死 <strong id="starvedTicks">—</strong><small id="starvedMeta">预填充 — · 总计 —</small></span>
             <span>实测控制 <strong id="achievedHz">—</strong></span>
           </div>
-          <p class="chart-help">推理中位数：每个 chunk 的模型推理耗时；运行饿死：启动预填充完成后没有可执行动作的 tick（预填充单独列出）；实测控制：桥接 move_js 实际发送频率。</p>
+          <p class="chart-help">推理中位数：最近最多 1000 个 chunk 的模型推理耗时，排除 warmup；运行饿死：启动预填充完成后没有可执行动作的累计 tick；实测控制：桥接 move_js 实际发送频率，随观测更新。离线部署无此频率。</p>
+          <p class="chart-help" id="diagnosticsPath">启动部署后自动创建本次运行记录</p>
         </article>
       </section>
 

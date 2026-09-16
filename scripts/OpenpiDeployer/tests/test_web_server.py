@@ -138,6 +138,70 @@ class WebConsoleConfigurationTest(unittest.TestCase):
         self.assertEqual(diagnostics["runtime_starved_ticks"], 1)
         self.assertEqual(diagnostics["starved_ticks"], 2)
 
+    def test_live_cumulative_metrics_survive_tail_window_without_final_summary(self) -> None:
+        from OpenpiDeployer import Diagnostics
+        import numpy as np
+
+        path = self.root / "live.jsonl"
+        writer = Diagnostics(path)
+        writer.record(action=None, queue_size=0, tick_s=.01)
+        writer.record(action=np.zeros(14), queue_size=5, tick_s=.01)
+        writer.record(action=None, queue_size=0, tick_s=.01)
+        for _ in range(300):
+            writer.record(action=np.zeros(14), queue_size=3, tick_s=.01,
+                          inference={"inference_chunks": 7, "inference_latency_s_median": .023,
+                                     "inference_latency_s_last": .025, "inference_latency_s_max": .04},
+                          move_js={"achieved_control_hz": 29.8})
+        supervisor = web_server.ProcessSupervisor()
+        supervisor._diagnostics_path = path
+        diagnostics = supervisor.diagnostics()
+        self.assertIsNone(diagnostics["runtime_summary"])
+        self.assertEqual(len(diagnostics["points"]), 240)
+        self.assertEqual(diagnostics["prefill_starved_ticks"], 1)
+        self.assertEqual(diagnostics["runtime_starved_ticks"], 1)
+        self.assertEqual(diagnostics["action_ticks"], 301)
+        self.assertEqual(diagnostics["minimum_queue"], 0)
+        self.assertEqual(diagnostics["live_summary"]["inference_latency_s_median"], .023)
+        self.assertEqual(diagnostics["live_summary"]["move_js"]["achieved_control_hz"], 29.8)
+        self.assertEqual(diagnostics["points"][-1]["inference_ms"], 25)
+        writer.close()
+        writer.save_summary(writer.summary())
+        self.assertEqual(json.loads(path.with_suffix(".summary.json").read_text())["runtime_starved_ticks"], 1)
+
+    def test_web_blank_diagnostic_path_allocates_unique_persistent_runs(self) -> None:
+        supervisor = web_server.ProcessSupervisor()
+        config = {**self.defaults, "diagnostics_jsonl": "", "offline_dataset_root": str(self.root)}
+        with mock.patch.object(web_server, "normalize_config", return_value=config), \
+             mock.patch.object(supervisor, "_external_processes", return_value=[]), \
+             mock.patch.object(supervisor, "_managed_running", return_value=False), \
+             mock.patch.object(supervisor, "_spawn") as spawn:
+            supervisor.start_deployment(config)
+            first = supervisor._diagnostics_path
+            config["diagnostics_jsonl"] = ""
+            supervisor.start_deployment(config)
+            self.assertNotEqual(first, supervisor._diagnostics_path)
+            self.assertIn("outputs/openpi_deployer", str(first))
+            self.assertIn("--diagnostics-jsonl", spawn.call_args.args[1])
+
+    def test_observation_carries_existing_metrics_without_extra_requests(self) -> None:
+        import sys
+        sys.path.insert(0, str(MODULE.parent / "LerobotDeployer"))
+        from bridge_client import PiperBridge
+
+        client = object.__new__(PiperBridge)
+        observation = {"observation.state": [0.0] * 14}
+        client._request = mock.Mock(return_value={
+            "observation": observation,
+            "command_loop": {"achieved_control_hz": 30.0},
+        })
+        self.assertIs(client.observation(), observation)
+        self.assertEqual(client.command_loop_stats["achieved_control_hz"], 30)
+        client._request.assert_called_once_with("observe")
+        # Old bridges remain readable without fabricating a control frequency.
+        client._request.return_value = {"observation": observation}
+        self.assertIs(client.observation(), observation)
+        self.assertEqual(client.command_loop_stats, {})
+
 
 if __name__ == "__main__":
     unittest.main()

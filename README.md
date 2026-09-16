@@ -16,7 +16,9 @@ python3 workbench.py
 
 | 模块 | 功能 | 环境 |
 | --- | --- | --- |
+| 模型与数据目录 | models / datasets 浏览、新建、重命名、复制路径、回收站与恢复 | piper-home |
 | Piper 采集 | 四臂示教、脚踏板 / 回车、保存与丢弃 | piper-home |
+| 相机标定 | 自定义棋盘 / ChArUco、内参、左右腕与全局双 base 外参、导出 | piper-home |
 | 轨迹浏览 | HDF5 三路图像、时间轴、关节曲线 | piper-home |
 | 数据转换 | 多目录、task 筛选、尾部裁剪、降采样、absolute / delta | lerobot-pi05 |
 | 质量分析 | HDF5 / LeRobot 全量检查、异常 episode 清理与备份 | lerobot-pi05 |
@@ -43,6 +45,12 @@ python3 workbench.py
 
 ## 验证
 
+新增模块的使用和约定见 [相机标定说明](docs/CAMERA_CALIBRATION.md) 与 [位姿动作数据流方案](docs/POSE_ACTION_DATAFLOW.md)。标定板默认 **4×6 内角点、53.5 mm**，可在网页修改；实际为 5×7 格。位姿数据转换与训练尚未接入，等待方案审阅。绝对位姿使用左右自身 base，不依赖相机标定。
+
+目录管理只操作仓库 `models/` 和 `datasets/`。删除默认移入对应根目录的回收站；恢复不覆盖同名项目；永久删除需输入完整名称。符号链接可管理链接本身，但不进入链接目标。运行任务中请勿移动其模型和数据；页面会阻止能识别到的进程路径引用，但无法替代所有外部程序的文件占用管理。
+
+OpenPI 的控制循环指标现持续记录每个 tick 的推理延迟、累计饿死次数、限幅次数、队列和桥接频率。网页诊断路径留空时，每次运行独立保存到 `outputs/openpi_deployer/`，结束后保留同名 `.summary.json`。自定义路径仍可使用。推理中位数为最近最多 1000 个 chunk 的统计，排除 warmup；离线运行没有机械臂实测频率。
+
 已安装三套环境后，运行项目的 CPU 回归矩阵：
 
 ```bash
@@ -59,5 +67,7 @@ uv run --no-project --with playwright python tests/browser_smoke.py
 浏览器测试需要安装 Playwright Chromium；也可通过 `--browser /path/to/chromium` 指定已有浏览器。非默认端口用 `--url http://127.0.0.1:8090`。
 
 具体修复、验证结果和剩余现场验收见 [仓库审查记录](docs/REPOSITORY_REVIEW.md)；各模块具体改动见 [模块改动清单](docs/MODULE_CHANGES.md)。
+
+新增目录管理、相机标定与 OpenPI 指标修复的 **117 项回归、浏览器和真机只读测试**详见 [本轮验收记录](docs/RESOURCES_CALIBRATION_ACCEPTANCE.md)。
 
 Git 仅保存源码与环境锁。`datasets/`、`models/`、虚拟环境、测试产生的数据和权重均不会上传，需要在目标机器上单独复制或重新生成。

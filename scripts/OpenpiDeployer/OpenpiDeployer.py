@@ -166,6 +166,7 @@ class Diagnostics:
         self.prefill_starved = 0
         self.runtime_starved = 0
         self.limited = 0
+        self.minimum_queue: int | None = None
         self.max_target_step = 0.0
         self.previous_target: np.ndarray | None = None
         if path is not None:
@@ -184,6 +185,9 @@ class Diagnostics:
         else:
             self.actions += 1
         self.limited += int(bool(record.get("limited")))
+        queue = record.get("queue_size")
+        if queue is not None:
+            self.minimum_queue = int(queue) if self.minimum_queue is None else min(self.minimum_queue, int(queue))
         if target is not None and self.previous_target is not None:
             self.max_target_step = max(
                 self.max_target_step,
@@ -196,8 +200,16 @@ class Diagnostics:
                 key: value.tolist() if isinstance(value, np.ndarray) else value
                 for key, value in record.items()
             }
-            self.stream.write(json.dumps({"tick": self.ticks, **serializable}) + "\n")
+            self.stream.write(json.dumps({"tick": self.ticks, "wall_time_s": time.time(),
+                                          **serializable, "counters": self.summary()}) + "\n")
             self.stream.flush()
+
+    def save_summary(self, summary: dict[str, Any]) -> None:
+        if self.path is not None:
+            path = self.path.with_suffix(".summary.json")
+            temporary = path.with_suffix(".summary.json.tmp")
+            temporary.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            temporary.replace(path)
 
     def close(self) -> None:
         if self.stream is not None:
@@ -213,6 +225,7 @@ class Diagnostics:
             # Keep the aggregate key for existing consumers.
             "starved_ticks": self.prefill_starved + self.runtime_starved,
             "hardware_limit_clips": self.limited,
+            "minimum_queue": self.minimum_queue,
             "max_absolute_target_step_l2": self.max_target_step,
         }
 
@@ -398,6 +411,8 @@ def main() -> int:
                 action=action,
                 target=target,
                 limited=limited,
+                inference=latency_summary(list(sampler.latencies)),
+                move_js={} if bridge is None else bridge.command_loop_stats,
             )
             deadline = max(deadline + 1.0 / args.policy_hz, time.perf_counter())
             time.sleep(max(0.0, deadline - time.perf_counter()))
@@ -424,6 +439,10 @@ def main() -> int:
             "rtc_enqueue_events": list(getattr(engine, "enqueue_events", ())),
             "move_js": bridge_stats,
         }
+        try:
+            diagnostics.save_summary(summary)
+        except OSError as exc:
+            print(f"Saving deployment summary failed: {exc}", file=sys.stderr, flush=True)
         print("OPENPI_DEPLOYER_SUMMARY=" + json.dumps(summary), flush=True)
     return 0
 

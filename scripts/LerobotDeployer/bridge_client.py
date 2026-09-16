@@ -36,6 +36,7 @@ class PiperBridge:
         self._context = zmq.Context()
         self._socket: zmq.Socket | None = None
         self._request_id = 0
+        self.command_loop_stats: dict[str, Any] = {}
         self._open_socket()
 
     def _open_socket(self) -> None:
@@ -113,6 +114,7 @@ class PiperBridge:
         observation = reply.get("observation")
         if not isinstance(observation, dict):
             raise BridgeError("bridge observe reply has no observation mapping")
+        self.command_loop_stats = reply.get("command_loop", {})
         return observation
 
     def action(self, target: np.ndarray) -> dict[str, Any]:

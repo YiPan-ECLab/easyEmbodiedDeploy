@@ -29,7 +29,7 @@ async def main():
         page.on("pageerror", lambda error: errors.append(str(error)))
         await page.goto(args.url)
         await page.wait_for_selector(".module-card")
-        assert await page.locator(".module-card").count() == 8
+        assert await page.locator(".module-card").count() == 10
         await page.screenshot(
             path=str(args.screenshots / "workbench.png"), full_page=True
         )

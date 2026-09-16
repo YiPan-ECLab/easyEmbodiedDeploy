@@ -487,7 +487,10 @@ def _serve(endpoint: str) -> None:
                         for name, camera in cameras.items():
                             observation[f"observation.images.{name}"] = camera.read().rgb
                         sequence += 1
-                        payload = {"observation": observation, "sequence": sequence}
+                        # Piggyback already accumulated counters on the existing
+                        # reply. No extra SDK reads or telemetry heartbeat RPCs.
+                        payload = {"observation": observation, "sequence": sequence,
+                                   "command_loop": command_loop.stats()}
                     elif operation == "act":
                         command_loop.set_target(request.get("target"))
                         payload = {"accepted": True}

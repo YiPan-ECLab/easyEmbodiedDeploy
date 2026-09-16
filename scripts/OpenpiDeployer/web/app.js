@@ -288,7 +288,7 @@ function renderStatus(status) {
   $("#queueMinimum").textContent = diagnostics.minimum_queue ?? "—";
   $("#clippedTicks").textContent = diagnostics.clipped_ticks ?? 0;
 
-  const summary = diagnostics.runtime_summary || {};
+  const summary = {...(diagnostics.live_summary || {}), ...(diagnostics.runtime_summary || {})};
   $("#inferenceMedian").textContent = summary.inference_latency_s_median !== undefined
     ? `${(summary.inference_latency_s_median * 1000).toFixed(0)} ms`
     : "—";
@@ -299,6 +299,13 @@ function renderStatus(status) {
   $("#starvedMeta").textContent = `预填充 ${prefillStarved ?? "—"} · 总计 ${totalStarved ?? "—"}`;
   const achieved = summary.move_js?.achieved_control_hz;
   $("#achievedHz").textContent = achieved !== undefined ? `${achieved.toFixed(2)} Hz` : "—";
+  $("#diagnosticsPath").textContent = diagnostics.read_error
+    ? `诊断读取失败：${diagnostics.read_error}`
+    : diagnostics.path ? `运行记录：${diagnostics.path}` : "启动部署后自动创建本次运行记录";
+  $("#inferenceMeta").textContent = summary.inference_latency_s_last !== undefined
+    ? `最近 ${(summary.inference_latency_s_last * 1000).toFixed(0)} ms · 最大 ${(summary.inference_latency_s_max * 1000).toFixed(0)} ms`
+    : "等待模型推理";
+  $("#achievedHz").title = summary.bridge_stats_error || "桥接 move_js 实际发送频率";
 
   const offline = Boolean($("#offline_dataset_root").value.trim());
   const bridgeActive = status.bridge.running && status.bridge.state === "ready";

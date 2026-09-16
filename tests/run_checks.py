@@ -14,6 +14,7 @@ SUITES = [
     ("openpi-jax", "scripts/OpenpiTrainer/tests", "test*.py"),
     ("openpi-jax", "scripts/OpenpiDeployer/tests", "test*.py"),
     ("piper-home", "tests", "test_runtime_boundaries.py"),
+    ("piper-home", "tests", "test_resources_calibration.py"),
     ("lerobot-pi05", "tests", "test_data_pipeline.py"),
 ]
 

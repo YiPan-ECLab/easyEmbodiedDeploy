@@ -1,4 +1,4 @@
-"""Local reverse proxy and process owner for the eight isolated consoles."""
+"""Local reverse proxy and process owner for the isolated consoles."""
 
 import argparse
 import concurrent.futures
@@ -20,12 +20,20 @@ from .http import LocalHandlerMixin, read_json
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "web/workbench"
 MODULES = {
+    "files": (
+        "模型与数据目录", "资源", "DirectoryManager/web_server.py", "piper-home",
+        "目录管理 · 路径复制 · 可恢复删除",
+    ),
     "recorder": (
         "Piper 采集",
         "采集",
         "PiperRecorder/web_server.py",
         "piper-home",
         "踏板操作 · 双臂示教 · HDF5",
+    ),
+    "calibration": (
+        "相机标定", "采集", "CameraCalibration/web_server.py", "piper-home",
+        "左右腕部 · 全局双 base · 自定义标定板",
     ),
     "viewer": (
         "轨迹浏览",

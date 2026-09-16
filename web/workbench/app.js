@@ -1,6 +1,8 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const icons = {
+  files: '▱',
+  calibration: '⊹',
   recorder: '◎',
   viewer: '▣',
   processor: '⇄',
@@ -76,6 +78,7 @@ function build() {
 
 function render() {
   if (!created) build();
+  $('module-count').replaceChildren(document.createTextNode(`${modules.length} `), make('small', '', '个功能模块'));
   let running = 0;
   for (const module of modules) {
     if (module.state === 'ready') running++;

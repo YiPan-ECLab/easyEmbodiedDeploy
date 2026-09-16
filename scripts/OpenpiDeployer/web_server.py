@@ -14,6 +14,7 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -66,7 +67,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "seed": 20260909,
     "rpc_timeout": 5.0,
     "watchdog_timeout": 30.0,
-    "diagnostics_jsonl": "/tmp/openpi_piper_rtc_web.jsonl",
+    # Empty means allocate a persistent, unique log for this web deployment.
+    "diagnostics_jsonl": "",
     "dry_run": False,
     "offline_dataset_root": "",
 }
@@ -556,6 +558,10 @@ class ProcessSupervisor:
                     raise ConsoleError("所选桥接地址与当前硬件桥不一致")
             if not port_is_open(config["bridge_endpoint"]):
                 raise ConsoleError("硬件桥尚未就绪")
+        if not config["diagnostics_jsonl"] or config["diagnostics_jsonl"] == "/tmp/openpi_piper_rtc_web.jsonl":
+            config["diagnostics_jsonl"] = str(
+                ROOT / "outputs/openpi_deployer" / f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}.jsonl"
+            )
         command, env = deployment_command(config)
         with self._lock:
             self._diagnostics_path = (
@@ -799,6 +805,8 @@ class ProcessSupervisor:
             path = self._diagnostics_path
             runtime_summary = self._runtime_summary
         points: list[dict[str, Any]] = []
+        live_summary: dict[str, Any] = {}
+        read_error = None
         if path is not None and path.is_file():
             try:
                 with path.open("rb") as stream:
@@ -814,6 +822,13 @@ class ProcessSupervisor:
                         item = json.loads(line)
                     except ValueError:
                         continue
+                    if not isinstance(item, dict):
+                        continue
+                    live_summary = {
+                        **item.get("counters", {}), **item.get("inference", {}),
+                        **({"move_js": item["move_js"]} if "move_js" in item else {}),
+                        **({"bridge_stats_error": item["bridge_stats_error"]} if "bridge_stats_error" in item else {}),
+                    }
                     action = item.get("action")
                     target = item.get("target")
                     points.append(
@@ -833,10 +848,14 @@ class ProcessSupervisor:
                             "target_min": min(target) if target else None,
                             "target_max": max(target) if target else None,
                             "clipped": bool(item.get("limited", item.get("hardware_limit_clipped", False))),
+                            "inference_ms": (
+                                round(float(item["inference"]["inference_latency_s_last"]) * 1000, 3)
+                                if item.get("inference", {}).get("inference_latency_s_last") is not None else None
+                            ),
                         }
                     )
-            except OSError:
-                pass
+            except (OSError, ValueError, TypeError) as exc:
+                read_error = str(exc)
         queues = [point["queue"] for point in points if point["queue"] is not None]
         actions = [point for point in points if point["has_action"]]
         # A missing action before the first successful action is startup
@@ -849,25 +868,29 @@ class ProcessSupervisor:
         else:
             prefill_starved = first_action
             runtime_starved = sum(not point["has_action"] for point in points[first_action:])
-        if runtime_summary is not None:
-            prefill_starved = int(runtime_summary.get("prefill_starved_ticks", prefill_starved))
+        summary = {**live_summary, **(runtime_summary or {})}
+        if summary:
+            prefill_starved = int(summary.get("prefill_starved_ticks", prefill_starved))
             runtime_starved = int(
-                runtime_summary.get(
+                summary.get(
                     "runtime_starved_ticks",
-                    runtime_summary.get("starved_ticks", runtime_starved),
+                    summary.get("starved_ticks", runtime_starved),
                 )
             )
         return {
             "path": None if path is None else str(path),
+            "summary_path": None if path is None else str(path.with_suffix(".summary.json")),
+            "read_error": read_error,
             "points": points,
             "latest_queue": queues[-1] if queues else None,
-            "minimum_queue": min(queues) if queues else None,
-            "action_ticks": len(actions),
-            "clipped_ticks": sum(point["clipped"] for point in points),
+            "minimum_queue": summary.get("minimum_queue", min(queues) if queues else None),
+            "action_ticks": summary.get("actions", len(actions)),
+            "clipped_ticks": summary.get("hardware_limit_clips", sum(point["clipped"] for point in points)),
             "prefill_starved_ticks": prefill_starved,
             "runtime_starved_ticks": runtime_starved,
             "starved_ticks": prefill_starved + runtime_starved,
             "runtime_summary": runtime_summary,
+            "live_summary": live_summary,
         }
 
     def status(self) -> dict[str, Any]:
