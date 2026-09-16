@@ -400,6 +400,10 @@ def _serve(endpoint: str) -> None:
             )
             stack.callback(robot.close)
             connect_followers(robot)
+            prepare_followers(robot)
+            initial_state = read_state(robot)
+            command_loop = FollowerCommandLoop(robot, initial_state)
+
             def shutdown_hardware() -> None:
                 nonlocal command_loop
                 if command_loop is not None:
@@ -410,9 +414,6 @@ def _serve(endpoint: str) -> None:
 
             # Registered after robot.close(), so homing runs before CAN disconnect.
             stack.callback(shutdown_hardware)
-            prepare_followers(robot)
-            initial_state = read_state(robot)
-            command_loop = FollowerCommandLoop(robot, initial_state)
             ready = True
             print(
                 f"hardware bridge ready: {endpoint} | awaiting deployer motion config "

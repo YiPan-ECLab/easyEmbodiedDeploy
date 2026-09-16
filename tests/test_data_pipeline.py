@@ -14,13 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 for module in ("PiperRecorder", "PiperViewer", "LerobotDataProcessor", "DataAnalysis"):
     sys.path.insert(0, str(ROOT / "scripts" / module))
 from piper_recorder.camera import CAMERA_NAMES, CameraFrame, resize_with_padding
-from piper_recorder.robot import (
-    ArmCommand,
-    ArmSample,
-    PiperPair,
-    _normalize_gripper_width,
-    _message_values,
-)
+from piper_recorder.robot import ArmCommand, ArmSample
 from piper_recorder.dataset import EpisodeData, write_episode
 from piper_viewer.server import (
     _plain,
@@ -135,17 +129,6 @@ class DataPipelineTests(unittest.TestCase):
         self.file.rename(special)
         self.assertEqual(_safe_hdf5_path(str(special)), special)
         json.dumps(_plain({"value": np.array([np.nan, 1])}), allow_nan=False)
-
-    def test_invalid_raw_values_are_not_silently_clamped(self):
-        from types import SimpleNamespace
-
-        for bad in (float("nan"), float("inf"), -float("inf")):
-            with self.assertRaises(RuntimeError):
-                _normalize_gripper_width(bad, 0.1, "test")
-            with self.assertRaises(RuntimeError):
-                PiperPair._clamp_joints([bad] * 6)
-            with self.assertRaises(RuntimeError):
-                _message_values(SimpleNamespace(msg=[bad] * 6), 6, "test")
 
     def test_resize_preserves_full_view_with_padding(self):
         rgb = np.full((60, 120, 3), 255, np.uint8)

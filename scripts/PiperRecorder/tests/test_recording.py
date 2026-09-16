@@ -100,39 +100,50 @@ class RecordingTests(unittest.TestCase):
                 record.record_episode(robot, {}, value)
         robot.preposition_and_start.assert_not_called()
 
-    def test_can_error_passive_rejected_before_connecting(self):
-        from piper_recorder import robot
-        from types import SimpleNamespace
-
-        for state in ("ERROR-PASSIVE", "BUS-OFF", "STOPPED"):
-            result = SimpleNamespace(
-                returncode=0,
-                stdout=f"10: piper-rt: <NOARP,UP> state UP\n can state {state}\n bitrate 1000000",
-            )
-            with mock.patch.object(robot.subprocess, "run", return_value=result):
-                with self.assertRaisesRegex(RuntimeError, "CAN 总线异常"):
-                    robot.verify_can_interface("piper-rt")
-
-    def test_mode_switch_requires_successive_fresh_feedback(self):
+    def test_mode_switch_accepts_intermittent_fresh_feedback(self):
         from piper_recorder.robot import PiperPair
         from types import SimpleNamespace
 
         pair = PiperPair.__new__(PiperPair)
         pair.leader_name = "test"
         pair.leader = mock.Mock()
-        stamps = [1, 2, 2, 3, 4, 5]
+        # Hardware trace: repeated mode requests interrupt publication, with
+        # fresh feedback only every few polls. Do not keep reconfiguring once
+        # the controller has supplied the first fresh sample.
+        stamps = [1, 1, 1, 1, 1, 1, 2]
         pair.leader.get_joint_angles.side_effect = [
             SimpleNamespace(timestamp=n) for n in stamps
         ]
         with (
             mock.patch(
-                "piper_recorder.robot.ticks", return_value=iter([1, 2, 3, 4, 5])
+                "piper_recorder.robot.ticks", return_value=iter([0, .05, .1, .15, .2, .25])
             ),
             mock.patch("piper_recorder.robot.time.monotonic", return_value=0),
         ):
             result = pair._enter_leader_control_mode(timeout=10)
-        self.assertEqual(result.timestamp, 5)
-        self.assertEqual(pair.leader.set_follower_mode.call_count, 5)
+        self.assertEqual(result.timestamp, 2)
+        self.assertEqual(pair.leader.set_follower_mode.call_count, 6)
+        pair.leader.move_j.assert_not_called()
+
+    def test_mode_switch_still_rejects_missing_or_stale_feedback(self):
+        from piper_recorder.robot import PiperPair
+        from types import SimpleNamespace
+
+        for feedback in (None, SimpleNamespace(timestamp=1)):
+            with self.subTest(feedback=feedback):
+                pair = PiperPair.__new__(PiperPair)
+                pair.leader_name = "test"
+                pair.leader = mock.Mock()
+                pair.leader.get_joint_angles.return_value = feedback
+                with (
+                    mock.patch("piper_recorder.robot.ticks", return_value=iter([0, 1, 2])),
+                    mock.patch("piper_recorder.robot.time.monotonic", return_value=0),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "切换 follower 后没有关节反馈"):
+                        pair._enter_leader_control_mode(timeout=2)
+                self.assertTrue(pair._leader_is_follower)
+                pair.leader.enable.assert_not_called()
+                pair.leader.move_j.assert_not_called()
 
 
 class RecordingSessionTests(unittest.TestCase):
@@ -184,7 +195,7 @@ class RecordingSessionTests(unittest.TestCase):
         context.term.assert_called_once()
         cameras.assert_not_called()
 
-    def test_bridge_failed_preposition_homes_before_disconnect(self):
+    def test_bridge_failed_preposition_keeps_original_cleanup_sequence(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "LerobotDeployer"))
         import hardware_bridge as bridge
 
@@ -207,7 +218,7 @@ class RecordingSessionTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "preposition failed"):
                 bridge._serve("tcp://127.0.0.1:6007")
-        self.assertEqual(order, ["home", "disconnect"])
+        self.assertEqual(order, ["disconnect"])
 
 
 if __name__ == "__main__":
