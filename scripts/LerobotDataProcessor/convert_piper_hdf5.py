@@ -40,6 +40,8 @@ def main() -> None:
     parser.add_argument("--gap-policy", choices=GAP_POLICIES, default=DEFAULT_GAP_POLICY,
                         help="compact 压缩时间空档，reject 遇到空档直接失败")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
+    parser.add_argument("--calibration-bundle", help="camera delta 使用的标定包 JSON")
+    parser.add_argument("--calibration-mount-id", default="", help="确认源数据采集时的相机安装版本")
     parser.add_argument("--inspect", action="store_true", help="Check input and preview output counts only")
     parser.add_argument("--validate-output", metavar="PATH",
                         help="只验收已有 LeRobot bundle，不读取 HDF5 或加载模型")
@@ -57,7 +59,8 @@ def main() -> None:
     settings = Settings(input_dir=input_dirs[0], input_dirs=input_dirs, output_root=args.output_root,
                         task=args.task, target_fps=args.fps, source_fps=args.source_fps,
                         action_mode=args.action_mode, repo_id=args.repo_id, limit=args.limit,
-                        gap_policy=args.gap_policy)
+                        gap_policy=args.gap_policy, calibration_bundle=args.calibration_bundle,
+                        calibration_mount_id=args.calibration_mount_id)
     if args.inspect:
         import json
         print(json.dumps(scan(settings), ensure_ascii=False, indent=2))

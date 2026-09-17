@@ -15,7 +15,7 @@ const app = {
 };
 
 const fieldIds = [
-  "checkpoint", "task", "action_mode", "device",
+  "checkpoint", "task", "action_mode", "calibration_mount_id", "pose_start_margin_deg", "device",
   "inference_mode", "rtc_mode", "rtc_horizon", "rtc_queue_threshold",
   "rtc_schedule", "rtc_max_guidance_weight", "rtc_mask_grippers",
   "sample_steps", "n_action_steps", "warmup", "dry_run",
@@ -142,6 +142,11 @@ function collectConfig() {
 }
 
 function updateFormState() {
+  const cameraPose = $("#action_mode").value.startsWith("camera_delta_");
+  const pose = cameraPose || $("#action_mode").value === "absolute_base_pose";
+  document.querySelectorAll("[data-camera-pose]").forEach(el => { el.hidden = !cameraPose; });
+  document.querySelectorAll("[data-pose]").forEach(el => { el.hidden = !pose; });
+  document.querySelectorAll("[data-motion-label]").forEach(el => { el.textContent = pose ? "move_p" : "move_js"; });
   const rtc = $("#inference_mode").value === "rtc";
   if (!rtc) $("#rtc_mode").value = "guided";
   for (const field of $$(".rtc-field")) {
@@ -181,7 +186,7 @@ function updateFormState() {
 function syncCheckpointContract() {
   const checkpoint = selectedCheckpoint();
   if (!checkpoint) return;
-  if (["delta_joint", "absolute_joint"].includes(checkpoint.action_mode)) {
+  if (["delta_joint", "absolute_joint", "absolute_base_pose", "camera_delta_wrist", "camera_delta_global"].includes(checkpoint.action_mode)) {
     $("#action_mode").value = checkpoint.action_mode;
   }
   if ($("#rtc_mode").value === "trained" && !(checkpoint.rtc_training_max_delay > 0)) {
@@ -305,7 +310,7 @@ function renderStatus(status) {
   $("#inferenceMeta").textContent = summary.inference_latency_s_last !== undefined
     ? `最近 ${(summary.inference_latency_s_last * 1000).toFixed(0)} ms · 最大 ${(summary.inference_latency_s_max * 1000).toFixed(0)} ms`
     : "等待模型推理";
-  $("#achievedHz").title = summary.bridge_stats_error || "桥接 move_js 实际发送频率";
+  $("#achievedHz").title = summary.bridge_stats_error || "桥接运动指令实际发送频率";
 
   const offline = Boolean($("#offline_dataset_root").value.trim());
   const bridgeActive = status.bridge.running && status.bridge.state === "ready";

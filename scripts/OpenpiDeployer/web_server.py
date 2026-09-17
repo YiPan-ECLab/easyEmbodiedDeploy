@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from easy_embodied_deploy.http import LocalHandlerMixin, json_safe, read_json
+from easy_embodied_deploy.action_contract import ACTION_MODES, POSE_MODES
 from easy_embodied_deploy.contracts import boolean
 
 
@@ -45,6 +46,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         / "models/finetuned_models/openpi_pi05_lora20hz_absolute"
     ),
     "action_mode": "absolute_joint",
+    "calibration_mount_id": "",
+    "pose_start_margin_deg": 2.0,
     "inference_mode": "rtc",
     "rtc_mode": "guided",
     "rtc_horizon": 20,
@@ -154,7 +157,7 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     inference_mode = str(config["inference_mode"])
     rtc_mode = str(config["rtc_mode"])
     device = str(config["device"])
-    if action_mode not in {"delta_joint", "absolute_joint"}:
+    if action_mode not in ACTION_MODES:
         raise ConsoleError("action mode 无效")
     if inference_mode not in {"rtc", "sync"}:
         raise ConsoleError("inference mode 无效")
@@ -177,6 +180,7 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     normalized = {
         **config,
         "checkpoint": str(checkpoint),
+        "pose_start_margin_deg": _number(config.get("pose_start_margin_deg", 2), "位姿初始关节偏移", minimum=0, maximum=5),
         "action_mode": action_mode,
         "inference_mode": inference_mode,
         "rtc_mode": rtc_mode,
@@ -262,6 +266,13 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         if not (dataset / "meta/info.json").is_file():
             raise ConsoleError(f"离线数据集缺少 meta/info.json：{dataset}")
         normalized["offline_dataset_root"] = str(dataset)
+    try:
+        if action_mode in POSE_MODES:
+            from easy_embodied_deploy.target_runtime import checkpoint_pose_contract
+            checkpoint_pose_contract(checkpoint, action_mode,
+                mount_id=str(config.get("calibration_mount_id", "")).strip(), policy_hz=normalized["policy_hz"])
+    except (ValueError, OSError, KeyError) as exc:
+        raise ConsoleError(str(exc)) from exc
     return normalized
 
 
@@ -321,6 +332,8 @@ def deployment_command(config: dict[str, Any]) -> tuple[list[str], dict[str, str
         "--watchdog-timeout",
         str(config["watchdog_timeout"]),
     ]
+    command.extend(["--pose-start-margin-deg", str(config.get("pose_start_margin_deg", 2))])
+    command.extend(["--calibration-mount-id", str(config.get("calibration_mount_id", "")).strip()])
     if config["diagnostics_jsonl"]:
         command.extend(["--diagnostics-jsonl", config["diagnostics_jsonl"]])
     if config.get("offline_dataset_root"):

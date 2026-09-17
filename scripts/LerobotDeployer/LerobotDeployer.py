@@ -21,6 +21,11 @@ import torch
 
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
+from easy_embodied_deploy.action_contract import ACTION_MODES, POSE_MODES
+from easy_embodied_deploy.target_runtime import (COMMAND_KEY, TargetSampler, PoseTargetAdapter,
+    TorchPolicyAdapter, EngineFacade, checkpoint_pose_contract, validate_live_cameras)
 CHECKPOINT = ROOT / (
     "models/finetuned_models/pi05_run_lora_test/checkpoints/005000/pretrained_model"
 )
@@ -298,6 +303,26 @@ def make_inference_engine(
     from deployer import AXES, PiperFeatureRobot
     from lerobot.rollout.inference.sync import SyncInferenceEngine
 
+    if args.action_mode != "absolute_joint":
+        from scripts.OpenpiDeployer.runtime import (PolicyChunkSampler, RTCSettings,
+                                                   SyncActionEngine, AsyncRTCActionEngine)
+        rtc = None
+        if args.inference_mode == "rtc":
+            from scripts.OpenpiDeployer.runtime import validate_manifest
+            config = {"action_mode": args.action_mode,
+                      "rtc_max_delay": int(policy.config.rtc_training_max_delay)}
+            validate_manifest({"config": config}, action_mode=args.action_mode,
+                              inference_mode=args.inference_mode, rtc_mode=args.rtc_mode,
+                              rtc_horizon=args.rtc_horizon, queue_threshold=args.rtc_queue_threshold)
+            rtc = RTCSettings(mode=args.rtc_mode, horizon=args.rtc_horizon,
+                              queue_threshold=args.rtc_queue_threshold, policy_hz=policy_hz,
+                              training_max_delay=config["rtc_max_delay"])
+        native = TorchPolicyAdapter(policy, preprocessor, postprocessor, args.device)
+        sampler = TargetSampler(PolicyChunkSampler(native, args.task, rtc), args.action_mode, args.pose_contract)
+        engine = (SyncActionEngine(sampler, policy.config.n_action_steps) if rtc is None
+                  else AsyncRTCActionEngine(sampler, rtc))
+        return EngineFacade(engine)
+
     if args.inference_mode == "sync":
         return SyncInferenceEngine(
             policy=policy,
@@ -371,7 +396,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--action-mode",
-        choices=("delta_joint", "absolute_joint"),
+        choices=ACTION_MODES,
         default=DEFAULT_ACTION_MODE,
         help="action representation used to train the checkpoint",
     )
@@ -475,7 +500,14 @@ def main() -> None:
         action="store_true",
         help="run inference and validate targets without sending actions",
     )
+    parser.add_argument("--calibration-mount-id", default="")
+    parser.add_argument("--offline-dataset-root", type=Path)
+    parser.add_argument("--pose-start-margin-deg", type=float, default=2.0, help="仅位姿部署：J2=+偏移，J3=-偏移，范围 0..5 度")
     args = parser.parse_args()
+    if not 0 <= args.pose_start_margin_deg <= 5:
+        parser.error("--pose-start-margin-deg must be in [0,5]")
+    if args.offline_dataset_root is not None:
+        args.dry_run = True
 
     checkpoint = resolve_path(args.checkpoint)
     if not (checkpoint / "config.json").is_file():
@@ -494,6 +526,8 @@ def main() -> None:
     except (ValueError, OSError, TypeError) as exc:
         parser.error(str(exc))
     policy_hz = validate_args(parser, args)
+    args.pose_contract = checkpoint_pose_contract(checkpoint, args.action_mode,
+        mount_id=args.calibration_mount_id, policy_hz=policy_hz)
 
     rtc_config = None
     if args.inference_mode == "rtc":
@@ -539,7 +573,14 @@ def main() -> None:
         validate_observation,
     )
 
-    bridge = PiperBridge(args.bridge_endpoint, timeout_s=args.rpc_timeout)
+    if args.offline_dataset_root is not None:
+        from easy_embodied_deploy.offline_bridge import OfflineBridge
+        root = resolve_path(args.offline_dataset_root)
+        if (root / "lerobot").is_dir():
+            root = root / "lerobot"
+        bridge = OfflineBridge(root)
+    else:
+        bridge = PiperBridge(args.bridge_endpoint, timeout_s=args.rpc_timeout)
     bridge_stopped = False
     engine_started = False
     diagnostics_path = (
@@ -561,18 +602,21 @@ def main() -> None:
             control_hz=args.control_hz,
             smoothing_time_constant_s=args.smoothing_time_constant,
             watchdog_timeout_s=args.watchdog_timeout,
+            motion_space="pose" if args.pose_contract else "joint",
+            pose_start_margin_deg=args.pose_start_margin_deg,
         )
+        validate_live_cameras(args.pose_contract, configured)
         if configured.get("joint_units") != "rad":
             raise BridgeError("hardware bridge joint unit is not rad")
         if configured.get("gripper_units") != "m":
             raise BridgeError("hardware bridge gripper unit is not m")
-        converter = PiperActionAdapter(
-            args.action_mode,
+        converter = PoseTargetAdapter() if args.pose_contract else PiperActionAdapter(
+            "absolute_joint",
             joint_limits=np.asarray(configured.get("joint_limits"), dtype=np.float64),
             gripper_limits=tuple(configured.get("gripper_limits", ())),
         )
         print(
-            f"Bridge connected | move_js={configured['control_hz']:g} Hz | "
+            f"Bridge connected | {'move_p' if args.action_mode in POSE_MODES else 'move_js'}={configured['control_hz']:g} Hz | "
             f"smoothing_tau={configured['smoothing_time_constant_s']:g}s | "
             f"policy={policy_hz:g} Hz | "
             f"mode={args.inference_mode}/{args.action_mode} | "
@@ -604,7 +648,11 @@ def main() -> None:
                 )
 
             engine_started_at = time.perf_counter()
-            if args.inference_mode == "rtc":
+            if args.action_mode == "delta_joint":
+                observation[COMMAND_KEY] = converter.command_target
+            if isinstance(engine, EngineFacade):
+                action = engine.get_action(observation)
+            elif args.inference_mode == "rtc":
                 engine.notify_observation(to_rtc_hardware_observation(observation))
                 action = engine.get_action(None)
             else:
@@ -633,7 +681,7 @@ def main() -> None:
                         flush=True,
                     )
                 if not args.dry_run:
-                    bridge.action(target)
+                    (bridge.pose_action if args.pose_contract else bridge.action)(target)
                 applied_steps += 1
                 limited = " | hardware-limit-clipped" if converter.last_was_limited else ""
                 print(

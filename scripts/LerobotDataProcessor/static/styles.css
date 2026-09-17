@@ -312,3 +312,6 @@ pre { font-size: 12px; }
 }
 
 form fieldset legend { grid-column: 1 / -1; float: none; }
+
+#actionMode { grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); }
+[data-camera-pose][hidden] { display: none; }

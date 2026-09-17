@@ -15,7 +15,7 @@ const app = {
 };
 
 const fieldIds = [
-  "checkpoint", "task", "action_mode", "device",
+  "checkpoint", "task", "action_mode", "calibration_mount_id", "pose_start_margin_deg", "device",
   "inference_mode", "rtc_mode", "rtc_horizon", "rtc_queue_threshold",
   "policy_hz", "control_hz", "smoothing_time_constant", "bridge_endpoint",
   "max_steps", "seed", "rpc_timeout", "watchdog_timeout",
@@ -130,6 +130,11 @@ function collectConfig() {
 }
 
 function updateFormState() {
+  const cameraPose = $("#action_mode").value.startsWith("camera_delta_");
+  const pose = cameraPose || $("#action_mode").value === "absolute_base_pose";
+  document.querySelectorAll("[data-camera-pose]").forEach(el => { el.hidden = !cameraPose; });
+  document.querySelectorAll("[data-pose]").forEach(el => { el.hidden = !pose; });
+  document.querySelectorAll("[data-motion-label]").forEach(el => { el.textContent = pose ? "move_p" : "move_js"; });
   const rtc = $("#inference_mode").value === "rtc";
   if (!rtc) $("#rtc_mode").value = "guided";
   for (const field of $$(".rtc-field")) {

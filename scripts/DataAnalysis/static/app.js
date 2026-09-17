@@ -32,6 +32,10 @@ function formPayload() {
     kind: kind(), path: $("path").value.trim(),
     expected_fps: Number($("expectedFps").value || 30),
     gap_factor: Number($("gapFactor").value || 1.5),
+    pose_thresholds: {
+      max_speed_m_s: Number($("poseSpeed").value), max_angular_speed_rad_s: Number($("poseAngular").value),
+      idle_translation_m: Number($("poseIdleM").value), idle_rotation_rad: Number($("poseIdleRad").value),
+    },
     source_dir: $("sourceDir").value.trim() || null,
   };
 }
@@ -83,13 +87,19 @@ function summaryBlocks(source) {
   ].map(([name, value]) => `<div><small>${name}</small><b>${value}</b></div>`).join("");
 }
 
+function poseSummary(pose) {
+  if (!pose?.sides) return "—";
+  return Object.entries(pose.sides).map(([side, m]) =>
+    `${side === 'left' ? '左' : '右'} ${Number(m.max_speed_m_s).toFixed(3)} m/s · ${Number(m.max_angular_speed_rad_s).toFixed(3)} rad/s`).join('；');
+}
+
 function renderHdf5Rows() {
   const query = $("search").value.trim().toLowerCase();
   const issues = $("issues").checked;
   const rows = state.report.files.filter((item) =>
     item.file.toLowerCase().includes(query) && (!issues || !item.valid || item.warnings.length)
   );
-  $("tableHead").innerHTML = "<tr><th>结果</th><th>文件</th><th>Task</th><th>Home</th><th>尾部等待</th><th>实测 FPS</th><th>间隔范围</th><th>相机偏差</th><th>边界裁剪</th><th>原因</th></tr>";
+  $("tableHead").innerHTML = "<tr><th>结果</th><th>文件</th><th>Task</th><th>Home</th><th>尾部等待</th><th>实测 FPS</th><th>间隔范围</th><th>相机偏差</th><th>边界裁剪</th><th>位姿峰值速度</th><th>原因</th></tr>";
   $("tableBody").innerHTML = rows.map((item) => {
     const m = item.metrics;
     const rowClass = item.valid ? (item.warnings.length ? "warning" : "") : "fail";
@@ -99,27 +109,27 @@ function renderHdf5Rows() {
       <td>${m.trailing_idle_frames}</td><td>${Number(m.measured_fps).toFixed(3)}</td>
       <td>${Number(m.task_dt_min_ms).toFixed(2)}–${Number(m.task_dt_max_ms).toFixed(2)} ms</td>
       <td>${Number(m.max_camera_skew_ms).toFixed(1)} ms</td><td>${m.boundary_clipped_values}</td>
-      <td title="${escapeHtml(detail)}">${escapeHtml(detail)}</td></tr>`;
-  }).join("") || '<tr><td colspan="10">没有匹配项</td></tr>';
+      <td>${escapeHtml(poseSummary(m.pose))}</td><td title="${escapeHtml(detail)}">${escapeHtml(detail)}</td></tr>`;
+  }).join("") || '<tr><td colspan="11">没有匹配项</td></tr>';
 }
 
 function renderLerobotRows() {
   const query = $("search").value.trim().toLowerCase();
   const issues = $("issues").checked;
   const rows = state.report.episodes.filter((item) => {
-    const hasIssue = item.errors.length > 0;
+    const hasIssue = item.errors.length > 0 || item.pose?.warnings?.length;
     return String(item.episode).includes(query) && (!issues || hasIssue);
   });
-  $("tableHead").innerHTML = "<tr><th>结果</th><th>Episode</th><th>源文件</th><th>输出帧</th><th>首部静止</th><th>尾部静止</th><th>最大动作步长</th><th>最大源间隔</th><th>Action 误差</th><th>State 误差</th><th>Home</th><th>错误</th></tr>";
-  $("tableBody").innerHTML = rows.map((item) => `<tr class="${item.errors.length ? "fail" : ""}">
-    <td>${item.errors.length ? "FAIL" : "PASS"}</td><td>${item.episode}</td>
+  $("tableHead").innerHTML = "<tr><th>结果</th><th>Episode</th><th>源文件</th><th>输出帧</th><th>首部静止</th><th>尾部静止</th><th>关节步长 / 位姿速度</th><th>最大源间隔</th><th>Action 误差</th><th>State 误差</th><th>Home</th><th>问题与提示</th></tr>";
+  $("tableBody").innerHTML = rows.map((item) => `<tr class="${item.errors.length ? "fail" : item.pose?.warnings?.length ? "warning" : ""}">
+    <td>${item.errors.length ? "FAIL" : item.pose?.warnings?.length ? "WARN" : "PASS"}</td><td>${item.episode}</td>
     <td title="${escapeHtml(item.source_file || "—")}">${escapeHtml(item.source_file || "—")}</td><td>${item.rows}</td>
     <td>${item.leading_idle_frames}</td><td>${item.trailing_idle_frames}</td>
-    <td>${Number(item.max_action_joint_step_rad).toFixed(4)} rad</td>
+    <td>${item.pose ? escapeHtml(poseSummary(item.pose)) : `${Number(item.max_action_joint_step_rad).toFixed(4)} rad`}</td>
     <td>${item.max_source_dt_ms == null ? "—" : `${Number(item.max_source_dt_ms).toFixed(3)} ms`}</td>
     <td>${item.action_error == null ? "—" : Number(item.action_error).toExponential(2)}</td>
     <td>${item.state_error == null ? "—" : Number(item.state_error).toExponential(2)}</td>
-    <td>${item.home_frames ?? "—"}</td><td>${escapeHtml(item.errors.join("；") || "—")}</td></tr>`).join("") || '<tr><td colspan="12">没有匹配项</td></tr>';
+    <td>${item.home_frames ?? "—"}</td><td>${escapeHtml([...item.errors, ...(item.pose?.warnings || [])].join("；") || "—")}</td></tr>`).join("") || '<tr><td colspan="12">没有匹配项</td></tr>';
 }
 
 function renderReport(report) {
@@ -142,6 +152,17 @@ function renderReport(report) {
   const source = $("sourceSummary");
   source.classList.toggle("hidden", !report.source_verification);
   source.innerHTML = summaryBlocks(report.source_verification);
+  const labels = (hdf5 ? report.files.map(item => item.metrics?.joint_labels) : report.episodes.map(item => item.joint_labels)).filter(Boolean);
+  const labelSummary = $("jointSummary");
+  labelSummary.classList.toggle("hidden", !labels.length);
+  if (labels.length) {
+    const median = key => {
+      const values = labels.map(item => Number(item[key])).filter(Number.isFinite).sort((a, b) => a - b);
+      const mid = Math.floor(values.length / 2);
+      return values.length % 2 ? values[mid] : (values[mid - 1] + values[mid]) / 2;
+    };
+    labelSummary.textContent = `关节标签诊断（各条记录中位数）：近零增量 ${(median('delta_joint_near_zero_fraction') * 100).toFixed(1)}%；首帧命令 / 反馈差 ${median('initial_command_feedback_joint_l2_rad').toFixed(4)} rad（L2）；最低误差匹配滞后 ${median('minimum_error_lag_frames')} 帧。匹配滞后是离线描述性指标，不等于硬件延迟；完整分布可导出 JSON。`;
+  }
   const itemErrors = hdf5
     ? report.files.flatMap((item) => item.errors.map((value) => `${item.file}: ${value}`)) : [];
   const itemWarnings = hdf5

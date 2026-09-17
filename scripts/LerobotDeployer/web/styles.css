@@ -477,3 +477,5 @@ pre { font-size: 12px; }
 .chart-wrap canvas { max-width: 100%; }
 .chart-stats { flex-wrap: wrap; gap: 10px 20px; }
 .chart-help, .chart-stats > span, .chart-stats > div { overflow-wrap: anywhere; }
+
+[data-camera-pose][hidden], [data-pose][hidden] { display: none; }

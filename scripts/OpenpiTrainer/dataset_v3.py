@@ -6,11 +6,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from easy_embodied_deploy.action_contract import read_pose_contract
 
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 IMAGE_KEYS = tuple(f"observation.images.{name}" for name in CAMERAS)
@@ -65,6 +69,10 @@ class LeRobotV3Dataset:
             sorted((self.root / "data").glob("chunk-*/file-*.parquet")),
             ["observation.state", "action", "timestamp", "episode_index", "task_index"],
         )
+        self.pose_data = None
+        if read_pose_contract(self.root):
+            from easy_embodied_deploy.pose_dataset import PoseDataset
+            self.pose_data = PoseDataset(self.root, action_horizon)
         self._states = _fixed_vectors(data, "observation.state", 14)
         self._actions = _fixed_vectors(data, "action", 14)
         self._timestamps = np.asarray(data.column("timestamp"), dtype=np.float64)
@@ -117,7 +125,10 @@ class LeRobotV3Dataset:
         return video_path, timestamp
 
     def _decode_image(self, key: str, index: int):
-        from lerobot.common.datasets.video_utils import decode_video_frames
+        try:
+            from lerobot.common.datasets.video_utils import decode_video_frames
+        except ModuleNotFoundError:
+            from lerobot.datasets.video_utils import decode_video_frames
 
         path, timestamp = self._video_location(key, index)
         frames = decode_video_frames(
@@ -149,6 +160,9 @@ class LeRobotV3Dataset:
             "task": self._tasks[int(self._task_indices[index])],
             "task_index": self._task_indices[index],
         }
+        sample["action_valid"] = np.arange(index, index+self.action_horizon) < end
+        if self.pose_data is not None:
+            sample["action"], sample["action_valid"] = self.pose_data.chunk(index)
         sample.update({key: self._decode_image(key, index) for key in IMAGE_KEYS})
         return sample
 
@@ -163,6 +177,8 @@ def install_openpi_loader(dataset_root: str | Path) -> None:
         return LeRobotV3Dataset(root, action_horizon)
 
     data_loader.create_torch_dataset = create_torch_dataset
+    from easy_embodied_deploy.pose_training_jax import install_loader
+    install_loader()
 
 
 def main() -> int:

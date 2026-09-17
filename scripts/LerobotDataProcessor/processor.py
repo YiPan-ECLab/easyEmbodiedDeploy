@@ -25,13 +25,13 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from easy_embodied_deploy.statistics import statistics_close
+from easy_embodied_deploy.action_contract import ACTION_MODES, POSE_MODES, action_axes, read_pose_contract
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 AXES = [f"{side}_{axis}" for side in ("left", "right")
         for axis in ("j1", "j2", "j3", "j4", "j5", "j6", "gripper")]
 REPORT_NAME = "processing.json"
 TASK_PHASE = 0
 HOME_PHASE = 1
-ACTION_MODES = ("absolute_joint", "delta_joint")
 GAP_POLICIES = ("compact", "reject")
 SOURCE_ACTION_LAYOUT = (
     "left_j1_rad,left_j2_rad,left_j3_rad,left_j4_rad,left_j5_rad,left_j6_rad,"
@@ -103,6 +103,8 @@ class Settings:
     limit: int = 0
     gap_policy: str = "reject"
     input_dirs: list[str] | None = None
+    calibration_bundle: str | None = None
+    calibration_mount_id: str = ""
 
 
 def canonical_action_mode(value: str) -> str:
@@ -159,7 +161,7 @@ def _bool_attr(value) -> bool:
     return bool(value)
 
 
-def _task_sample_indices(demo: h5py.Group, stride: int) -> tuple[np.ndarray, int, int]:
+def _task_sample_indices(demo: h5py.Group, stride: int, *, pose: bool = False) -> tuple[np.ndarray, int, int]:
     """Select task frames, excluding trailing idle and homing frames."""
     indices = np.arange(0, len(demo["actions"]), stride)
     if "trajectory_phase" not in demo:
@@ -193,6 +195,8 @@ def _task_sample_indices(demo: h5py.Group, stride: int) -> tuple[np.ndarray, int
     while (
         last_active > 0
         and np.array_equal(actions[last_active], actions[last_active - 1])
+        and (not pose or all(np.array_equal(demo[key][last_active], demo[key][last_active-1])
+                            for key in ("states", "obs/left_ee_states", "obs/right_ee_states")))
     ):
         last_active -= 1
     trimmed_idle_frames = task_end - last_active - 1
@@ -309,9 +313,12 @@ def inspect_file(path: Path, settings: Settings) -> dict:
         else:
             max_camera_skew = None
         stride = source_fps // settings.target_fps
-        selected, excluded_home_frames, trimmed_idle_frames = _task_sample_indices(demo, stride)
+        selected, excluded_home_frames, trimmed_idle_frames = _task_sample_indices(demo, stride, pose=settings.action_mode in POSE_MODES)
         sampled_frames = len(selected)
-        output_frames = sampled_frames - int(settings.action_mode == "delta_joint")
+        output_frames = sampled_frames - int(settings.action_mode == "delta_joint" or settings.action_mode in POSE_MODES)
+        if settings.action_mode in POSE_MODES:
+            from easy_embodied_deploy.pose_conversion import read_raw_poses
+            read_raw_poses(demo)
         if output_frames < 1:
             raise ValueError(f"{path.name}: 降采样后不足以计算增量")
         selected_dt = np.diff(t[selected])
@@ -365,6 +372,12 @@ def scan(settings: Settings) -> dict:
         raise ValueError(f"时间空档策略必须为 {' 或 '.join(GAP_POLICIES)}")
     if not settings.task.strip():
         raise ValueError("请填写任务描述")
+    if settings.action_mode in POSE_MODES:
+        from easy_embodied_deploy.pose_actions import load_calibration
+        if settings.gap_policy != "reject":
+            raise ValueError("位姿动作必须使用 reject，不能跨异常时间间隔组织未来目标")
+        load_calibration(resolve_path(settings.calibration_bundle) if settings.calibration_bundle else None,
+                         settings.action_mode, settings.calibration_mount_id)
     sources = input_directories(settings)
     paths = [
         (source, path)
@@ -390,6 +403,7 @@ def scan(settings: Settings) -> dict:
         raise ValueError("输出目录必须与输入目录分开，不能互相包含")
     warnings = [f"{item['name']}: {warning}" for item in files for warning in item["warnings"]]
     return dict(input_dir=portable_path(sources[0]), input_dirs=[portable_path(path) for path in sources],
+                target_fps=settings.target_fps, action_mode=settings.action_mode,
                 output_root=portable_path(out), files=files,
                 episodes=len(files), input_frames=sum(x["frames"] for x in files),
                 output_frames=sum(x["output_frames"] for x in files),
@@ -398,8 +412,9 @@ def scan(settings: Settings) -> dict:
                 repo_id=settings.repo_id or f"local/piper_{settings.target_fps}hz_{settings.action_mode}")
 
 
-def make_features(shapes: list) -> dict:
-    features = {key: {"dtype": "float32", "shape": (14,), "names": {"axes": AXES}}
+def make_features(shapes: list, action_mode="absolute_joint") -> dict:
+    features = {key: {"dtype": "float32", "shape": (14,),
+                      "names": {"axes": AXES if key == "observation.state" else action_axes(action_mode)}}
                 for key in ("observation.state", "action")}
     for camera, shape in zip(CAMERAS, shapes):
         features[f"observation.images.{camera}"] = dict(dtype="video", shape=tuple(shape),
@@ -489,12 +504,21 @@ def validate_lerobot_bundle(bundle_root: str | Path, *, expected: dict | None = 
         if int(info.get("total_tasks", 1)) != 1:
             errors.append("当前处理器只支持单任务数据集")
         features = info.get("features", {})
+        pose_contract = read_pose_contract(root)
+        action_mode = canonical_action_mode(str((expected or {}).get("action_mode", "")))
+        if pose_contract:
+            if action_mode and action_mode != pose_contract["action_mode"]:
+                errors.append("位姿契约与所选 action_mode 不一致")
+            action_mode = pose_contract["action_mode"]
+        elif action_mode in POSE_MODES:
+            errors.append("位姿数据缺少动作契约")
         for key in ("observation.state", "action"):
             feature = features.get(key, {})
             if feature.get("dtype") != "float32" or feature.get("shape") != [14]:
                 errors.append(f"{key} feature 不是 float32[14]")
             axes = feature.get("names", {}).get("axes")
-            if axes != AXES:
+            expected_axes = action_axes(action_mode) if key == "action" and action_mode else AXES
+            if axes != expected_axes:
                 errors.append(f"{key} 的 axes 顺序不符合 Piper 契约")
             stat = stats.get(key)
             if not isinstance(stat, dict):
@@ -559,8 +583,12 @@ def validate_lerobot_bundle(bundle_root: str | Path, *, expected: dict | None = 
             if len(positions) and not np.allclose(timestamp[positions], expected_frames / fps,
                                                   rtol=0, atol=2e-5):
                 errors.append(f"episode {ep} timestamp 与 fps={fps} 不一致")
-        action_mode = canonical_action_mode(str((expected or {}).get("action_mode", "")))
         action_values = np.asarray(columns["action"], dtype=np.float64)
+        if pose_contract:
+            from easy_embodied_deploy.pose_conversion import validate_pose_bundle
+            checked_pose = validate_pose_bundle(root, columns)
+            errors.extend(checked_pose["errors"])
+            metrics["pose"] = checked_pose["metrics"]
         if action_mode == "absolute_joint" and action_values.shape == (rows, 14):
             try:
                 _validate_piper_range(action_values, "action")
@@ -669,10 +697,17 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
              message=f"使用 {cpu_count} 个可用 CPU worker 写入图像；视频编码由 LeRobot 编码器自动调度")
         dataset = LeRobotDataset.create(
             repo_id=plan["repo_id"], root=output / "lerobot", fps=settings.target_fps,
-            features=make_features(plan["files"][0]["camera_shapes"]),
+            features=make_features(plan["files"][0]["camera_shapes"], settings.action_mode),
             robot_type="piper_dual", use_videos=True,
             image_writer_threads=cpu_count,
         )
+        pose_contract = None
+        if settings.action_mode in POSE_MODES:
+            from easy_embodied_deploy.pose_actions import load_calibration
+            from easy_embodied_deploy.pose_dataset import new_contract
+            calibration = load_calibration(resolve_path(settings.calibration_bundle) if settings.calibration_bundle else None,
+                                           settings.action_mode, settings.calibration_mount_id)
+            pose_contract = new_contract(settings.action_mode, settings.target_fps, calibration, settings.calibration_mount_id)
         for index, info in enumerate(plan["files"]):
             checkpoint()
             source_dir = resolve_path(info.get("source_dir") or plan["input_dir"])
@@ -681,9 +716,14 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
                 # Stream one HDF5 directly into the current LeRobot episode.
                 # A bounded contiguous read block is held while frames are sent
                 # to LeRobot's asynchronous image writer.
-                selected, _, _ = _task_sample_indices(demo, info["stride"])
+                selected, _, _ = _task_sample_indices(demo, info["stride"], pose=settings.action_mode in POSE_MODES)
                 raw_actions = np.asarray(demo["actions"][selected], dtype=np.float32)
-                if settings.action_mode == "delta_joint":
+                if pose_contract is not None:
+                    from easy_embodied_deploy.pose_conversion import convert_episode
+                    actions = convert_episode(output / "lerobot", pose_contract, demo, selected,
+                                              source=dict(info))
+                    selected = selected[:-1]
+                elif settings.action_mode == "delta_joint":
                     actions = np.diff(raw_actions, axis=0)
                     selected = selected[:-1]
                 else:
@@ -736,6 +776,11 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
             checkpoint()
         emit("finalizing", message="保存 LeRobot 元数据与官方统计量")
         dataset.finalize()
+        if pose_contract is not None:
+            from easy_embodied_deploy.pose_dataset import compute_chunk_statistics
+            emit("pose_statistics", message="按固定锚点的完整 50 步 chunk 统计有效位姿目标，排除尾部填充")
+            manifest["pose_action_statistics"] = compute_chunk_statistics(output / "lerobot", checkpoint)
+            manifest["pose_contract"] = pose_contract
         stats = dataset.meta.stats
         for key in ("action", "observation.state"):
             for stat in ("q01", "q99", "mean", "std", "min", "max"):

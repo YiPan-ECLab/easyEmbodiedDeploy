@@ -129,7 +129,26 @@ def home_followers(robot: DualPiper) -> None:
     _parallel(pairs, home_follower)
 
 
-def read_state(robot: DualPiper) -> np.ndarray:
+def prepare_pose_followers(robot, margin_deg):
+    """Optional, explicit Cartesian start margin; reuse original move helper.
+
+    At J2=J3=0 a rounded Cartesian target may place firmware IK outside a
+    joint limit. This applies only to the new pose mode, never joint rollout.
+    """
+    if not math.isfinite(margin_deg) or not 0 <= margin_deg <= 5:
+        raise ValueError("pose_start_margin_deg must be in [0,5]")
+    if margin_deg == 0:
+        return
+    def prepare(pair):
+        target = list(pair.target)
+        target[1], target[2] = math.radians(margin_deg), -math.radians(margin_deg)
+        pair._move_to({pair.follower_name: pair.follower}, tuple(target),
+                      speed=PREPOSITION_SPEED, timeout=PREPOSITION_TIMEOUT_S,
+                      tolerance=pair.zero_tolerance, hz=50)
+    _parallel(list(robot.pairs.values()), prepare)
+
+
+def read_state(robot: DualPiper, *, include_pose=False):
     samples = robot.sample()
     state: list[float] = []
     for side in ("left", "right"):
@@ -137,6 +156,13 @@ def read_state(robot: DualPiper) -> np.ndarray:
     result = np.asarray(state, dtype=np.float32)
     if result.shape != (14,) or not np.isfinite(result).all():
         raise RuntimeError("Piper returned an invalid 14-dimensional state")
+    if include_pose:
+        # sample() already obtains flange feedback for the recorder. Reuse
+        # those same samples; no additional SDK read or hardware mode change.
+        poses = np.asarray([v for side in ("left", "right") for v in samples[side].flange_pose], dtype=np.float64)
+        if poses.shape != (12,) or not np.isfinite(poses).all():
+            raise RuntimeError("Piper returned an invalid flange pose")
+        return result, poses
     return result
 
 
@@ -345,6 +371,63 @@ class FollowerCommandLoop:
             raise RuntimeError("Piper command loop did not stop")
 
 
+class PoseCommandLoop(FollowerCommandLoop):
+    """New Cartesian path through SDK move_p; original joint loop is unchanged."""
+
+    def set_target(self, value):
+        from easy_embodied_deploy.target_runtime import PoseTargetAdapter
+        raw = np.asarray(value, dtype=np.float64)
+        target = PoseTargetAdapter().to_absolute(raw, np.zeros(14))
+        if np.any(raw[[6, 13]] != target[[6, 13]]):
+            raise ValueError("gripper target exceeds [0, 0.1] m")
+        for offset in (0, 7):
+            if abs(target[offset+4]) > np.pi/2 + 1e-9 or np.any(np.abs(target[[offset+3, offset+5]]) > np.pi + 1e-9):
+                raise ValueError("move_p RPY must use principal Euler angles")
+        with self._lock:
+            self._target = target.copy()
+            self._armed = True
+
+    def stats(self):
+        result = super().stats()
+        result["motion_space"] = "pose"
+        result["command_units"] = "m,m,m,rad,rad,rad,m per arm"
+        for key in ("max_tracking_error_rad", "max_actual_step_rad", "max_actual_velocity_rad_s", "velocity_sign_reversals"):
+            result.pop(key, None)
+        return result
+
+    def _run(self):
+        from easy_embodied_deploy.pose_actions import matrix_rotvec, matrix_rpy, rotvec_matrix, rpy_matrix
+        deadline = time.monotonic()
+        try:
+            while not self._stop.is_set():
+                with self._lock:
+                    desired, previous = self._target.copy(), self._filtered_target.copy()
+                    hz, tau, armed = self._control_hz, self._smoothing_time_constant_s, self._armed
+                if armed:
+                    alpha = 1.0 if tau == 0 else -math.expm1(-1.0/(hz*tau))
+                    target = previous + alpha*(desired-previous)
+                    for offset in (0, 7):
+                        current, future = rpy_matrix(previous[offset+3:offset+6]), rpy_matrix(desired[offset+3:offset+6])
+                        target[offset+3:offset+6] = matrix_rpy(rotvec_matrix(alpha*matrix_rotvec(future @ current.T)) @ current)
+                    now = time.monotonic()
+                    for side, offset in (("left", 0), ("right", 7)):
+                        pair = self.robot.pairs[side]
+                        pair.follower.move_p(target[offset:offset+6].tolist())
+                        pair.follower_gripper.move_gripper_m(float(target[offset+6]), force=pair.gripper_force)
+                    with self._lock:
+                        self._filtered_target = target
+                        self._cycles_sent += 1
+                        self._max_command_step = np.maximum(self._max_command_step, np.abs(target-previous))
+                        if self._send_started_at is None:
+                            self._send_started_at = now
+                        self._last_send_at = now
+                deadline = max(deadline+1/hz, time.monotonic())
+                self._stop.wait(max(0.0, deadline-time.monotonic()))
+        except BaseException as exc:
+            if not self._stop.is_set():
+                self._error = exc
+
+
 def make_reply(request: dict[str, Any], *, ok: bool, **payload: Any) -> dict[str, Any]:
     return {
         "protocol": PROTOCOL_VERSION,
@@ -369,6 +452,8 @@ def _serve(endpoint: str) -> None:
     watchdog_timeout_s = DEFAULT_WATCHDOG_TIMEOUT_S
     last_contact: float | None = None
     sequence = 0
+    motion_space = "joint"
+    motion_configured = False
 
     try:
         socket.bind(endpoint)
@@ -410,6 +495,14 @@ def _serve(endpoint: str) -> None:
                     command_loop.stop()
                     command_loop = None
                 print("Returning followers and grippers to ZERO...", flush=True)
+                if motion_space == "pose":
+                    # Begin the same joint homing target before its existing
+                    # status checker runs. A rejected move_p status otherwise
+                    # survives until the next CAN feedback frame.
+                    for pair in robot.pairs.values():
+                        pair.follower.set_speed_percent(pair.home_speed)
+                        pair.follower.move_j(list(ZERO_JOINTS))
+                    time.sleep(.1)
                 home_followers(robot)
 
             # Registered after robot.close(), so homing runs before CAN disconnect.
@@ -463,14 +556,40 @@ def _serve(endpoint: str) -> None:
                         control_hz = float(request["control_hz"])
                         smoothing_tau = float(request["smoothing_time_constant_s"])
                         watchdog = float(request["watchdog_timeout_s"])
+                        if not 1 <= control_hz <= 200:
+                            raise ValueError("control_hz must be in [1, 200]")
+                        if not 0 <= smoothing_tau <= 2:
+                            raise ValueError("smoothing_time_constant_s must be in [0, 2]")
                         if not math.isfinite(watchdog) or watchdog < 5:
                             raise ValueError("watchdog_timeout_s must be at least 5 seconds")
+                        selected_space = request.get("motion_space", "joint")
+                        if selected_space not in ("joint", "pose"):
+                            raise ValueError("motion_space must be joint or pose")
+                        pose_margin = float(request.get("pose_start_margin_deg", 2.0))
+                        if selected_space == "pose" and not 0 <= pose_margin <= 5:
+                            raise ValueError("pose_start_margin_deg must be in [0,5]")
+                        if selected_space != motion_space:
+                            if motion_configured:
+                                raise ValueError("restart bridge before changing motion space")
+                            command_loop.stop()
+                            prepare_pose_followers(robot, pose_margin)
+                            state, poses = read_state(robot, include_pose=True)
+                            initial = np.r_[poses[:6], state[6], poses[6:], state[13]]
+                            command_loop = PoseCommandLoop(robot, initial)
+                            motion_space = selected_space
                         command_loop.configure(
                             control_hz=control_hz,
                             smoothing_time_constant_s=smoothing_tau,
                         )
                         watchdog_timeout_s = watchdog
+                        motion_configured = True
                         payload = {
+                            "motion_space": motion_space,
+                            "pose_start_margin_deg": float(request.get("pose_start_margin_deg", 2.0)) if motion_space == "pose" else 0.0,
+                            "pose_units": "m,m,m,rad,rad,rad",
+                            "cameras": {name: {"serial": camera.serial, "sensor": camera._sensor_type.name,
+                                               "width": camera.width, "height": camera.height}
+                                        for name, camera in cameras.items()},
                             "control_hz": control_hz,
                             "smoothing_time_constant_s": smoothing_tau,
                             "watchdog_timeout_s": watchdog_timeout_s,
@@ -480,10 +599,15 @@ def _serve(endpoint: str) -> None:
                             "gripper_units": "m",
                         }
                     elif operation == "observe":
-                        state = read_state(robot)
+                        if motion_space == "pose":
+                            state, poses = read_state(robot, include_pose=True)
+                        else:
+                            state = read_state(robot)
                         observation: dict[str, Any] = {
                             "observation.state": state
                         }
+                        if motion_space == "pose":
+                            observation["observation.flange_pose"] = poses
                         for name, camera in cameras.items():
                             observation[f"observation.images.{name}"] = camera.read().rgb
                         sequence += 1
@@ -491,7 +615,9 @@ def _serve(endpoint: str) -> None:
                         # reply. No extra SDK reads or telemetry heartbeat RPCs.
                         payload = {"observation": observation, "sequence": sequence,
                                    "command_loop": command_loop.stats()}
-                    elif operation == "act":
+                    elif operation in ("act", "act_pose"):
+                        if (operation == "act_pose") != (motion_space == "pose"):
+                            raise ValueError("action RPC does not match configured motion_space")
                         command_loop.set_target(request.get("target"))
                         payload = {"accepted": True}
                     elif operation == "status":

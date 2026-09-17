@@ -98,8 +98,11 @@
                 <select id="action_mode" name="action_mode">
                   <option value="delta_joint">Delta joint</option>
                   <option value="absolute_joint">Absolute joint</option>
+                  <option value="absolute_base_pose">绝对位姿 · 各自 Base</option>
+                  <option value="camera_delta_wrist">位姿 Delta · 各自腕部相机</option>
+                  <option value="camera_delta_global">位姿 Delta · 全局相机</option>
                 </select>
-                <small>必须与 processing.json 一致</small>
+                <small>必须与数据集动作契约一致。位姿 state 仍为 14 维关节；action 使用三维旋转向量，标定随数据和检查点保存。</small>
               </label>
               <label class="field wide optional-field">
                 <span>本地 Repo ID <b title="仅作为 LeRobot 本地数据集标识，不会上传">?</b></span>

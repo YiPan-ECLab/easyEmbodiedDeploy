@@ -1,5 +1,7 @@
 # 各模块改动清单
 
+最新位姿扩展见文末“2026-09-17：位姿动作与相对关节修复”及 [验收记录](POSE_ACTION_ACCEPTANCE.md)。前面按日期保留历史改动，当时的“尚未加入”或“未修改”只描述对应轮次。
+
 比较基准为改造前的 `e4145bf`。本清单描述最终保留的改动，不把已撤回的硬件改动列为优化。
 硬件回归的原因、撤回范围和真实 A/B 结果见 [Recorder 硬件复测](RECORDER_HARDWARE_RECHECK.md)。
 
@@ -154,3 +156,24 @@
 本次未修改 `src/`、第三方 SDK 或 `scripts/` 下的 Python 后端。四个训练 / 部署页面的 JavaScript 仅变更图表颜色；七个原模块的 DOM ID 保持一致。详细测试证据和实物验收边界见 [界面与内参验收](UI_INTRINSICS_ACCEPTANCE.md)。
 
 退出示教后的补测已覆盖原桥保持 / J6 小步响应、两套部署真实相机推理和退出回零、采集页 Enter 真机流程及十模块布局。补测期间仅修正 `tests/browser_theme.py` 的模块冷启动等待，未修改产品或硬件控制代码；0.5° 请求未见响应及 2° 测试的实际误差均如实记入验收文档。
+
+## 2026-09-17：位姿动作与相对关节修复
+
+基线 `a5615613`。本轮明确 state 始终为 14D 从臂关节 / 夹爪反馈，新增位姿 action 为每臂 xyz3 + rotvec3 + 绝对夹爪1；覆盖转换、训练和部署。
+
+| 模块 | 本轮具体改动 |
+| --- | --- |
+| 数据转换 | 新增 absolute_base_pose、camera_delta_wrist、camera_delta_global；按各自 base 反馈生成 t+1…t+50 目标，camera delta 冻结当前相机方向；保存独立 pose sidecar、标定快照 / SHA256 / mount_id 和完整有效 chunk 统计；尾部保留从臂收敛，拒绝跨异常实际时间间隔；页面新增模式和标定字段，结果模式 / FPS 使用服务端记录 |
+| 数据质量分析 | 原采样过大 / 过小、首尾静止与图像检查继续保留；新增位姿单位 / 非有限值、几何旋转跳变、平移 / 旋转速度、近静止边界、关节运动但 pose 冻结、rotvec ±π 分支提示；核对源数据、未来目标还原、标定契约和有效 chunk 统计；删除 episode 后重排 sidecar 并重算统计；网页阈值可编辑、WARN 行与关节标签诊断摘要可见 |
+| LeRobot Trainer | 新位姿入口生成固定锚点 chunk，state 不拼 pose；位姿和 delta_joint 对真实 14D action 的有效帧计算 loss，剔除尾部 padding 与 RTC 已知前缀；支持原正常 / trained RTC、LoRA / full 和归一化选项；修复 spawn worker 类序列化、恢复时动作入口选择、新检查点契约迁移 |
+| OpenPI Trainer | 原 v3 适配器新增 pose chunk 和有效帧掩码；保持网络参数 / 采样结构，位姿与 delta_joint 用有效 14D loss；保存完整 chunk 归一化资产；修复有效 step 0 检查点被误认为空恢复目录、新检查点契约迁移，以及两版 LeRobot 视频导入兼容 |
+| LeRobot Deployer | 新增三种位姿模式及离线数据 CLI；解码完整预测段后再排队，camera RTC 前缀按新观测重新编码；修复相对关节裁剪丢位移和锚点 / 前缀不同步；guided 路径允许原生局部梯度；页面显示安装版本、位姿起始偏移与 move_p 模式 |
+| OpenPI Deployer | 新增三种位姿、标定 / FPS / 实际相机配置一致性检查；与 LeRobot 使用同一完整目标解码规则；RTC 在锁内取得一致的观测 / 指令锚点 / 前缀快照；已有逐 tick 推理耗时、累计断粮与最终汇总在新模式下复测通过 |
+| 共享硬件桥 | 仅新位姿分支复用同次采样中的现有 flange pose；绝对 xyz 与 SO(3) 平滑后调用 SDK move_p，夹爪绝对宽度单独执行；新分支起始 J2 / J3 偏移可配 0…5°、默认 ±2°，规避回零边界的 IK 舍入拒绝；退出切回已有 SDK 关节回零；运动配置参数先校验再执行 |
+| 相机标定 | 导出标记与说明更新为已接入训练；保留出厂视频 profile 内参、可编辑板配置和四项外参求解。补齐矩阵方向、板固定、操作顺序与转换 / 训练 / 部署衔接文档 |
+| DirectoryManager / PiperViewer | 本轮未更改业务逻辑；目录全流程、轨迹页面和响应式布局重新验收 |
+| PiperRecorder / 工作台 | 本轮未改 Recorder、脚踏板阶段或工作台后端；验证四臂回零、预定位、Enter 习惯和十模块 iframe；新功能通过现有模块入口使用 |
+| 公共代码与测试 | 新建独立 action_contract、pose_actions / dataset / conversion / quality、joint_diagnostics、pose_training_torch / jax、target_runtime、checkpoint_runtime、offline_bridge；第三方源码未改；新增几何、训练梯度、有效帧、RTC、恢复迁移与 pose SDK 调用测试 |
+| 文档 | 位姿链路改为实际支持功能；新增关节相对 / 绝对排查、当前验收记录；README 与各模块 README 同步，标定说明包含从导出到部署的步骤 |
+
+已确认的相对关节问题是“先裁剪再积分丢失位移”和“尾部重复增量进入训练”；标签定义仍为相邻主臂命令差。新训练修复需重新训练才生效，不能由短步测试断言任务成功率已提高。详见 [原因与真实数据统计](JOINT_ACTION_AUDIT.md)。

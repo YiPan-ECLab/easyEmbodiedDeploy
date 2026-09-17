@@ -14,7 +14,7 @@ thirdParty/.venvs/lerobot-pi05/bin/python scripts/LerobotDataProcessor/DataProce
 原始 HDF5 → 只选 task phase 并裁掉尾部静止帧 → 内存中降采样 →（可选）action[t+1]-action[t] → LeRobot v3
 ```
 
-PiperRecorder 在任务结束后还会记录 `trajectory_phase=1` 的回零过程。处理器只接受带 `trajectory_phase` 的原始录制，排除这些帧，并按示教主臂的 absolute action 裁掉任务结束至按下回车之间的连续等待帧。从臂可能在真人松手后继续收敛，因此不能把 follower state 是否完全静止作为尾帧判据。这样既不会训练模型等待或执行回零，也不会把 task→home 边界变成一个巨大的增量 action。阶段必须是连续的 task(0) 前缀和可选 home(1) 后缀。
+PiperRecorder 在任务结束后还会记录 `trajectory_phase=1` 的回零过程。处理器只接受带 `trajectory_phase` 的原始录制，排除这些帧，并按示教主臂的 absolute action 裁掉任务结束至按下回车之间的连续等待帧。这项规则保留用于关节模式。位姿模式预测从臂未来位姿，会同时检查命令、从臂 state 与法兰反馈，保留从臂继续收敛的片段。这样既不会训练模型等待或执行回零，也不会把 task→home 边界变成一个巨大的增量 action。阶段必须是连续的 task(0) 前缀和可选 home(1) 后缀。
 
 无界面方式：
 
@@ -38,3 +38,8 @@ thirdParty/.venvs/lerobot-pi05/bin/python \
 * `--validate-output PATH`：只对已有 `PATH`（数据集目录或其父目录）做 CPU 结构、统计量、Piper 限位和视频帧数验收；若路径旁没有 `processing.json`，可再给 `--validate-action-mode absolute_joint|delta_joint`。
 
 处理采用流式方式：每个 HDF5 降采样后立即写入 LeRobot，不在输出目录保留中间 HDF5，因此只生成 `lerobot/` 和 `processing.json`。完成后会自动执行同一套 CPU 验收。LeRobot `finalize()` 负责生成官方统计量，处理器不会重写其 q01/q99 语义。
+
+## 位姿动作与相对关节更新
+
+支持 `absolute_base_pose`、`camera_delta_wrist`、`camera_delta_global`；state 保持左右关节 / 夹爪 14 维，位姿 action 是双臂 xyz / 三维 rotvec / 绝对夹爪 14 维。
+详见 [完整位姿链路](../../docs/POSE_ACTION_DATAFLOW.md)、[标定操作与训练顺序](../../docs/CAMERA_CALIBRATION.md) 和 [相对关节问题排查](../../docs/JOINT_ACTION_AUDIT.md)。位姿数据必须保留 `meta/pose*` 附属文件，并通过本项目训练入口读取。camera delta 部署需确认相机安装版本；绝对 base 位姿不需要标定。

@@ -299,6 +299,7 @@ class AsyncRTCActionEngine:
         self._queue: deque[np.ndarray] = deque()
         self._condition = threading.Condition()
         self._latest_observation: dict[str, Any] | None = None
+        self._target_snapshot = None
         self._requested = False
         self._stopping = False
         self._in_flight = False
@@ -330,6 +331,13 @@ class AsyncRTCActionEngine:
     def get_action(self, observation: dict[str, Any]) -> np.ndarray | None:
         with self._condition:
             self._latest_observation = self._copy_observation(observation)
+            # Freeze observation, command anchor and queued prefix together,
+            # before this tick dispatches its action. Otherwise a delta prefix
+            # would skip that first target but retain its old command anchor.
+            target_snapshot = None
+            if getattr(self.sampler, "absolute_targets", False):
+                target_snapshot = (self._latest_observation,
+                                   tuple(row.copy() for row in self._queue), time.perf_counter())
             action = self._queue.popleft() if self._queue else None
             if (
                 len(self._queue) <= self.settings.queue_threshold
@@ -337,6 +345,7 @@ class AsyncRTCActionEngine:
                 and self._failure is None
             ):
                 self._requested = True
+                self._target_snapshot = target_snapshot
                 self._condition.notify()
             return action
 
@@ -380,6 +389,12 @@ class AsyncRTCActionEngine:
                     if self._queue
                     else None
                 )
+                snapshot_at = None
+                if self._target_snapshot is not None:
+                    observation, queued, snapshot_at = self._target_snapshot
+                    qsize_at_snapshot = len(queued)
+                    previous_actions = np.stack(queued) if queued else None
+                    self._target_snapshot = None
                 self._requested = False
                 self._in_flight = True
             has_previous_actions = previous_actions is not None and len(previous_actions) > 0
@@ -406,6 +421,8 @@ class AsyncRTCActionEngine:
                     prefix_start=inference_delay,
                 )
                 actual_s = self.sampler.latencies[-1]
+                if snapshot_at is not None:
+                    actual_s = time.perf_counter()-snapshot_at
                 actual_frames = max(0, int(math.ceil(actual_s * self.settings.policy_hz)))
                 with self._condition:
                     if self._stopping:
@@ -443,7 +460,7 @@ class AsyncRTCActionEngine:
                         # Keep the old queue and retry after the consumer has
                         # advanced.  Appending an unusable chunk here would
                         # silently violate the train-time RTC contract.
-                        if len(self._queue) <= self.settings.queue_threshold:
+                        if len(self._queue) <= self.settings.queue_threshold and not getattr(self.sampler, "absolute_targets", False):
                             self._requested = True
                             self._condition.notify()
                         continue
@@ -471,7 +488,7 @@ class AsyncRTCActionEngine:
                             "discarded": False,
                         }
                     )
-                    if len(self._queue) <= self.settings.queue_threshold:
+                    if len(self._queue) <= self.settings.queue_threshold and not getattr(self.sampler, "absolute_targets", False):
                         self._requested = True
                         self._condition.notify()
             except BaseException as exc:  # worker failures must reach the control loop

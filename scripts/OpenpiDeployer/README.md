@@ -41,3 +41,8 @@ thirdParty/.venvs/openpi-jax/bin/python -m unittest discover -s scripts/OpenpiDe
 对应 CLI `--offline-dataset-root`，填写后启动流程跳过硬件桥；留空则使用原真机流程。
 `Dry run` 对应 `--dry-run`：推理与目标检查照常进行，但不发送模型动作；使用真机输入时
 硬件桥仍执行原回零和预定位。页面不会接管其他控制台或外部命令启动的硬件桥。
+
+## 位姿动作与相对关节更新
+
+支持 `absolute_base_pose`、`camera_delta_wrist`、`camera_delta_global`；state 保持左右关节 / 夹爪 14 维，位姿 action 是双臂 xyz / 三维 rotvec / 绝对夹爪 14 维。
+详见 [完整位姿链路](../../docs/POSE_ACTION_DATAFLOW.md)、[标定操作与训练顺序](../../docs/CAMERA_CALIBRATION.md) 和 [相对关节问题排查](../../docs/JOINT_ACTION_AUDIT.md)。位姿数据必须保留 `meta/pose*` 附属文件，并通过本项目训练入口读取。camera delta 部署需确认相机安装版本；绝对 base 位姿不需要标定。

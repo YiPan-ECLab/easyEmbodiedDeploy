@@ -95,6 +95,9 @@ def start_analysis(payload: dict) -> int:
             value = float(payload.get(key, default))
             if not math.isfinite(value) or value <= minimum:
                 raise ValueError(f"{key} 必须是大于 {minimum} 的有限数值")
+    from easy_embodied_deploy.pose_quality import PoseThresholds
+    pose_thresholds = PoseThresholds(**{key: float(payload.get("pose_thresholds", {}).get(key, value))
+                                       for key, value in vars(PoseThresholds()).items()})
     with LOCK:
         if STATE["status"] in ("running", "deleting"):
             raise RuntimeError("已有分析任务正在运行")
@@ -131,6 +134,8 @@ def start_analysis(payload: dict) -> int:
                 ])
             elif payload.get("source_dir"):
                 command.extend(["--source-dir", str(payload["source_dir"])])
+            for key, value in vars(pose_thresholds).items():
+                command.extend(["--pose-" + key.replace("_", "-"), str(value)])
             add_event(job_id, f"启动 {kind.upper()} 全量质量分析")
             environment = os.environ.copy()
             environment["CUDA_VISIBLE_DEVICES"] = ""
@@ -309,6 +314,8 @@ def delete_error_episodes(payload: dict) -> dict:
             dataset = LeRobotDataset(repo_id=repo_id, root=root, download_videos=False)
             delete_episodes(dataset, sorted(requested), output_dir=temp_dir, repo_id=repo_id)
             del dataset
+            from easy_embodied_deploy.pose_dataset import copy_retained_episodes
+            copy_retained_episodes(root, temp_dir, requested)
 
             # Validate the generated root without consulting the old manifest.
             processor_dir = PROJECT_ROOT / "scripts" / "LerobotDataProcessor"

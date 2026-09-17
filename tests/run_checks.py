@@ -16,6 +16,12 @@ SUITES = [
     ("piper-home", "tests", "test_runtime_boundaries.py"),
     ("piper-home", "tests", "test_resources_calibration.py"),
     ("lerobot-pi05", "tests", "test_data_pipeline.py"),
+    ("piper-home", "tests", "test_pose_actions.py"),
+    ("piper-home", "tests", "test_pose_runtime.py"),
+    ("lerobot-pi05", "tests", "test_pose_training_torch.py"),
+    ("openpi-jax", "tests", "test_pose_training_jax.py"),
+    ("lerobot-pi05", "tests", "test_pose_pipeline.py"),
+    ("piper-home", "tests", "test_pose_hardware.py"),
 ]
 
 

@@ -15,6 +15,11 @@ jobs:
         run: python -m compileall -q src scripts tests workbench.py
       - name: Test HTTP, resource ownership and process cancellation
         run: python -m unittest discover -s tests -p test_runtime_boundaries.py -v
+      - name: Test pose geometry, RTC anchors and checkpoint contracts
+        run: |
+          python -m pip install numpy==1.26.4 opencv-python-headless==4.11.0.86
+          python -m unittest discover -s tests -p test_pose_actions.py -v
+          python -m unittest discover -s tests -p test_pose_runtime.py -v
       - name: Parse browser scripts and launch scripts
         run: |
           while IFS= read -r -d '' script; do node --check "$script"; done < <(find web scripts -name '*.js' -not -path '*/vendor/*' -print0)

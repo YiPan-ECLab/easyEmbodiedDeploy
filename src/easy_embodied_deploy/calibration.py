@@ -420,7 +420,7 @@ class CalibrationStore:
                 created_at=time.time(),
                 convention="T_A_B maps B to A; meters; rotation matrices stored by rows",
                 status="operator_exported_not_hardware_certified",
-                training_integration=False,
+                training_integration=True,
                 missing_jobs=[
                     j
                     for j in JOBS

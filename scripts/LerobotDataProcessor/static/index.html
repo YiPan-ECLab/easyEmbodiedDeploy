@@ -49,7 +49,12 @@
               <div class="field wide"><span>动作表示</span><div class="segmented" id="actionMode">
                 <label><input type="radio" name="actionMode" value="absolute_joint"><b>Absolute</b><small>绝对关节目标</small></label>
                 <label><input type="radio" name="actionMode" value="delta_joint"><b>Delta</b><small>降采样后 t+1 − t</small></label>
-              </div></div>
+                <label><input type="radio" name="actionMode" value="absolute_base_pose"><b>Base Pose</b><small>各自 Base 的绝对位姿</small></label>
+                <label><input type="radio" name="actionMode" value="camera_delta_wrist"><b>Wrist Delta</b><small>各自腕部相机下的位姿变化</small></label>
+                <label><input type="radio" name="actionMode" value="camera_delta_global"><b>Global Delta</b><small>全局相机下的双臂位姿变化</small></label>
+              </div><small>位姿模式：state 仍为 14 维关节反馈；action 为 xyz + 三维旋转向量 + 绝对夹爪，每臂 7 维。</small></div>
+              <label class="field wide" data-camera-pose hidden><span>标定包路径</span><input id="calibrationBundle" placeholder="outputs/calibration/…/calibration_bundle.json" spellcheck="false"></label>
+              <label class="field wide" data-camera-pose hidden><span>采集时相机安装版本</span><input id="calibrationMountId" placeholder="与标定包的 mount_id 一致" spellcheck="false"><small>仅 camera delta 需要标定。每段 50 步共用观测时刻锚点，禁止压缩时间空档。</small></label>
               <div class="field wide"><span>时间空档策略</span><div class="segmented compact" id="gapPolicy">
                 <label><input type="radio" name="gapPolicy" value="reject"><b>严格拒绝</b><small>推荐用于最终数据</small></label>
                 <label><input type="radio" name="gapPolicy" value="compact"><b>压缩空档</b><small>保留并生成警告</small></label>

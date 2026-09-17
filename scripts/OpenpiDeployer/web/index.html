@@ -112,9 +112,14 @@
                 <select id="action_mode" name="action_mode">
                   <option value="delta_joint">Delta Joint</option>
                   <option value="absolute_joint">Absolute Joint</option>
+                  <option value="absolute_base_pose">绝对位姿 · 各自 Base</option>
+                  <option value="camera_delta_wrist">位姿 Delta · 各自腕部相机</option>
+                  <option value="camera_delta_global">位姿 Delta · 全局相机</option>
                 </select>
                 <small>必须与 checkpoint 的训练动作语义一致</small>
               </label>
+              <label class="field" data-camera-pose><span>相机安装版本（camera delta）</span><input id="calibration_mount_id" name="calibration_mount_id" placeholder="与训练使用的 mount_id 一致"></label>
+              <label class="field" data-pose><span>位姿初始关节偏移（度）</span><input id="pose_start_margin_deg" name="pose_start_margin_deg" type="number" min="0" max="5" step="0.5" value="2"><small>J6 预定位后 J2=+偏移、J3=−偏移，避开零位 IK 边界。仅位姿模式使用，0 表示关闭。</small></label>
               <label class="field">
                 <span>推理显卡</span>
                 <select id="device" name="device">
@@ -160,7 +165,7 @@
               <label class="field featured-field">
                 <span>Control Hz <b title="向每个 follower 发送 move_js 目标的频率">?</b></span>
                 <div class="number-control"><input id="control_hz" name="control_hz" type="number" min="1" max="200" step="1"><i>Hz</i></div>
-                <small>move_js 实际发送频率</small>
+                <small><span data-motion-label>move_js</span> 实际发送频率</small>
               </label>
               <label class="field featured-field">
                 <span>平滑时间常数 <b title="绝对目标一阶低通，0 表示关闭">?</b></span>
@@ -172,7 +177,7 @@
                 <i>→</i>
                 <div><strong>绝对目标</strong><span>转换 · 限位 · 低通</span></div>
                 <i>→</i>
-                <div><strong id="flowControl">30 Hz</strong><span>move_js × 2</span></div>
+                <div><strong id="flowControl">30 Hz</strong><span><span data-motion-label>move_js</span> × 2</span></div>
               </div>
             </div>
 
@@ -315,7 +320,7 @@
             <span>运行饿死 <strong id="starvedTicks">—</strong><small id="starvedMeta">预填充 — · 总计 —</small></span>
             <span>实测控制 <strong id="achievedHz">—</strong></span>
           </div>
-          <p class="chart-help">推理中位数：最近最多 1000 个 chunk 的模型推理耗时，排除 warmup；运行饿死：启动预填充完成后没有可执行动作的累计 tick；实测控制：桥接 move_js 实际发送频率，随观测更新。离线部署无此频率。</p>
+          <p class="chart-help">推理中位数：最近最多 1000 个 chunk 的模型推理耗时，排除 warmup；运行饿死：启动预填充完成后没有可执行动作的累计 tick；实测控制：桥接 <span data-motion-label>move_js</span> 实际发送频率，随观测更新。离线部署无此频率。</p>
           <p class="chart-help" id="diagnosticsPath">启动部署后自动创建本次运行记录</p>
         </article>
       </section>

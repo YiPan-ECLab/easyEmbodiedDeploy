@@ -45,7 +45,7 @@ python3 workbench.py
 
 ## 验证
 
-新增模块的使用和约定见 [相机标定说明](docs/CAMERA_CALIBRATION.md) 与 [位姿动作数据流方案](docs/POSE_ACTION_DATAFLOW.md)。标定板默认 **4×6 内角点、53.5 mm**，可在网页修改；实际为 5×7 格。按最新要求暂缓位姿转换、训练和部署扩展，本轮只更新简明链路文档。绝对位姿使用左右自身 base，不依赖相机标定。
+新增模块的使用和约定见 [相机标定说明](docs/CAMERA_CALIBRATION.md) 与 [位姿动作数据流](docs/POSE_ACTION_DATAFLOW.md)。标定板默认 **4×6 内角点、53.5 mm**，可在网页修改；实际为 5×7 格。位姿转换、两套训练和部署现支持各自 base 绝对位姿、各自腕部 camera delta 和全局 camera delta；state 固定复用 14 维关节反馈，action 为 14 维 xyz / 三维旋转向量 / 夹爪。绝对位姿使用左右自身 base，不依赖相机标定。
 
 标定页面默认直接使用实际 RGB 视频配置的出厂内参；打开相机即可查看 K、畸变和来源，新建记录时自动保存，无需点击“应用内参”。“相机 → 左法兰”是 `T_left_flange_left_camera`，操作顺序和 base / 法兰区别见上述标定说明。
 
@@ -72,8 +72,8 @@ uv run --no-project --with playwright python tests/browser_theme.py --url http:/
 
 具体修复、验证结果和剩余现场验收见 [仓库审查记录](docs/REPOSITORY_REVIEW.md)；各模块具体改动见 [模块改动清单](docs/MODULE_CHANGES.md)。
 
-新增目录管理、相机标定与 OpenPI 指标修复的 **117 项回归、浏览器和真机只读测试**详见 [本轮验收记录](docs/RESOURCES_CALIBRATION_ACCEPTANCE.md)。
+2026-09-16 目录管理、相机标定与 OpenPI 指标修复的 **117 项回归、浏览器和真机只读测试**详见 [当日验收记录](docs/RESOURCES_CALIBRATION_ACCEPTANCE.md)。
 
-最新的统一浅色界面、出厂内参显示及回归结果见 [界面与内参验收](docs/UI_INTRINSICS_ACCEPTANCE.md)。本轮仅调整前端与文档，原后端接口、数据处理、训练和硬件控制代码均未改动。
+此前的统一界面与出厂内参工作见 [界面与内参验收](docs/UI_INTRINSICS_ACCEPTANCE.md)。最新位姿扩展、相对关节修复、GPU / 网页 / 真机测试见 [位姿扩展验收](docs/POSE_ACTION_ACCEPTANCE.md)；使用前按 [标定说明](docs/CAMERA_CALIBRATION.md) 和 [位姿数据链路](docs/POSE_ACTION_DATAFLOW.md) 配置所选动作模式。
 
 Git 仅保存源码与环境锁。`datasets/`、`models/`、虚拟环境、测试产生的数据和权重均不会上传，需要在目标机器上单独复制或重新生成。

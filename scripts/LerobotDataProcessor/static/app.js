@@ -57,6 +57,8 @@ function formPayload() {
     source_fps: $("sourceFps").value ? Number($("sourceFps").value) : null,
     target_fps: Number($("targetFps").value),
     action_mode: checked("actionMode"),
+    calibration_bundle: $("calibrationBundle").value.trim(),
+    calibration_mount_id: $("calibrationMountId").value.trim(),
     gap_policy: checked("gapPolicy"),
     repo_id: $("repoId").value.trim() || null,
     limit: Number($("limit").value || 0),
@@ -69,6 +71,12 @@ function shellQuote(value) {
 
 function updateCommand() {
   const value = formPayload();
+  const cameraPose = value.action_mode.startsWith("camera_delta_");
+  const pose = cameraPose || value.action_mode === "absolute_base_pose";
+  document.querySelectorAll("[data-camera-pose]").forEach(el => { el.hidden = !cameraPose; });
+  const compact = document.querySelector('input[name="gapPolicy"][value="compact"]');
+  compact.disabled = ui.locked || pose;
+  if (pose) { document.querySelector('input[name="gapPolicy"][value="reject"]').checked = true; value.gap_policy = "reject"; }
   const parts = [
     "CUDA_VISIBLE_DEVICES='' thirdParty/.venvs/lerobot-pi05/bin/python \\",
     "  scripts/LerobotDataProcessor/convert_piper_hdf5.py \\",
@@ -78,6 +86,10 @@ function updateCommand() {
   });
   if (value.output_root) parts.push(`  --output-root ${shellQuote(value.output_root)} \\`);
   if (value.repo_id) parts.push(`  --repo-id ${shellQuote(value.repo_id)} \\`);
+  if (cameraPose) {
+    parts.push(`  --calibration-bundle ${shellQuote(value.calibration_bundle)} \\`);
+    parts.push(`  --calibration-mount-id ${shellQuote(value.calibration_mount_id)} \\`);
+  }
   parts.push(`  --task ${shellQuote(value.task)} \\`);
   if (value.source_fps) parts.push(`  --source-fps ${value.source_fps} \\`);
   parts.push(`  --fps ${value.target_fps} --action-mode ${value.action_mode} \\`);
@@ -109,6 +121,7 @@ function setLocked(locked) {
   $("startButton").classList.toggle("hidden", locked);
   $("cancelButton").classList.toggle("hidden", !locked);
   $("cancelButton").disabled = false;
+  updateCommand();
 }
 
 function invalidatePlan() {
@@ -128,7 +141,7 @@ function renderPlan(plan) {
   $("metricInput").textContent = formatNumber(plan.input_frames);
   $("metricInputMeta").textContent = `${formatNumber(plan.files.reduce((sum, file) => sum + file.source_task_frames, 0))} task`;
   $("metricOutput").textContent = formatNumber(plan.output_frames);
-  $("metricOutputMeta").textContent = `${formPayload().target_fps} Hz · ${formPayload().action_mode}`;
+  $("metricOutputMeta").textContent = `${plan.target_fps ?? '—'} Hz · ${plan.action_mode ?? '—'}`;
   $("metricQuality").textContent = plan.warnings.length ? "有警告" : "检查通过";
   $("metricQualityMeta").textContent = `${plan.gaps} 个时间空档`;
   $("stepInspect").className = plan.warnings.length ? "active" : "done";

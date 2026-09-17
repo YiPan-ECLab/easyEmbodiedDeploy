@@ -91,6 +91,8 @@ def settings_from(payload: dict) -> Settings:
         repo_id=payload.get("repo_id") or DEFAULT_REPO_ID,
         limit=integer("limit", DEFAULT_LIMIT),
         gap_policy=str(payload.get("gap_policy") or DEFAULT_GAP_POLICY),
+        calibration_bundle=payload.get("calibration_bundle") or None,
+        calibration_mount_id=str(payload.get("calibration_mount_id") or "").strip(),
     )
 
 

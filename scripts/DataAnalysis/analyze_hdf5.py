@@ -14,6 +14,9 @@ import h5py
 import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from easy_embodied_deploy.joint_diagnostics import joint_label_metrics
+from easy_embodied_deploy.pose_quality import PoseThresholds, analyze_raw_pose
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 JOINT_LIMITS = np.asarray(
     [
@@ -93,7 +96,7 @@ def range_errors(values: np.ndarray, label: str) -> list[str]:
     return errors
 
 
-def analyze_file(path: Path, expected_fps: float, gap_factor: float) -> dict[str, Any]:
+def analyze_file(path: Path, expected_fps: float, gap_factor: float, pose_thresholds=None) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
     metrics: dict[str, Any] = {"file": path.name}
@@ -172,6 +175,8 @@ def analyze_file(path: Path, expected_fps: float, gap_factor: float) -> dict[str
 
                 task_actions = actions[task_positions]
                 task_states = states[task_positions]
+                if len(task_states) > 1:
+                    metrics["joint_labels"] = joint_label_metrics(task_actions, task_states)
                 leading_idle = edge_repeat_count(task_actions, task_states, tail=False)
                 trailing_idle = trailing_action_repeat_count(task_actions)
                 baseline = np.asarray(demo.attrs.get("start_baseline", PREPOSITION), dtype=np.float64)
@@ -201,6 +206,13 @@ def analyze_file(path: Path, expected_fps: float, gap_factor: float) -> dict[str
                     warnings.append(
                         f"task 尾部有 {trailing_idle} 个重复示教目标，DataProcessor 将自动裁掉"
                     )
+
+            try:
+                quality = analyze_raw_pose(demo, pose_thresholds)
+                metrics["pose"] = quality
+                warnings.extend(quality["warnings"])
+            except (ValueError, KeyError) as exc:
+                errors.append(f"位姿数据不合法: {exc}")
 
             if "left_actions" in demo and "right_actions" in demo:
                 split = np.concatenate(
@@ -323,12 +335,18 @@ def main() -> int:
         help="fail intervals outside [period/factor, period*factor] (default: 1.5)",
     )
     parser.add_argument("--json", dest="json_path", help="write the full JSON report")
+    for key, value in vars(PoseThresholds()).items():
+        parser.add_argument("--pose-" + key.replace("_", "-"), type=float, default=value)
     args = parser.parse_args()
+    try:
+        pose_thresholds = PoseThresholds(**{key: getattr(args, "pose_"+key) for key in vars(PoseThresholds())})
+    except ValueError as exc:
+        parser.error(str(exc))
     if (not math.isfinite(args.expected_fps) or not math.isfinite(args.gap_factor)
             or args.expected_fps <= 0 or args.gap_factor <= 1):
         parser.error("--expected-fps must be positive and --gap-factor must exceed 1")
     root, files = resolve_files(args.path)
-    results = [analyze_file(path, args.expected_fps, args.gap_factor) for path in files]
+    results = [analyze_file(path, args.expected_fps, args.gap_factor, pose_thresholds) for path in files]
     measured_fps = [item["metrics"].get("measured_fps", 0.0) for item in results]
     summary = {
         "files": len(results),

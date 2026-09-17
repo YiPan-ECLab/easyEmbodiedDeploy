@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -19,6 +20,9 @@ from openpi.shared import normalize
 from openpi.training import config as training_config
 from openpi.training import weight_loaders
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+from easy_embodied_deploy.action_contract import POSE_MODES
 
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 IMAGE_KEYS = tuple(f"observation.images.{name}" for name in CAMERAS)
@@ -72,6 +76,8 @@ class PiperInputs(transforms.DataTransformFn):
             if actions.shape[-1] != 14:
                 raise ValueError(f"Piper actions must have 14 dimensions, got {actions.shape}")
             result["actions"] = actions
+        if "action_valid" in data:
+            result["action_valid"] = np.asarray(data["action_valid"], dtype=bool)
         if "prompt" in data:
             result["prompt"] = data["prompt"]
         return result
@@ -88,6 +94,7 @@ class PiperOutputs(transforms.DataTransformFn):
 class PiperDataConfig(training_config.DataConfigFactory):
     default_prompt: str | None = None
     normalization_mode: str = "quantiles"
+    pose_actions: bool = False
 
     def create(self, assets_dirs: Path, model_config) -> training_config.DataConfig:
         if self.normalization_mode not in {"quantiles", "min_max", "mean_std"}:
@@ -105,6 +112,7 @@ class PiperDataConfig(training_config.DataConfigFactory):
                         "state": "observation.state",
                         "actions": "action",
                         "prompt": "task",
+                        **({"action_valid": "action_valid"} if self.pose_actions else {}),
                     }
                 )
             ]
@@ -147,6 +155,8 @@ def asset_id(repo_id: str, normalization_mode: str) -> str:
 def write_norm_stats(dataset_root: str | Path, output_parent: str | Path, repo_id: str, mode: str) -> tuple[Path, str]:
     root = Path(dataset_root).resolve()
     source = json.loads((root / "meta/stats.json").read_text(encoding="utf-8"))
+    from easy_embodied_deploy.pose_dataset import training_stats
+    source = training_stats(root, source)
     selected: dict[str, normalize.NormStats] = {}
     for target, source_key in (("state", "observation.state"), ("actions", "action")):
         raw = source[source_key]
@@ -196,7 +206,11 @@ def _freeze_filter(model: pi0_config.Pi0Config, finetune_mode: str, training_sco
 def _model_config(settings: dict[str, Any]) -> pi0_config.Pi0Config:
     finetune_mode = str(settings["finetune_mode"])
     is_lora = finetune_mode == "lora"
-    return pi0_config.Pi0Config(
+    config_class = pi0_config.Pi0Config
+    if settings["action_mode"] in (*POSE_MODES, "delta_joint"):
+        from easy_embodied_deploy.pose_training_jax import PosePi0Config
+        config_class = PosePi0Config
+    return config_class(
         dtype=str(settings["dtype"]),
         paligemma_variant="gemma_2b_lora" if is_lora else "gemma_2b",
         action_expert_variant="gemma_300m_lora" if is_lora else "gemma_300m",
@@ -221,6 +235,7 @@ def build_train_config(settings: dict[str, Any], *, resume: bool = False) -> Pip
     pretrained = str(settings["pretrained"])
     params_path = str(Path(pretrained) / "params") if not pretrained.startswith(("gs://", "hf://")) and (Path(pretrained) / "params").is_dir() else pretrained
     data = PiperDataConfig(
+        pose_actions=settings["action_mode"] in (*POSE_MODES, "delta_joint"),
         repo_id=str(settings["repo_id"]),
         assets=training_config.AssetsConfig(assets_dir=str(assets_parent), asset_id=identifier),
         default_prompt=str(settings.get("task", "") or "") or None,
@@ -267,6 +282,7 @@ def build_inference_config(settings: dict[str, Any], checkpoint_dir: str | Path)
     model = _model_config(settings)
     identifier = asset_id(str(settings["repo_id"]), str(settings["normalization_mode"]))
     data = PiperDataConfig(
+        pose_actions=settings["action_mode"] in (*POSE_MODES, "delta_joint"),
         repo_id=str(settings["repo_id"]),
         assets=training_config.AssetsConfig(
             assets_dir=str(checkpoint / "assets"),

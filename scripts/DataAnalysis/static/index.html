@@ -34,6 +34,13 @@
             <label class="field"><span>显著间隔系数</span><input id="gapFactor" type="number" min="1.01" step="0.1"></label>
           </div>
           <label id="sourceField" class="field hidden"><span>源 HDF5 目录 <small>留空从 processing.json 读取</small></span><input id="sourceDir" spellcheck="false"></label>
+          <details><summary>位姿检测阈值（只提示，不自动删除）</summary>
+            <div class="option-grid">
+              <label class="field"><span>平移速度上限 m/s</span><input id="poseSpeed" type="number" min="0.001" step="0.1" value="1"></label>
+              <label class="field"><span>旋转速度上限 rad/s</span><input id="poseAngular" type="number" min="0.001" step="0.1" value="6"></label>
+              <label class="field"><span>近静止平移 m</span><input id="poseIdleM" type="number" min="0.000001" step="0.0001" value="0.0001"></label>
+              <label class="field"><span>近静止旋转 rad</span><input id="poseIdleRad" type="number" min="0.000001" step="0.001" value="0.001"></label>
+            </div></details>
           <div class="actions">
             <button id="start" class="primary" type="button"><span>▶</span>开始全面检查</button>
             <button id="cancel" class="danger hidden" type="button"><span>■</span>停止检查</button>
@@ -46,10 +53,10 @@
           <ul id="gateList">
             <li><i></i><span><b>结构与语义</b><small>Schema、轴序、单位、动作模式</small></span></li>
             <li><i></i><span><b>时序完整性</b><small>采样频率、相邻间隔、索引连续</small></span></li>
-            <li><i></i><span><b>动作有效性</b><small>Piper 限位、NaN/Inf、delta 重算</small></span></li>
+            <li><i></i><span><b>动作有效性</b><small>限位、NaN/Inf、位姿速度、反馈冻结、旋转分支</small></span></li>
             <li><i></i><span><b>阶段边界</b><small>首部接管、尾部静止、home 排除</small></span></li>
             <li><i></i><span><b>视觉数据</b><small>三路相机、同步、尺寸与视频帧数</small></span></li>
-            <li><i></i><span><b>统计量</b><small>count、均值、方差与分位数顺序</small></span></li>
+            <li><i></i><span><b>转换与统计</b><small>源帧核对、位姿还原、有效 chunk 统计与标定快照</small></span></li>
           </ul>
           <div class="progress"><i id="progress"></i></div>
           <div class="run-status"><span id="runMessage">等待开始</span><b id="elapsed">—</b></div>
@@ -59,6 +66,7 @@
       <section id="report" class="report hidden">
         <div class="report-head"><div><p>QUALITY REPORT</p><h2 id="reportTitle">分析结果</h2><small id="reportPath"></small></div><div class="report-actions"><button id="deleteGapEpisodes" class="danger hidden" type="button">删除物理间隔异常 Episode</button><button id="download" type="button">↓ 导出 JSON</button></div></div>
         <div id="sourceSummary" class="source-summary hidden"></div>
+        <div id="jointSummary" class="messages hidden"></div>
         <div id="messages" class="messages hidden"></div>
         <div class="table-tools"><input id="search" type="search" placeholder="筛选文件或 episode"><label><input id="issues" type="checkbox">只看问题</label></div>
         <div class="table-wrap"><table><thead id="tableHead"></thead><tbody id="tableBody"></tbody></table></div>

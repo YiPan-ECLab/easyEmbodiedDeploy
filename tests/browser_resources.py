@@ -163,7 +163,7 @@ print(json.dumps({'id':s['id']}))
                 args.url + "/modules/calibration/" + href
             )
             bundle = await response.json()
-            assert bundle["training_integration"] is False
+            assert bundle["training_integration"] is True
             assert len(bundle["missing_jobs"]) == 3
             await page.screenshot(
                 path=str(args.screenshots / "calibration.png"), full_page=True

@@ -98,12 +98,16 @@ class PiperBridge:
         control_hz: float,
         smoothing_time_constant_s: float,
         watchdog_timeout_s: float,
+        motion_space: str = "joint",
+        pose_start_margin_deg: float = 2.0,
     ) -> dict[str, Any]:
         return self._request(
             "configure",
             control_hz=float(control_hz),
             smoothing_time_constant_s=float(smoothing_time_constant_s),
             watchdog_timeout_s=float(watchdog_timeout_s),
+            motion_space=motion_space,
+            pose_start_margin_deg=float(pose_start_margin_deg),
         )
 
     def status(self) -> dict[str, Any]:
@@ -128,6 +132,12 @@ class PiperBridge:
             self._request("stop")
         finally:
             self.close()
+
+    def pose_action(self, target):
+        values = np.asarray(target, dtype=np.float64)
+        if values.shape != (14,) or not np.isfinite(values).all():
+            raise ValueError("Piper pose target must contain 14 finite values")
+        return self._request("act_pose", target=values.tolist())
 
     def close(self) -> None:
         if self._socket is not None:

@@ -9,6 +9,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -18,6 +19,8 @@ from typing import Any
 
 MODULE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = MODULE_DIR.parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from easy_embodied_deploy.action_contract import ACTION_MODES, POSE_MODES, action_axes, read_pose_contract
 VENV_PYTHON = PROJECT_ROOT / "thirdParty/.venvs/lerobot-pi05/bin/python"
 LEROBOT_TRAIN = PROJECT_ROOT / "thirdParty/.venvs/lerobot-pi05/bin/lerobot-train"
 DEFAULT_PRETRAINED = PROJECT_ROOT / "models/base_models/pi05_base"
@@ -219,7 +222,7 @@ def config_from_mapping(raw: dict[str, Any], *, check_output: bool = True) -> Tr
     rtc_mode = str(raw.get("rtc_mode", "normal"))
     dtype = str(raw.get("dtype", "bfloat16"))
     wandb_mode = str(raw.get("wandb_mode", "online"))
-    if action_mode not in {"delta_joint", "absolute_joint"}:
+    if action_mode not in ACTION_MODES:
         raise TrainerConfigError("动作表示无效")
     if normalization_mode not in NORMALIZATION_MODES:
         raise TrainerConfigError("归一化模式无效")
@@ -343,6 +346,22 @@ def validate_dataset(
     except (OSError, ValueError) as exc:
         raise TrainerConfigError(f"数据集元数据无法读取：{exc}") from exc
 
+    try:
+        pose_contract = read_pose_contract(root, required=action_mode in POSE_MODES)
+        if pose_contract:
+            if pose_contract["action_mode"] != action_mode:
+                raise TrainerConfigError("位姿契约与选择的动作模式不一致")
+            from easy_embodied_deploy.pose_dataset import PoseDataset, training_stats
+            pose_dataset = PoseDataset(root)
+            if pose_dataset.rows != int(info.get("total_frames", 0)):
+                raise TrainerConfigError("位姿 sidecar 帧数不一致")
+            if len(pose_dataset.episodes) != int(info.get("total_episodes", 0)) or pose_contract["fps"] != info.get("fps"):
+                raise TrainerConfigError("位姿 sidecar 的 episode 数或 FPS 与数据集不一致")
+            for episode_index in range(len(pose_dataset.episodes)):
+                pose_dataset.episode(episode_index)
+            stats = training_stats(root, stats)
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        raise TrainerConfigError(f"位姿数据契约不合法：{exc}") from exc
     features = info.get("features")
     if not isinstance(features, dict):
         raise TrainerConfigError("数据集 info.json 缺少 features")
@@ -355,7 +374,7 @@ def validate_dataset(
         if feature.get("shape") != [14] or feature.get("dtype") != "float32":
             raise TrainerConfigError(f"{key} 必须是 float32[14]，实际为 {feature}")
         axes = _feature_axes(feature)
-        if axes != AXES:
+        if axes != (tuple(action_axes(action_mode)) if key == "action" else AXES):
             raise TrainerConfigError(f"{key} 轴顺序与双臂 Piper 不一致：{axes}")
     for key in IMAGE_KEYS:
         feature = features[key]
@@ -428,11 +447,13 @@ def validate_dataset(
         "fps": fps,
         "episodes": episodes,
         "frames": frames,
-        "action_mode": declared_action_mode,
+        "action_mode": declared_action_mode or action_mode,
+        "pose_contract": pose_contract,
         "normalization_mode": normalization_mode,
         "sample_checked": decode_sample,
         "cameras": list(CAMERAS),
         "axes": list(AXES),
+        "action_axes": action_axes(action_mode),
     }
 
 
@@ -485,9 +506,18 @@ def _bool_arg(value: bool) -> str:
 
 
 def build_command(config: TrainingConfig) -> list[str]:
+    mode = config.action_mode
+    if config.resume_config is not None:
+        saved = json.loads(config.resume_config.read_text())
+        saved_root = saved.get("dataset", {}).get("root")
+        if saved_root:
+            mode = validation_contract(config)[2]
+    pose_entry = mode in (*POSE_MODES, "delta_joint")
+    entrypoint = ([str(VENV_PYTHON), str(MODULE_DIR / "train_pose.py")]
+                  if pose_entry else [str(LEROBOT_TRAIN)])
     if config.resume_config is not None:
         command = [
-            str(LEROBOT_TRAIN),
+            *entrypoint,
             f"--config_path={config.resume_config}",
             "--resume=true",
             f"--policy.device={config.device}",
@@ -503,7 +533,7 @@ def build_command(config: TrainingConfig) -> list[str]:
         if config.finetune_mode == "lora":
             freeze_vision, train_expert_only = True, True
         command = [
-            str(LEROBOT_TRAIN),
+            *entrypoint,
             f"--dataset.repo_id={config.repo_id}",
             f"--dataset.root={cli_path(config.dataset_root)}",
             "--policy.type=pi05",
@@ -556,7 +586,7 @@ def build_command(config: TrainingConfig) -> list[str]:
             "torch.distributed.run",
             "--standalone",
             f"--nproc_per_node={len(config.gpu_ids)}",
-            *command,
+            *(command[1:] if pose_entry else command),
         ]
     return command
 
@@ -665,6 +695,15 @@ def write_training_manifest(
     config: TrainingConfig, report: dict[str, Any], command: list[str], *, status: str = "completed"
 ) -> None:
     if config.resume_config is not None:
+        from easy_embodied_deploy.checkpoint_runtime import copy_resume_manifest
+        saved = json.loads(config.resume_config.read_text(encoding="utf-8"))
+        output = resolve_path(saved["output_dir"])
+        source = config.resume_config.parent / "training_manifest.json"
+        if not source.is_file():
+            source = output / "training_manifest.json"
+        copy_resume_manifest(source, output, output.glob("checkpoints/*/pretrained_model"),
+                             status=status, command=command, pose_contract=report.get("pose_contract"),
+                             steps=saved.get("steps"))
         return
     manifest = {
         "schema_version": 2,
@@ -674,6 +713,7 @@ def write_training_manifest(
         "trainer": "LerobotTrainer",
         "config": config_for_json(config),
         "dataset": report,
+        "pose_contract": report.get("pose_contract"),
         "command": command,
         "normalization_source": "checkpoint policy processor state",
     }
@@ -693,7 +733,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pretrained", default=str(DEFAULT_PRETRAINED))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--job-name", default="pi05_piper")
-    parser.add_argument("--action-mode", choices=("delta_joint", "absolute_joint"), default="delta_joint")
+    parser.add_argument("--action-mode", choices=ACTION_MODES, default="delta_joint")
     parser.add_argument("--normalization-mode", choices=tuple(NORMALIZATION_MODES), default="quantiles")
     parser.add_argument("--finetune-mode", choices=("lora", "full"), default="lora")
     parser.add_argument("--training-scope", choices=tuple(TRAINING_SCOPES), default="expert_only")
@@ -746,6 +786,7 @@ def main() -> int:
     plan = {
         "config": config_for_json(config),
         "dataset": report,
+        "pose_contract": report.get("pose_contract"),
         "command": command,
         "cuda_visible_devices": build_environment(config)["CUDA_VISIBLE_DEVICES"],
     }

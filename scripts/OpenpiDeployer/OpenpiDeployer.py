@@ -18,6 +18,10 @@ import numpy as np
 
 MODULE_DIR = Path(__file__).resolve().parent
 ROOT = MODULE_DIR.parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from easy_embodied_deploy.action_contract import ACTION_MODES, POSE_MODES
+from easy_embodied_deploy.target_runtime import (COMMAND_KEY, POSE_KEY, TargetSampler, PoseTargetAdapter,
+                                                 checkpoint_pose_contract, validate_live_cameras)
 LEROBOT_DEPLOYER_DIR = ROOT / "scripts/LerobotDeployer"
 OPENPI_TRAINER_DIR = ROOT / "scripts/OpenpiTrainer"
 DEFAULT_CHECKPOINT = ROOT / "models/finetuned_models/openpi_pi05_trainer_run"
@@ -44,7 +48,7 @@ def _parser() -> argparse.ArgumentParser:
         description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
-    parser.add_argument("--action-mode", choices=("delta_joint", "absolute_joint"), default="delta_joint")
+    parser.add_argument("--action-mode", choices=ACTION_MODES, default="delta_joint")
     parser.add_argument("--inference-mode", choices=("sync", "rtc"), default="rtc")
     parser.add_argument("--rtc-mode", choices=("guided", "trained"), default="guided")
     parser.add_argument("--rtc-horizon", type=int, default=20)
@@ -60,6 +64,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-steps", type=int, default=10)
     parser.add_argument("--n-action-steps", type=int, default=0, help="0 uses the training manifest")
     parser.add_argument("--bridge-endpoint", default="tcp://127.0.0.1:6007")
+    parser.add_argument("--calibration-mount-id", default="", help="确认当前安装版本与 checkpoint 标定一致")
     parser.add_argument("--task", default=DEFAULT_TASK)
     parser.add_argument("--device", default="cuda:1", help="cpu, cuda, or a physical GPU such as cuda:1")
     parser.add_argument("--policy-hz", type=float, default=10.0)
@@ -146,6 +151,8 @@ def _offline_observations(root: Path) -> Iterator[dict[str, Any]]:
         observation: dict[str, Any] = {
             "observation.state": np.asarray(sample["observation.state"], dtype=np.float32)
         }
+        if dataset.pose_data is not None:
+            observation[POSE_KEY] = dataset.pose_data.anchor(index % len(dataset))
         for key in IMAGE_KEYS:
             image = np.asarray(sample[key])
             if image.shape == (3, 224, 224):
@@ -232,7 +239,10 @@ class Diagnostics:
 
 def main() -> int:
     parser = _parser()
+    parser.add_argument("--pose-start-margin-deg", type=float, default=2.0, help="仅位姿部署：J2=+偏移，J3=-偏移，范围 0..5 度")
     args = parser.parse_args()
+    if not 0 <= args.pose_start_margin_deg <= 5:
+        parser.error("--pose-start-margin-deg must be in [0,5]")
     _validate_args(parser, args)
 
     from runtime import (
@@ -261,6 +271,8 @@ def main() -> int:
         )
     except OpenpiDeploymentError as exc:
         parser.error(str(exc))
+    pose_contract = checkpoint_pose_contract(checkpoint, args.action_mode,
+                                             mount_id=args.calibration_mount_id, policy_hz=args.policy_hz)
     n_action_steps = args.n_action_steps or int(manifest_config.get("n_action_steps", 10))
     if not 1 <= n_action_steps <= 50:
         parser.error("checkpoint n_action_steps must be in [1, 50]")
@@ -308,6 +320,8 @@ def main() -> int:
         print("Compiling OpenPI sampling paths before hardware connection...", flush=True)
         sampler.warmup()
         print(f"OpenPI sampling warmup finished in {time.perf_counter() - warmup_at:.2f}s", flush=True)
+    if args.action_mode != "absolute_joint":
+        sampler = TargetSampler(sampler, args.action_mode, pose_contract)
     engine = (
         SyncActionEngine(sampler, n_action_steps)
         if rtc is None
@@ -333,7 +347,10 @@ def main() -> int:
                 control_hz=args.control_hz,
                 smoothing_time_constant_s=args.smoothing_time_constant,
                 watchdog_timeout_s=args.watchdog_timeout,
+                motion_space="pose" if args.action_mode in POSE_MODES else "joint",
+                pose_start_margin_deg=args.pose_start_margin_deg,
             )
+            validate_live_cameras(pose_contract, configured)
             if configured.get("joint_units") != "rad" or configured.get("gripper_units") != "m":
                 raise BridgeError("hardware bridge must expose joint radians and gripper meters")
             joint_limits = np.asarray(configured["joint_limits"], dtype=np.float64)
@@ -346,7 +363,8 @@ def main() -> int:
             observations = _offline_observations(root)
             joint_limits = OFFLINE_JOINT_LIMITS
             gripper_limits = (0.0, 0.1)
-        converter = PiperActionAdapter(args.action_mode, joint_limits, gripper_limits)
+        converter = (PoseTargetAdapter() if pose_contract else
+                     PiperActionAdapter("absolute_joint", joint_limits, gripper_limits))
 
         # Prime the asynchronous queue before the first control tick.  JAX
         # compilation and the first inference are expected to take longer
@@ -357,6 +375,8 @@ def main() -> int:
             raw_observation = bridge.observation() if bridge is not None else next(observations)
             pending_observation = validate_observation(raw_observation)
             converter.reset(pending_observation["observation.state"])
+            if args.action_mode == "delta_joint":
+                pending_observation[COMMAND_KEY] = converter.command_target
             print("Prefilling OpenPI RTC action queue...", flush=True)
             if not engine.prefill(
                 pending_observation,
@@ -385,6 +405,8 @@ def main() -> int:
             state = observation["observation.state"]
             if tick == 1:
                 converter.reset(state)
+            if args.action_mode == "delta_joint":
+                observation[COMMAND_KEY] = converter.command_target
             engine_started = time.perf_counter()
             action = engine.get_action(observation)
             engine_s = time.perf_counter() - engine_started
@@ -396,7 +418,7 @@ def main() -> int:
                 target = converter.to_absolute(action, state)
                 limited = converter.last_was_limited
                 if bridge is not None and not args.dry_run:
-                    bridge.action(target)
+                    (bridge.pose_action if pose_contract else bridge.action)(target)
                 applied += 1
                 print(
                     f"action {applied}{('/' + str(args.max_steps)) if args.max_steps else ''} "

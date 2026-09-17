@@ -7,6 +7,7 @@ import argparse
 import importlib.util
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,8 @@ from typing import Any
 MODULE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = MODULE_DIR.parents[1]
 OPENPI_ROOT = PROJECT_ROOT / "thirdParty/openpi"
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from easy_embodied_deploy.action_contract import ACTION_MODES
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -23,7 +26,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pretrained")
     parser.add_argument("--output-dir")
     parser.add_argument("--job-name")
-    parser.add_argument("--action-mode", choices=("delta_joint", "absolute_joint"))
+    parser.add_argument("--action-mode", choices=ACTION_MODES)
     parser.add_argument("--normalization-mode", choices=("quantiles", "min_max", "mean_std"))
     parser.add_argument("--finetune-mode", choices=("lora", "full"))
     parser.add_argument("--training-scope", choices=("expert_only", "vision_frozen", "full_model"))
@@ -107,7 +110,15 @@ def main() -> int:
         ),
         flush=True,
     )
-    _vendor_train_module().main(config)
+    from functools import partial
+    from easy_embodied_deploy.checkpoint_runtime import initialize_for_resume
+    vendor = _vendor_train_module()
+    initialize = vendor._checkpoints.initialize_checkpoint_dir
+    vendor._checkpoints.initialize_checkpoint_dir = partial(initialize_for_resume, initialize)
+    try:
+        vendor.main(config)
+    finally:
+        vendor._checkpoints.initialize_checkpoint_dir = initialize
     return 0
 
 

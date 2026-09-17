@@ -9,6 +9,7 @@ import math
 import os
 import re
 import subprocess
+import sys
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -18,6 +19,8 @@ from typing import Any
 
 MODULE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = MODULE_DIR.parents[1]
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+from easy_embodied_deploy.action_contract import ACTION_MODES, POSE_MODES, action_axes, read_pose_contract
 VENV_PYTHON = PROJECT_ROOT / "thirdParty/.venvs/openpi-jax/bin/python"
 OPENPI_TRAIN = MODULE_DIR / "train_jax.py"
 DEFAULT_PRETRAINED = PROJECT_ROOT / "models/base_models/openpi-assets/checkpoints/pi05_base"
@@ -232,7 +235,7 @@ def config_from_mapping(raw: dict[str, Any], *, check_output: bool = True) -> Tr
     rtc_mode = str(raw.get("rtc_mode", "normal"))
     dtype = str(raw.get("dtype", "bfloat16"))
     wandb_mode = str(raw.get("wandb_mode", "online"))
-    if action_mode not in {"delta_joint", "absolute_joint"}:
+    if action_mode not in ACTION_MODES:
         raise TrainerConfigError("动作表示无效")
     if normalization_mode not in NORMALIZATION_MODES:
         raise TrainerConfigError("归一化模式无效")
@@ -354,6 +357,22 @@ def validate_dataset(
     except (OSError, ValueError) as exc:
         raise TrainerConfigError(f"数据集元数据无法读取：{exc}") from exc
 
+    try:
+        pose_contract = read_pose_contract(root, required=action_mode in POSE_MODES)
+        if pose_contract:
+            if pose_contract["action_mode"] != action_mode:
+                raise TrainerConfigError("位姿契约与选择的动作模式不一致")
+            from easy_embodied_deploy.pose_dataset import PoseDataset, training_stats
+            pose_dataset = PoseDataset(root)
+            if pose_dataset.rows != int(info.get("total_frames", 0)):
+                raise TrainerConfigError("位姿 sidecar 帧数不一致")
+            if len(pose_dataset.episodes) != int(info.get("total_episodes", 0)) or pose_contract["fps"] != info.get("fps"):
+                raise TrainerConfigError("位姿 sidecar 的 episode 数或 FPS 与数据集不一致")
+            for episode_index in range(len(pose_dataset.episodes)):
+                pose_dataset.episode(episode_index)
+            stats = training_stats(root, stats)
+    except (ValueError, OSError, KeyError, TypeError) as exc:
+        raise TrainerConfigError(f"位姿数据契约不合法：{exc}") from exc
     features = info.get("features")
     if not isinstance(features, dict):
         raise TrainerConfigError("数据集 info.json 缺少 features")
@@ -366,7 +385,7 @@ def validate_dataset(
         if feature.get("shape") != [14] or feature.get("dtype") != "float32":
             raise TrainerConfigError(f"{key} 必须是 float32[14]，实际为 {feature}")
         axes = _feature_axes(feature)
-        if axes != AXES:
+        if axes != (tuple(action_axes(action_mode)) if key == "action" else AXES):
             raise TrainerConfigError(f"{key} 轴顺序与双臂 Piper 不一致：{axes}")
     for key in IMAGE_KEYS:
         feature = features[key]
@@ -427,11 +446,13 @@ def validate_dataset(
         "fps": fps,
         "episodes": episodes,
         "frames": frames,
-        "action_mode": declared_action_mode,
+        "action_mode": declared_action_mode or action_mode,
+        "pose_contract": pose_contract,
         "normalization_mode": normalization_mode,
         "sample_checked": decode_sample,
         "cameras": list(CAMERAS),
         "axes": list(AXES),
+        "action_axes": action_axes(action_mode),
     }
 
 
@@ -652,6 +673,12 @@ def write_training_manifest(
     status: str = "completed",
 ) -> None:
     if config.resume_config is not None:
+        from easy_embodied_deploy.checkpoint_runtime import copy_resume_manifest
+        saved = json.loads(config.resume_config.read_text(encoding="utf-8"))
+        output = resolve_path(saved["config"]["output_dir"])
+        copy_resume_manifest(config.resume_config, output,
+                             (p.parent for p in output.glob("*/params") if p.parent.name.isdigit()), status=status, command=command,
+                             pose_contract=report.get("pose_contract"))
         return
     if status not in {"running", "completed"}:
         raise ValueError(f"unsupported training manifest status: {status}")
@@ -663,8 +690,10 @@ def write_training_manifest(
         "trainer": "OpenpiTrainer",
         "config": config_for_json(config),
         "dataset": report,
+        "pose_contract": report.get("pose_contract"),
         "command": command,
-        "normalization_source": "LeRobot v3 meta/stats.json copied into OpenPI checkpoint assets",
+        "normalization_source": ("meta/stats.json state + meta/pose_action_stats.json valid-chunk action"
+                                 if report.get("pose_contract") else "LeRobot v3 meta/stats.json copied into OpenPI checkpoint assets"),
     }
     if status == "completed":
         manifest["completed_at"] = recorded_at
@@ -684,7 +713,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pretrained", default=str(DEFAULT_PRETRAINED))
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT))
     parser.add_argument("--job-name", default="pi05_piper")
-    parser.add_argument("--action-mode", choices=("delta_joint", "absolute_joint"), default="delta_joint")
+    parser.add_argument("--action-mode", choices=ACTION_MODES, default="delta_joint")
     parser.add_argument("--normalization-mode", choices=tuple(NORMALIZATION_MODES), default="quantiles")
     parser.add_argument("--finetune-mode", choices=("lora", "full"), default="lora")
     parser.add_argument("--training-scope", choices=tuple(TRAINING_SCOPES), default="expert_only")
@@ -737,6 +766,7 @@ def main() -> int:
     plan = {
         "config": config_for_json(config),
         "dataset": report,
+        "pose_contract": report.get("pose_contract"),
         "command": command,
         "cuda_visible_devices": build_environment(config)["CUDA_VISIBLE_DEVICES"],
     }

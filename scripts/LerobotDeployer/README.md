@@ -194,3 +194,8 @@ scripts/LerobotDeployer/LerobotDeployer.py --help
 对应 CLI `--dry-run`，只验证推理与目标，不发送模型动作；硬件连接、回零和预定位仍正常执行。
 若 checkpoint 包含 `training_manifest.json`，部署前会核对动作模式；无清单的旧模型保留原手动选择方式。
 页面只管理本控制台启动的硬件桥，不会接管外部桥。
+
+## 位姿动作与相对关节更新
+
+支持 `absolute_base_pose`、`camera_delta_wrist`、`camera_delta_global`；state 保持左右关节 / 夹爪 14 维，位姿 action 是双臂 xyz / 三维 rotvec / 绝对夹爪 14 维。
+详见 [完整位姿链路](../../docs/POSE_ACTION_DATAFLOW.md)、[标定操作与训练顺序](../../docs/CAMERA_CALIBRATION.md) 和 [相对关节问题排查](../../docs/JOINT_ACTION_AUDIT.md)。位姿数据必须保留 `meta/pose*` 附属文件，并通过本项目训练入口读取。camera delta 部署需确认相机安装版本；绝对 base 位姿不需要标定。

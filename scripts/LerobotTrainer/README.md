@@ -86,3 +86,8 @@ thirdParty/.venvs/lerobot-pi05/bin/python scripts/LerobotTrainer/trainer.py \
 ```
 
 训练成功后会在输出目录及各 checkpoint 的 `pretrained_model` 中写入精简的 `training_manifest.json`。模型、processor 和反归一化状态仍由 LeRobot 原生 checkpoint 保存，清单不复制大段统计量。
+
+## 位姿动作与相对关节更新
+
+支持 `absolute_base_pose`、`camera_delta_wrist`、`camera_delta_global`；state 保持左右关节 / 夹爪 14 维，位姿 action 是双臂 xyz / 三维 rotvec / 绝对夹爪 14 维。
+详见 [完整位姿链路](../../docs/POSE_ACTION_DATAFLOW.md)、[标定操作与训练顺序](../../docs/CAMERA_CALIBRATION.md) 和 [相对关节问题排查](../../docs/JOINT_ACTION_AUDIT.md)。位姿数据必须保留 `meta/pose*` 附属文件，并通过本项目训练入口读取。camera delta 部署需确认相机安装版本；绝对 base 位姿不需要标定。

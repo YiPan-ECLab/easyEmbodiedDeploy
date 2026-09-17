@@ -136,6 +136,13 @@ def validate_observation(observation: dict[str, Any]) -> dict[str, np.ndarray]:
     if state.shape != (14,) or not np.isfinite(state).all():
         raise ValueError(f"Piper state must be finite float32[14], got {state.shape}")
     checked = {STATE_KEY: state}
+    if "observation.flange_pose" in observation:
+        poses = np.asarray(observation["observation.flange_pose"], dtype=np.float64)
+        if poses.shape != (12,) or not np.isfinite(poses).all():
+            raise ValueError("flange pose must be finite xyz/RPY[12]")
+        checked["observation.flange_pose"] = poses
+    if "command_anchor" in observation:
+        checked["command_anchor"] = PiperActionAdapter._vector(observation["command_anchor"], "command anchor")
     for key in IMAGE_KEYS:
         image = np.asarray(observation[key])
         if image.shape != (224, 224, 3) or image.dtype != np.uint8:
@@ -235,6 +242,12 @@ class PiperActionAdapter:
         self.last_was_limited = not np.allclose(target, requested, atol=1e-7)
         self._target = target
         return target.copy()
+
+    @property
+    def command_target(self):
+        if self._target is None:
+            raise ValueError("command anchor has not been initialized")
+        return self._target.copy()
 
     @staticmethod
     def split(absolute_action: np.ndarray) -> dict[str, tuple[np.ndarray, float]]:

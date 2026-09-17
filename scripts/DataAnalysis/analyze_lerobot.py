@@ -19,6 +19,11 @@ import pyarrow.parquet as pq
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from easy_embodied_deploy.statistics import statistics_close
+from easy_embodied_deploy.action_contract import ACTION_MODES, POSE_MODES, action_axes, read_pose_contract
+from easy_embodied_deploy.pose_dataset import PoseDataset, compute_chunk_statistics, training_stats
+from easy_embodied_deploy.pose_conversion import read_raw_poses, validate_pose_bundle
+from easy_embodied_deploy.joint_diagnostics import joint_label_metrics
+from easy_embodied_deploy.pose_quality import analyze_poses, PoseThresholds
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 AXES = [
     f"{side}_{axis}"
@@ -151,7 +156,7 @@ def probe_video(path: Path) -> dict[str, Any]:
     }
 
 
-def _analyze(raw: str, source_override: str | None) -> dict[str, Any]:
+def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dict[str, Any]:
     bundle, root = lerobot_root(raw)
     errors: list[str] = []
     warnings: list[str] = []
@@ -162,6 +167,14 @@ def _analyze(raw: str, source_override: str | None) -> dict[str, Any]:
     settings = processing.get("settings", {})
     plan = processing.get("plan", {})
     mode = "absolute_joint" if settings.get("action_mode") == "absolute" else settings.get("action_mode")
+    pose_contract = read_pose_contract(root)
+    pose_data = PoseDataset(root) if pose_contract else None
+    if pose_contract:
+        if mode and mode != pose_contract["action_mode"]:
+            errors.append("processing.json 与位姿契约动作模式不一致")
+        mode = pose_contract["action_mode"]
+    elif mode in POSE_MODES:
+        errors.append("缺少 pose_action_contract.json")
     fps = int(info.get("fps", 0))
     total_frames = int(info.get("total_frames", 0))
     total_episodes = int(info.get("total_episodes", 0))
@@ -174,13 +187,13 @@ def _analyze(raw: str, source_override: str | None) -> dict[str, Any]:
         errors.append("codebase_version 不是 v3.0")
     if info.get("robot_type") != "piper_dual":
         errors.append("robot_type 不是 piper_dual")
-    if mode not in ("absolute_joint", "delta_joint"):
+    if mode not in ACTION_MODES:
         errors.append("processing.json 缺少明确 action_mode")
     for key in ("observation.state", "action"):
         feature = info.get("features", {}).get(key, {})
         if feature.get("dtype") != "float32" or feature.get("shape") != [14]:
             errors.append(f"{key} feature 必须为 float32[14]")
-        if feature.get("names", {}).get("axes") != AXES:
+        if feature.get("names", {}).get("axes") != (action_axes(mode) if key == "action" and mode in ACTION_MODES else AXES):
             errors.append(f"{key} axes 顺序错误")
         values = stats.get(key, {})
         for stat in STATS:
@@ -260,6 +273,18 @@ def _analyze(raw: str, source_override: str | None) -> dict[str, Any]:
                 errors.append(f"stats {key}/{name} 与 parquet 全量重算不一致，最大误差 {difference:g}")
         statistics[key] = {"max_recompute_error": maximum_error}
 
+    if pose_data is not None:
+        verification = validate_pose_bundle(root, columns)
+        errors.extend(verification["errors"])
+        stored = training_stats(root, {})["action"]
+        recomputed = compute_chunk_statistics(root, persist=False)
+        for stat in STATS:
+            if not np.allclose(stored[stat], recomputed[stat], rtol=1e-5, atol=1e-7):
+                errors.append(f"位姿完整 chunk 统计 {stat} 与全量重算不一致")
+        if stored["count"] != recomputed["count"]:
+            errors.append("位姿统计包含填充帧或缺少未来目标")
+        statistics["pose_chunk"] = {**verification["metrics"], "valid_targets": recomputed["count"][0]}
+
     task_path = root / "meta/tasks.parquet"
     if not task_path.is_file():
         errors.append("缺少 meta/tasks.parquet")
@@ -321,7 +346,7 @@ def _analyze(raw: str, source_override: str | None) -> dict[str, Any]:
             "trailing_idle_frames": trailing,
             "max_action_joint_step_rad": float(
                 np.max(np.abs(action_steps[:, np.r_[0:6, 7:13]]))
-            ) if len(action_steps) else 0.0,
+            ) if len(action_steps) and mode not in POSE_MODES else 0.0,
             "max_action_gripper_step_m": float(
                 np.max(np.abs(action_steps[:, [6, 13]]))
             ) if len(action_steps) else 0.0,
@@ -330,6 +355,11 @@ def _analyze(raw: str, source_override: str | None) -> dict[str, Any]:
             ) if len(state_steps) else 0.0,
             "errors": ep_errors,
         })
+        if pose_data is not None:
+            arrays = pose_data.episode(ep)
+            quality = analyze_poses(arrays["poses"][:-1], arrays["timestamps"][:-1], ep_states, thresholds=pose_thresholds)
+            episode_results[-1]["pose"] = quality
+            warnings.extend(f"episode {ep}: {warning}" for warning in quality["warnings"])
         errors.extend(f"episode {ep}: {error}" for error in ep_errors)
 
     source_metrics = None
@@ -359,11 +389,30 @@ def _analyze(raw: str, source_override: str | None) -> dict[str, Any]:
                         continue
                     stride = source_fps // fps
                     selected, idle = source_indices(demo, stride)
+                    if pose_data is not None:
+                        # Verify saved indices against the current source selector, not
+                        # merely against their own sidecar metadata.
+                        sys.path.insert(0, str(PROJECT_ROOT / "scripts/LerobotDataProcessor"))
+                        from processor import _task_sample_indices
+                        selected, _, idle = _task_sample_indices(demo, stride, pose=True)
                     trimmed_idle += idle
                     raw_actions = np.asarray(demo["actions"][selected], dtype=np.float32)
+                    if len(raw_actions) > 1:
+                        episode_results[ep]["joint_labels"] = joint_label_metrics(raw_actions, np.asarray(demo["states"])[selected])
                     expected_actions = raw_actions
                     expected_selected = selected
-                    if mode == "delta_joint":
+                    if pose_data is not None:
+                        saved = pose_data.episode(ep)
+                        raw_poses = read_raw_poses(demo)[selected]
+                        if not np.array_equal(saved["source_indices"], selected) or not np.array_equal(saved["poses"], raw_poses):
+                            errors.append(f"episode {ep}: 位姿 sidecar 与源帧/原始位姿不一致")
+                        if not np.array_equal(saved["grippers"], np.asarray(demo["actions"])[selected][:, [6, 13]]):
+                            errors.append(f"episode {ep}: 位姿夹爪 sidecar 与源指令不一致")
+                        if not np.array_equal(saved["timestamps"], np.asarray(demo["timestamps"])[selected]):
+                            errors.append(f"episode {ep}: 位姿实际时间戳与原始采集不一致")
+                        expected_actions = np.asarray([pose_data.codec.encode(raw_poses[i], raw_poses[i+1], raw_actions[i+1, [6, 13]]) for i in range(len(selected)-1)])
+                        expected_selected = selected[:-1]
+                    elif mode == "delta_joint":
                         expected_actions = np.diff(raw_actions, axis=0)
                         expected_selected = selected[:-1]
                     expected_states = np.asarray(demo["states"][expected_selected], dtype=np.float32)
@@ -464,11 +513,11 @@ def _analyze(raw: str, source_override: str | None) -> dict[str, Any]:
     }
 
 
-def analyze(raw: str, source_override: str | None) -> dict[str, Any]:
+def analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dict[str, Any]:
     """Malformed datasets produce a usable failure report, including strict JSON."""
     from easy_embodied_deploy.http import json_safe
     try:
-        return json_safe(_analyze(raw, source_override))
+        return json_safe(_analyze(raw, source_override, pose_thresholds))
     except (ValueError, TypeError, KeyError, IndexError, OverflowError, OSError) as exc:
         return {
             "status": "FAIL", "bundle": str(Path(raw).expanduser().resolve()),
@@ -498,7 +547,7 @@ def print_report(report: dict[str, Any]) -> None:
             f"trimmed_tail={source['trimmed_idle_frames']}"
         )
     for key, values in report.get("statistics", {}).items():
-        print(f"stats recompute: {key} max_error={values['max_recompute_error']:.3g}")
+        print(f"stats recompute: {key} max_error={values['max_recompute_error']:.3g}" if "max_recompute_error" in values else f"pose chunk: {values}")
     for key, values in report.get("videos", {}).items():
         print(f"video: {key} files={values['files']} frames={values['frames']}")
     print(
@@ -521,8 +570,14 @@ def main() -> int:
     parser.add_argument("path", help="converter bundle or inner lerobot directory")
     parser.add_argument("--source-dir", help="override source HDF5 directory")
     parser.add_argument("--json", dest="json_path", help="write the full JSON report")
+    for key, value in vars(PoseThresholds()).items():
+        parser.add_argument("--pose-" + key.replace("_", "-"), type=float, default=value)
     args = parser.parse_args()
-    report = analyze(args.path, args.source_dir)
+    try:
+        pose_thresholds = PoseThresholds(**{key: getattr(args, "pose_"+key) for key in vars(PoseThresholds())})
+    except ValueError as exc:
+        parser.error(str(exc))
+    report = analyze(args.path, args.source_dir, pose_thresholds)
     print_report(report)
     if args.json_path:
         Path(args.json_path).write_text(

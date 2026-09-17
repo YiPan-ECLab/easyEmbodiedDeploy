@@ -315,7 +315,7 @@ class GeometryTests(unittest.TestCase):
             store.solve(session["id"])
             result = store.export([session["id"]])
             self.assertTrue(Path(result["path"]).is_file())
-            self.assertFalse(result["bundle"]["training_integration"])
+            self.assertTrue(result["bundle"]["training_integration"])
             self.assertEqual(len(result["bundle"]["missing_jobs"]), 3)
             store.remove_sample(session["id"], session["samples"][0]["id"])
             self.assertIsNone(store.load(session["id"])["result"])
