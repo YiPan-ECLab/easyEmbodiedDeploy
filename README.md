@@ -41,7 +41,7 @@ python3 workbench.py
 
 网页必须获得键盘焦点，页内会显示踏板就绪提示。阶段令牌与按键去重避免长按或重复请求跨阶段触发。“结束会话并归位”会结束当前记录、等待回零并丢弃尚未保存的数据。关闭浏览器标签不会自动终止正在运行的会话，可重新打开工作台继续操作。
 
-采集与部署桥接共用设备锁，不允许同时占用设备。机械臂连接、反馈、预定位和回零直接沿用已验证的原版硬件实现，详见[硬件对照复测](docs/RECORDER_HARDWARE_RECHECK.md)。
+采集与部署桥接共用设备锁，不允许同时占用设备。机械臂连接、反馈、预定位和回零直接沿用已验证的原版硬件实现，详见[位姿扩展验收](docs/POSE_ACTION_ACCEPTANCE.md)中的硬件验收记录。
 
 ## 验证
 
@@ -70,10 +70,10 @@ uv run --no-project --with playwright python tests/browser_theme.py --url http:/
 
 浏览器测试需要安装 Playwright Chromium；也可通过 `--browser /path/to/chromium` 指定已有浏览器。非默认端口用 `--url http://127.0.0.1:8090`。
 
-具体修复、验证结果和剩余现场验收见 [仓库审查记录](docs/REPOSITORY_REVIEW.md)；各模块具体改动见 [模块改动清单](docs/MODULE_CHANGES.md)。
+具体修复、验证结果和剩余现场验收见 [位姿扩展验收](docs/POSE_ACTION_ACCEPTANCE.md)；各模块具体改动见 [模块改动清单](docs/MODULE_CHANGES.md)。
 
-2026-09-16 目录管理、相机标定与 OpenPI 指标修复的 **117 项回归、浏览器和真机只读测试**详见 [当日验收记录](docs/RESOURCES_CALIBRATION_ACCEPTANCE.md)。
+此前目录管理、相机标定与 OpenPI 指标修复的内容已合并进 [模块改动清单](docs/MODULE_CHANGES.md)，当前完整验收以 [位姿扩展验收](docs/POSE_ACTION_ACCEPTANCE.md) 为准。
 
-此前的统一界面与出厂内参工作见 [界面与内参验收](docs/UI_INTRINSICS_ACCEPTANCE.md)。最新位姿扩展、相对关节修复、GPU / 网页 / 真机测试见 [位姿扩展验收](docs/POSE_ACTION_ACCEPTANCE.md)；使用前按 [标定说明](docs/CAMERA_CALIBRATION.md) 和 [位姿数据链路](docs/POSE_ACTION_DATAFLOW.md) 配置所选动作模式。
+统一界面与出厂内参的结果已合并进 [相机标定说明](docs/CAMERA_CALIBRATION.md) 与 [模块改动清单](docs/MODULE_CHANGES.md)。最新位姿扩展、相对关节修复、GPU / 网页 / 真机测试见 [位姿扩展验收](docs/POSE_ACTION_ACCEPTANCE.md)；使用前按 [标定说明](docs/CAMERA_CALIBRATION.md) 和 [位姿数据链路](docs/POSE_ACTION_DATAFLOW.md) 配置所选动作模式。
 
 Git 仅保存源码与环境锁。`datasets/`、`models/`、虚拟环境、测试产生的数据和权重均不会上传，需要在目标机器上单独复制或重新生成。
