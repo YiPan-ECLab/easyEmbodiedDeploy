@@ -72,6 +72,37 @@ h2 {
   gap: 22px
 }
 
+.camera-panel {
+  margin-bottom: 22px;
+  border-top: 3px solid var(--green)
+}
+
+.camera-panel .section-head { gap: 12px; margin-bottom: 16px }
+.camera-panel .badge { letter-spacing: 0; font-size: 12px }
+.camera-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px }
+.camera-tile { margin: 0; min-width: 0 }
+.camera-image {
+  position: relative;
+  display: grid;
+  place-items: center;
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+  border-radius: 10px;
+  background: #172a27;
+  color: #c0d4ca
+}
+.camera-image img { width: 100%; height: 100%; object-fit: contain; position: absolute }
+.camera-image img[hidden], .camera-placeholder[hidden] { display: none }
+.camera-placeholder { padding: 16px; text-align: center; font-size: 12px }
+.camera-tile figcaption { display: flex; justify-content: space-between; gap: 8px; margin-top: 9px }
+.camera-status { color: var(--muted); font-size: 11px }
+.camera-tile.live .camera-status { color: var(--green) }
+@media(max-width:740px) {
+  .camera-grid { grid-template-columns: 1fr; gap: 20px }
+  .camera-image { max-height: 240px }
+  .camera-panel .section-head { align-items: flex-start; flex-wrap: wrap }
+}
+
 .card {
   background: white;
   border: 1px solid var(--line);

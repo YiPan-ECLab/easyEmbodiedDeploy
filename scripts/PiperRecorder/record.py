@@ -351,6 +351,17 @@ def run(
             image_size=IMAGE_SIZE,
             max_age_s=CAMERA_MAX_AGE_S,
         )
+        if operator:
+            # Preview has its own HTTP threads and reads existing camera frames.
+            # Failure to start the optional preview must not stop recording.
+            try:
+                from easy_embodied_deploy.camera_preview import CameraPreview
+
+                preview = CameraPreview(cameras)
+                resources.callback(preview.close)
+                operator.emit(preview_port=preview.port)
+            except Exception as exc:
+                print(f"相机预览不可用（不影响采集）：{exc}")
         robot = DualPiper(
             PIPERS,
             firmware=FIRMWARE,

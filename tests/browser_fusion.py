@@ -71,11 +71,14 @@ async def main():
                 assert await page.evaluate("frameAtMediaTime(-0.001) === state.fusion.indices[0]")
                 requests = await page.evaluate("""() => {
                   stopPlayback(); updateFrame(0, true);
-                  const original = preloadFrameImages, requested = [];
+                  const original = preloadFrameImages, prefetch = prefetchPlaybackFrames, requested = [];
+                  prefetchPlaybackFrames = () => {};
                   preloadFrameImages = (index) => { requested.push(index); return Promise.resolve([]); };
                   togglePlayback(); cancelAnimationFrame(state.animationFrame);
+                  requested.length = 0;
+                  state.frameLoadPending = false;
                   playbackTick(state.playbackStartedAt - 0.5, state.playbackToken);
-                  stopPlayback(); preloadFrameImages = original;
+                  stopPlayback(); preloadFrameImages = original; prefetchPlaybackFrames = prefetch;
                   return requested;
                 }""")
                 assert requests == [], requests

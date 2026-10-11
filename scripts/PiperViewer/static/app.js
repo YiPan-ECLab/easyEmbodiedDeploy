@@ -28,6 +28,9 @@ const state = {
   visibleJoints: new Set([0, 1, 2, 3, 4, 5]),
   loadToken: 0,
   playbackToken: 0,
+  imageFrames: new Map(),
+  imageLoads: 0,
+  prefetchFrames: [],
   fusion: null,
   fusionPreview: false,
   fusionBusy: false,
@@ -141,6 +144,7 @@ function renderFileList() {
 
 async function selectFile(path, demo = null) {
   stopPlayback();
+  state.imageFrames.clear();
   state.selectedPath = path;
   state.frame = 0;
   renderFileList();
@@ -255,7 +259,7 @@ function updateFrame(index, force = false, imageUrls = null) {
     $(`#camera-time-${cameraIndex}`).textContent = Number.isFinite(Number(cameraTimes[cameraIndex])) ? `${Number(cameraTimes[cameraIndex]).toFixed(3)} s` : `frame ${index + 1}`;
   });
   renderCharts();
-  renderFrameDetails();
+  if (!$("#tab-frame").classList.contains("hidden")) renderFrameDetails();
 }
 
 function stopPlayback() {
@@ -264,6 +268,7 @@ function stopPlayback() {
   cancelAnimationFrame(state.animationFrame);
   state.animationFrame = null;
   state.frameLoadPending = false;
+  state.prefetchFrames = [];
   const button = $("#play-toggle");
   if (button) {
     button.innerHTML = '<i data-lucide="play"></i>';
@@ -283,13 +288,58 @@ function playbackCycleDuration() {
 }
 
 function preloadFrameImages(index) {
+  const cached = state.imageFrames.get(index);
+  if (cached) return cached.promise;
   const urls = state.episode.cameras.map((camera) => frameImageUrl(camera, index));
-  return Promise.all(urls.map((url) => new Promise((resolve, reject) => {
+  const entry = { images: [], urls: null, promise: null };
+  state.imageFrames.set(index, entry);
+  state.imageLoads += 1;
+  entry.promise = Promise.all(urls.map((url) => new Promise((resolve, reject) => {
     const image = new Image();
-    image.onload = () => resolve(url);
+    entry.images.push(image); // Retain decoded images until they leave the window.
+    image.onload = async () => {
+      try { await image.decode(); resolve(url); }
+      catch { reject(new Error(`图像帧解码失败: ${index + 1}`)); }
+    };
     image.onerror = () => reject(new Error(`图像帧加载失败: ${index + 1}`));
     image.src = url;
-  })));
+  }))).then((loaded) => {
+    entry.urls = loaded;
+    return loaded;
+  }).finally(() => {
+    state.imageLoads -= 1;
+    pumpFramePrefetch();
+  });
+  return entry.promise;
+}
+
+function pumpFramePrefetch() {
+  if (!state.playing) return;
+  for (const index of state.prefetchFrames) {
+    if (state.imageLoads >= 2) break;
+    if (!state.imageFrames.has(index)) {
+      // Report errors only when the affected frame is actually requested.
+      preloadFrameImages(index).catch(() => {});
+    }
+  }
+}
+
+function prefetchPlaybackFrames(index) {
+  const indices = state.fusionPreview ? state.fusion.indices : null;
+  const length = indices?.length || state.episode.frames;
+  const position = indices ? Math.max(0, indices.indexOf(index)) : index;
+  const bytesPerFrame = state.episode.cameras.reduce((sum, camera) =>
+    sum + camera.shape[1] * camera.shape[2] * 4, 0);
+  // At most 18 camera groups / about 32 MiB decoded. Two groups are prefetched;
+  // after a seek, a foreground request may briefly coexist with old requests.
+  const count = Math.min(length, 18, Math.max(2, Math.floor(32 * 1024 ** 2 / Math.max(1, bytesPerFrame))));
+  state.prefetchFrames = Array.from({ length: count }, (_, offset) =>
+    indices ? indices[(position + offset) % length] : (position + offset) % length);
+  const wanted = new Set(state.prefetchFrames);
+  for (const key of state.imageFrames.keys()) {
+    if (!wanted.has(key)) state.imageFrames.delete(key);
+  }
+  pumpFramePrefetch();
 }
 
 function frameAtMediaTime(mediaTime) {
@@ -311,6 +361,10 @@ function frameAtMediaTime(mediaTime) {
 
 function playbackTick(now, token) {
   if (!state.playing || !state.episode || token !== state.playbackToken) return;
+  if (state.frameLoadPending) {
+    state.animationFrame = requestAnimationFrame((nextNow) => playbackTick(nextNow, token));
+    return;
+  }
   const cycleDuration = playbackCycleDuration();
   // rAF timestamps refer to the start of a rendering frame. A click handler
   // can start playback later in that same frame, so the first delta is negative.
@@ -322,16 +376,24 @@ function playbackTick(now, token) {
     state.playbackStartedMediaTime = mediaTime;
   }
   const target = frameAtMediaTime(mediaTime);
-  if (target !== state.frame && !state.frameLoadPending) {
+  prefetchPlaybackFrames(target);
+  const ready = state.imageFrames.get(target)?.urls;
+  if (target !== state.frame && ready) {
+    updateFrame(target, true, ready);
+  } else if (target !== state.frame) {
     state.frameLoadPending = true;
+    // Buffering must not consume media time and skip a stretch of the episode.
+    state.playbackStartedMediaTime = mediaTime;
     preloadFrameImages(target)
       .then((imageUrls) => {
         if (state.playing && token === state.playbackToken) {
           updateFrame(target, true, imageUrls);
+          state.playbackStartedAt = performance.now();
         }
       })
       .catch((error) => {
         if (state.playing && token === state.playbackToken) {
+          state.imageFrames.delete(target);
           stopPlayback();
           toast(error.message, true);
         }
@@ -352,7 +414,7 @@ function togglePlayback() {
   state.playing = true;
   state.playbackToken += 1;
   const token = state.playbackToken;
-  state.frameLoadPending = false;
+  state.frameLoadPending = true;
   if (state.frame >= state.episode.frames - 1) updateFrame(0, true);
   state.playbackStartedAt = performance.now();
   state.playbackStartedMediaTime = state.fusionPreview
@@ -363,7 +425,20 @@ function togglePlayback() {
   button.title = "暂停";
   button.setAttribute("aria-label", button.title);
   icons();
-  state.animationFrame = requestAnimationFrame((now) => playbackTick(now, token));
+  const first = frameAtMediaTime(state.playbackStartedMediaTime);
+  prefetchPlaybackFrames(first);
+  preloadFrameImages(first).then((urls) => {
+    if (!state.playing || token !== state.playbackToken) return;
+    updateFrame(first, true, urls);
+    state.playbackStartedAt = performance.now();
+    state.frameLoadPending = false;
+    state.animationFrame = requestAnimationFrame((now) => playbackTick(now, token));
+  }).catch((error) => {
+    if (!state.playing || token !== state.playbackToken) return;
+    state.imageFrames.delete(first);
+    stopPlayback();
+    toast(error.message, true);
+  });
 }
 
 function sourceData() {
@@ -550,7 +625,7 @@ function bindEvents() {
     catch { toast("浏览器未允许访问剪贴板", true); }
   });
   $$("#speed-control button").forEach((button) => button.addEventListener("click", () => {
-    if (state.playing) {
+    if (state.playing && !state.frameLoadPending) {
       const now = performance.now();
       const elapsed = (now - state.playbackStartedAt) * state.speed / 1000;
       state.playbackStartedMediaTime = (

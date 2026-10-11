@@ -12,7 +12,9 @@ import threading
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
+from urllib.request import urlopen
+from urllib.error import URLError
 
 from .http import LocalHandlerMixin, read_json
 
@@ -96,6 +98,7 @@ class RecorderSession:
                 "stopping": self.stopping,
                 "maintenance": self.maintenance,
                 "session_id": self.generation,
+                "camera_preview": running and bool(self.state.get("preview_port")),
                 "pid": self.process.pid if running else None,
                 "exit_code": self.process.poll() if self.process else None,
                 "config": self.config.copy(),
@@ -138,6 +141,19 @@ class RecorderSession:
             threading.Thread(
                 target=self._read, args=(self.process,), daemon=True
             ).start()
+
+    def camera_frame(self, camera, session_id):
+        if camera not in ("agentview", "left_eye_in_hand", "right_eye_in_hand"):
+            raise ValueError("未知相机")
+        with self.lock:
+            if session_id != str(self.generation):
+                raise RuntimeError("采集会话已切换")
+            port = self.state.get("preview_port")
+            if not port or self.process is None or self.process.poll() is not None:
+                raise RuntimeError("相机预览尚未就绪")
+        # Never hold the operator/session lock during image I/O.
+        with urlopen(f"http://127.0.0.1:{int(port)}/{camera}", timeout=1) as response:
+            return response.read()
 
     def _send(self, action, value=""):
         if self.pending or action not in self.state.get("accepts", []):
@@ -333,6 +349,16 @@ class Handler(LocalHandlerMixin, BaseHTTPRequestHandler):
             self.send({"defaults": defaults(), "status": self.server.session.status()})
         elif route == "/api/status":
             self.send(self.server.session.status())
+        elif route == "/api/camera-frame":
+            query = parse_qs(urlsplit(self.path).query)
+            try:
+                body = self.server.session.camera_frame(query.get("camera", [""])[0],
+                                                       query.get("session_id", [""])[0])
+                self.send(body, content_type="image/jpeg")
+            except ValueError as exc:
+                self.send({"error": str(exc)}, 400)
+            except (RuntimeError, OSError, URLError):
+                self.send({"error": "相机画面暂不可用，正在等待新帧"}, 503)
         elif route == "/api/health":
             self.send({"status": "ok"})
         elif route in {"/", "/index.html", "/styles.css", "/app.js"}:

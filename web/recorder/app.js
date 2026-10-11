@@ -130,7 +130,94 @@ function render() {
     }
   }
   renderZeroInspection();
+  updateCameraPreview();
 }
+
+// One request per camera at a time; no image data enters the control channel.
+let previewVisible = false;
+const cameraPreviews = [...document.querySelectorAll('[data-camera]')].map(tile => ({
+  tile, name: tile.dataset.camera, image: tile.querySelector('img'),
+  message: tile.querySelector('.camera-placeholder'), label: tile.querySelector('.camera-status'),
+  controller: null, url: null, generation: null, lastGood: 0
+}));
+
+function previewUnavailable(camera, message) {
+  camera.image.hidden = true;
+  camera.message.hidden = false;
+  camera.message.textContent = message;
+  camera.label.textContent = message;
+  camera.tile.classList.remove('live');
+  if (camera.url) URL.revokeObjectURL(camera.url);
+  camera.url = null;
+  camera.lastGood = 0;
+}
+
+function updateCameraPreview() {
+  const enabled = online && state?.running && state.camera_preview;
+  const visible = previewVisible && !document.hidden;
+  let message = !online ? '等待控制台连接' : !state?.running ? '连接设备后显示画面'
+    : state.camera_preview ? (visible ? '等待相机画面' : '预览暂停')
+    : state.camera_preview === undefined ? '更新预览需重启采集模块'
+    : state.phase === 'initializing' ? '相机正在连接' : '预览不可用，请查看运行日志';
+  for (const camera of cameraPreviews) {
+    if (!enabled || !visible || camera.generation !== state.session_id) {
+      camera.controller?.abort();
+      previewUnavailable(camera, message);
+      camera.generation = state?.session_id;
+    } else if (camera.lastGood && performance.now() - camera.lastGood > 2000) {
+      previewUnavailable(camera, '画面中断，正在重连');
+    }
+  }
+  const count = cameraPreviews.filter(camera => camera.lastGood).length;
+  $('camera-preview-status').textContent = enabled && visible ? `实时预览 · ${count} / 3 路` : message;
+}
+
+async function refreshCamera(camera) {
+  let nextUrl = null;
+  if (online && state?.running && state.camera_preview && previewVisible && !document.hidden) {
+    const generation = state.session_id;
+    const controller = new AbortController();
+    camera.controller = controller;
+    const timer = setTimeout(() => controller.abort(), 2000);
+    try {
+      const params = new URLSearchParams({camera: camera.name, session_id: generation});
+      const response = await fetch(`api/camera-frame?${params}`, {signal: controller.signal, cache: 'no-store'});
+      if (!response.ok) throw new Error('相机画面暂不可用');
+      nextUrl = URL.createObjectURL(await response.blob());
+      const decoded = new Image();
+      decoded.src = nextUrl;
+      await decoded.decode();
+      if (controller.signal.aborted || state.session_id !== generation || !state.running)
+        throw new Error('预览请求已过期');
+      const previous = camera.url;
+      camera.image.src = nextUrl;
+      camera.url = nextUrl;
+      nextUrl = null;
+      if (previous) URL.revokeObjectURL(previous);
+      camera.image.hidden = false;
+      camera.message.hidden = true;
+      camera.label.textContent = '实时画面';
+      camera.tile.classList.add('live');
+      camera.lastGood = performance.now();
+    } catch {
+      if (!controller.signal.aborted && state?.session_id === generation)
+        previewUnavailable(camera, '画面中断，正在重连');
+    } finally {
+      clearTimeout(timer);
+      if (nextUrl) URL.revokeObjectURL(nextUrl);
+      camera.controller = null;
+      updateCameraPreview();
+    }
+  }
+  setTimeout(() => refreshCamera(camera), 100);
+}
+
+new IntersectionObserver(entries => {
+  previewVisible = entries[0].isIntersecting;
+  updateCameraPreview();
+}).observe(document.querySelector('.camera-panel'));
+document.addEventListener('visibilitychange', updateCameraPreview);
+cameraPreviews.forEach(camera => refreshCamera(camera));
 async function perform(fn) {
   if (sending) return;
   sending = true;

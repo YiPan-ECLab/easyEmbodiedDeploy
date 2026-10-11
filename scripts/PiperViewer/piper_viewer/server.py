@@ -331,33 +331,77 @@ class ImageCache:
 IMAGE_CACHE = ImageCache()
 
 
+class FrameBlockCache:
+    """Read temporal HDF5 chunks once, without retaining open recording files.
+
+    Older recordings split each image over many chunks spanning multiple frames.
+    Reading these frames separately repeatedly decompresses the same data.
+    Both the total cache and each read are bounded, including for large images.
+    """
+
+    def __init__(self, limit: int = 128 * 1024**2, block_limit: int = 32 * 1024**2):
+        self.limit = limit
+        self.block_limit = min(block_limit, limit)
+        self.values: OrderedDict[tuple[Any, ...], np.ndarray] = OrderedDict()
+        self.size = 0
+        self.lock = threading.Lock()
+
+    def get(self, identity: tuple[Any, ...], path: Path, demo_name: str | None,
+            camera: str, index: int) -> np.ndarray:
+        # Coalesce concurrent misses. h5py itself serializes HDF5 operations;
+        # JPEG encoding and HTTP delivery take place outside this lock.
+        with self.lock:
+            for key, block in self.values.items():
+                if key[:-1] == identity and key[-1] <= index < key[-1] + len(block):
+                    self.values.move_to_end(key)
+                    return block[index - key[-1]]
+            with h5py.File(path, "r") as handle:
+                _, demo = _demo_group(handle, demo_name)
+                _require_direct_schema(handle, demo)
+                available = {item["name"]: item["path"] for item in _camera_datasets(demo)}
+                if camera not in available:
+                    raise KeyError(f"相机数据集不存在: {camera}")
+                dataset = demo[available[camera]]
+                if not len(dataset):
+                    raise IndexError("相机数据集为空")
+                index = min(max(index, 0), len(dataset) - 1)
+                frame_bytes = int(np.prod(dataset.shape[1:])) * dataset.dtype.itemsize
+                chunk_frames = dataset.chunks[0] if dataset.chunks else 16
+                count = max(1, min(chunk_frames, self.block_limit // max(1, frame_bytes)))
+                start = index // count * count
+                block = np.asarray(dataset[start:min(start + count, len(dataset))])
+            if block.nbytes <= self.limit:
+                key = (*identity, start)
+                previous = self.values.pop(key, None)
+                if previous is not None:
+                    self.size -= previous.nbytes
+                while self.values and self.size + block.nbytes > self.limit:
+                    _, removed = self.values.popitem(last=False)
+                    self.size -= removed.nbytes
+                self.values[key] = block
+                self.size += block.nbytes
+            return block[index - start]
+
+
+FRAME_BLOCK_CACHE = FrameBlockCache()
+
+
 def read_frame(path: Path, demo_name: str | None, camera: str, index: int) -> bytes:
     stat = path.stat()
-    cache_key = (str(path), stat.st_mtime_ns, demo_name, camera, index)
+    identity = (str(path), stat.st_ino, stat.st_size, stat.st_mtime_ns, demo_name, camera)
+    cache_key = (*identity, index)
     cached = IMAGE_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    with h5py.File(path, "r") as handle:
-        selected, demo = _demo_group(handle, demo_name)
-        _require_direct_schema(handle, demo)
-        available = {item["name"]: item["path"] for item in _camera_datasets(demo)}
-        if camera not in available:
-            raise KeyError(f"相机数据集不存在: {camera}")
-        dataset = demo[available[camera]]
-        if not len(dataset):
-            raise IndexError("相机数据集为空")
-        index = min(max(index, 0), len(dataset) - 1)
-        rgb = np.asarray(dataset[index])
-        if rgb.shape[-1] == 4:
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
-        else:
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        ok, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
-        if not ok:
-            raise RuntimeError(f"无法编码 {selected}/{camera} 第 {index} 帧")
-        value = encoded.tobytes()
-        IMAGE_CACHE.put(cache_key, value)
-        return value
+    rgb = FRAME_BLOCK_CACHE.get(identity, path, demo_name, camera, index)
+    conversion = cv2.COLOR_RGBA2BGR if rgb.shape[-1] == 4 else cv2.COLOR_RGB2BGR
+    bgr = cv2.cvtColor(rgb, conversion)
+    ok, encoded = cv2.imencode(".jpg", bgr, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    if not ok:
+        raise RuntimeError(f"无法编码 {demo_name}/{camera} 第 {index} 帧")
+    value = encoded.tobytes()
+    IMAGE_CACHE.put(cache_key, value)
+    return value
 
 
 class ViewerHandler(LocalHandlerMixin, BaseHTTPRequestHandler):
