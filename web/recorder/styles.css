@@ -190,6 +190,64 @@ button:disabled {
   margin: 15px 0 0
 }
 
+.zero-panel {
+  margin-top: 20px;
+  border-top-color: #ead8cd
+}
+
+.zero-panel>summary {
+  color: #92543f;
+  font-weight: 650
+}
+
+.zero-warning {
+  margin: 0 0 14px;
+  padding: 11px 12px;
+  border-radius: 8px;
+  background: #fff5ef;
+  color: #8b533f;
+  font-size: 11px;
+  line-height: 1.7
+}
+
+.zero-actions {
+  margin-bottom: 10px
+}
+
+.zero-result {
+  height: auto;
+  min-height: 92px;
+  max-height: 190px;
+  margin-bottom: 14px
+}
+
+.zero-confirm {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 8px;
+  align-items: start;
+  color: #704536;
+  line-height: 1.55;
+  cursor: pointer
+}
+
+.zero-confirm input {
+  width: 16px;
+  height: 16px;
+  margin: 2px 0 0;
+  accent-color: #a05b43
+}
+
+.repair {
+  width: 100%;
+  background: #a05b43;
+  color: white
+}
+
+.repair:hover:not(:disabled) {
+  background: #804531
+}
+
 details {
   border-top: 1px solid var(--line);
   padding-top: 16px;

@@ -30,8 +30,6 @@ def checkpoint_pose_contract(checkpoint, mode, *, mount_id="", policy_hz=None):
                 raise ValueError("checkpoint 标定快照校验失败")
             if mode != "absolute_base_pose" and mount_id != contract["mount_id"]:
                 raise ValueError("请确认当前相机安装版本与训练标定 mount_id 一致")
-            if policy_hz is not None and not np.isclose(policy_hz, contract["fps"]):
-                raise ValueError("位姿部署 policy_hz 必须等于训练数据 FPS")
             PoseCodec(mode, contract.get("calibration"))
             calibration_for_mode(contract.get("calibration"), mode, contract["mount_id"])
             return contract

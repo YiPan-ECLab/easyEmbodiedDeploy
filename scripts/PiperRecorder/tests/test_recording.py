@@ -57,7 +57,9 @@ class RecordingTests(unittest.TestCase):
             value = 0 if samples[0] < 4 else 0.02 + samples[0] * 0.001
             action = ArmCommand((value, 0, 0, 0, 0, 0), 0, now[0])
             item = ArmSample(action.joints, (0,) * 6, 0, 1, action)
-            return {"left": item, "right": item}
+            idle_action = ArmCommand((0,) * 6, 0, 99.0)
+            idle = ArmSample(idle_action.joints, (0,) * 6, 0, 1, idle_action)
+            return {"left": item, "right": idle}
 
         def ticks(_):
             for _ in range(7):
@@ -92,6 +94,60 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(episode.phases, [0] * 4 + [1] * 3)
         self.assertEqual(len(episode), 7)
         self.assertEqual(episode.recording_metadata["start_joint_delta_rad"], 0.01)
+
+    def test_either_arm_or_gripper_can_start_recording_at_threshold(self):
+        baseline = {side: ((0,) * 6, 0) for side in ("left", "right")}
+        for side in baseline:
+            for gripper_only in (False, True):
+                for scale, expected in ((0.99, False), (1.0, True)):
+                    samples = {}
+                    for arm in baseline:
+                        joints = (.01 * scale if arm == side and not gripper_only else 0,) + (0,) * 5
+                        width = .002 * scale if arm == side and gripper_only else 0
+                        command = ArmCommand(joints, width, 0)
+                        samples[arm] = ArmSample(joints, (0,) * 6, width, 1, command)
+                    with self.subTest(side=side, gripper_only=gripper_only, scale=scale):
+                        self.assertEqual(record._operator_started(samples, baseline, .01, .002), expected)
+
+    def test_nonfinite_feedback_is_rejected_before_clamping(self):
+        from types import SimpleNamespace
+        from piper_recorder.robot import PiperPair, _message_values, _normalize_gripper_width
+
+        for value in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(RuntimeError, "NaN/Inf"):
+                    _normalize_gripper_width(value, .1, "right")
+                with self.assertRaisesRegex(RuntimeError, "NaN/Inf"):
+                    _message_values(SimpleNamespace(msg=[value] + [0] * 5), 6, "right")
+                with self.assertRaisesRegex(RuntimeError, "有限"):
+                    PiperPair._clamp_joints([value] + [0] * 5)
+        self.assertEqual(_normalize_gripper_width(-.0001, .1, "right"), 0)
+        self.assertEqual(_normalize_gripper_width(.1001, .1, "right"), .1)
+
+    def test_idle_arm_does_not_require_new_leader_commands(self):
+        from piper_recorder.robot import PiperPair
+
+        pair = PiperPair.__new__(PiperPair)
+        pair.status_period_s = .5
+        pair.follow_hz = 200
+        pair._stop = threading.Event()
+        pair._lock = threading.Lock()
+        pair._error = None
+        pair._complete_leader_joints = mock.Mock(return_value=None)
+        pair.leader_gripper = mock.Mock()
+        pair.leader_gripper.get_gripper_ctrl_states.return_value = None
+        pair.follower = mock.Mock()
+        pair.follower_gripper = mock.Mock()
+        command = ArmCommand((0, 0, 0, 0, 0, .785398), 0, -100)
+        with (
+            mock.patch("piper_recorder.robot.time.monotonic", return_value=0),
+            mock.patch("piper_recorder.robot.ticks", return_value=iter([0, .005, .01])),
+        ):
+            pair._follow_loop(command, (0, 0, 0), 0)
+        self.assertIsNone(pair._error)
+        self.assertEqual(pair._command, command)
+        pair.follower.move_js.assert_not_called()
+        pair.follower_gripper.move_gripper_m.assert_not_called()
 
     def test_invalid_options_are_rejected_before_movement(self):
         robot = mock.Mock()

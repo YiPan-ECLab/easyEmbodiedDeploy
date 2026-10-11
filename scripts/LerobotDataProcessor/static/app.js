@@ -165,8 +165,8 @@ function renderFileTable() {
     return `<tr class="${issue ? "issue" : ""}">
       <td title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</td>
       <td>${formatNumber(file.frames)}</td><td>${formatNumber(file.source_task_frames)}</td>
-      <td>${formatNumber(file.source_home_frames)}</td><td>${formatNumber(file.trimmed_idle_frames)}</td>
-      <td>${Number(file.measured_fps).toFixed(3)}</td><td>${formatNumber(file.output_frames)}</td>
+      <td>${formatNumber(file.source_home_frames)}</td><td>${formatNumber(file.trimmed_leading_idle_frames || 0)} / ${formatNumber(file.trimmed_idle_frames)}</td>
+      <td>${file.temporal_fusion ? "mixed" : Number(file.measured_fps).toFixed(3)}</td><td>${formatNumber(file.output_frames)}</td>
       <td>${(Number(file.max_camera_skew_s) * 1000).toFixed(1)} ms</td>
       <td>${file.gaps || "0"}</td></tr>`;
   }).join("") || '<tr><td colspan="9">没有匹配的文件</td></tr>';
@@ -282,10 +282,9 @@ async function refreshStatus() {
 
 async function startConversion() {
   try {
-    const plan = await inspectInput(false);
-    if (plan.warnings.length && formPayload().gap_policy === "reject") {
-      throw new Error("严格模式不允许带警告的输入")
-    }
+    // The backend rejects invalid inputs; warnings also include informational
+    // notices such as preserving an intentionally fused sequence.
+    await inspectInput(false);
     const response = await request("api/start", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(formPayload()),

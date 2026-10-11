@@ -52,8 +52,8 @@ def validate_pose_bundle(root, columns):
             if not np.all(np.asarray(columns["episode_index"])[ids] == index):
                 raise ValueError("位姿 sidecar 的 episode 与 parquet 不一致")
             dt = np.diff(arrays["timestamps"])
-            period = 1/dataset.contract["fps"]
-            if np.any((dt < period/1.5) | (dt > period*1.5)):
+            period = 1/dataset.contract["fps"] if dataset.contract["fps"] != "mixed" else None
+            if period is not None and np.any((dt < period/1.5) | (dt > period*1.5)):
                 raise ValueError("位姿未来目标跨越异常实际采样间隔")
             codec = dataset.codec
             for local in range(rows):

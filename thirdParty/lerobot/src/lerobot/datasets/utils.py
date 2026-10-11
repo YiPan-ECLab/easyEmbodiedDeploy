@@ -164,7 +164,7 @@ class DatasetInfo:
     """
 
     codebase_version: str
-    fps: int
+    fps: int | str
     features: dict[str, dict]
 
     # Episode / frame counters — start at zero for new datasets
@@ -192,6 +192,9 @@ class DatasetInfo:
     # OpenAI-style tool schemas declared by the dataset. ``None`` means the
     # dataset doesn't declare any — readers fall back to ``DEFAULT_TOOLS``.
     tools: list[dict] | None = None
+    # Manual temporal decimation uses fps="mixed". Video timestamps still use
+    # a numeric encoding clock, independent of physical acquisition cadence.
+    video_fps: int | None = None
 
     def __post_init__(self) -> None:
         # Coerce feature shapes from list to tuple — JSON deserialisation
@@ -200,7 +203,8 @@ class DatasetInfo:
             if isinstance(ft.get("shape"), list):
                 ft["shape"] = tuple(ft["shape"])
 
-        if self.fps <= 0:
+        timeline_fps = self.video_fps if self.fps == "mixed" else self.fps
+        if not isinstance(timeline_fps, (int, float)) or timeline_fps <= 0:
             raise ValueError(f"fps must be positive, got {self.fps}")
         if self.chunks_size <= 0:
             raise ValueError(f"chunks_size must be positive, got {self.chunks_size}")
@@ -224,6 +228,8 @@ class DatasetInfo:
             d.pop("tools", None)
         if d.get("storage_format") is None:
             d.pop("storage_format", None)
+        if d.get("video_fps") is None:
+            d.pop("video_fps", None)
         return d
 
     @classmethod

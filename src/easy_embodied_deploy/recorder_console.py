@@ -19,8 +19,11 @@ from .http import LocalHandlerMixin, read_json
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "web/recorder"
 SCRIPT = ROOT / "scripts/PiperRecorder/record.py"
+ZERO_RECOVERY_SCRIPT = ROOT / "scripts/PiperRecorder/joint_zero_recovery.py"
 PYTHON = ROOT / "thirdParty/.venvs/piper-home/bin/python"
 EVENT_PREFIX = "PIPER_RECORDER_EVENT="
+ZERO_RESULT_PREFIX = "PIPER_ZERO_RESULT="
+ZERO_CONFIRMATION = "我已确认J2位于物理零位"
 
 
 def defaults():
@@ -80,6 +83,8 @@ class RecorderSession:
         self.stopping = False
         self.generation = 0
         self.closed = False
+        self.maintenance = False
+        self.maintenance_process = None
 
     def status(self):
         with self.lock:
@@ -89,6 +94,7 @@ class RecorderSession:
                 "running": running,
                 "pending": self.pending,
                 "stopping": self.stopping,
+                "maintenance": self.maintenance,
                 "session_id": self.generation,
                 "pid": self.process.pid if running else None,
                 "exit_code": self.process.poll() if self.process else None,
@@ -102,6 +108,8 @@ class RecorderSession:
         with self.lock:
             if self.closed:
                 raise RuntimeError("采集服务正在关闭")
+            if self.maintenance:
+                raise RuntimeError("主臂零点诊断/修复正在运行")
             if self.process is not None and self.process.poll() is None:
                 raise RuntimeError("采集会话已经在运行")
             self.process = subprocess.Popen(
@@ -172,6 +180,64 @@ class RecorderSession:
                 self.stopping = True
                 self._advance_stop()
 
+    def joint_zero(self, action, payload):
+        if action not in {"inspect", "repair"}:
+            raise ValueError("未知零点维护操作")
+        side = payload.get("side")
+        if side not in {"left", "right"}:
+            raise ValueError("请选择左主臂或右主臂")
+        if action == "repair" and payload.get("confirmation") != ZERO_CONFIRMATION:
+            raise ValueError("请先确认 J2 已位于真实机械零位")
+
+        command = [str(PYTHON), "-u", str(ZERO_RECOVERY_SCRIPT), "--side", side]
+        if action == "repair":
+            command += ["--repair", "--confirm-physical-zero"]
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("采集服务正在关闭")
+            if self.process is not None and self.process.poll() is None:
+                raise RuntimeError("请先结束采集会话并等待设备断开")
+            if self.maintenance:
+                raise RuntimeError("另一项主臂零点诊断/修复仍在运行")
+            self.maintenance = True
+            process = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                errors="replace",
+            )
+            self.maintenance_process = process
+
+        try:
+            try:
+                output, _ = process.communicate(timeout=45)
+            except subprocess.TimeoutExpired:
+                with self.lock:
+                    self.logs.append("零点维护超过 45 秒，继续等待安全收尾，不强杀进程")
+                output, _ = process.communicate()
+            result = None
+            with self.lock:
+                for line in output.splitlines():
+                    if line.startswith(ZERO_RESULT_PREFIX):
+                        try:
+                            result = json.loads(line[len(ZERO_RESULT_PREFIX) :])
+                        except ValueError as exc:
+                            raise RuntimeError(f"零点维护返回了无效结果：{exc}") from exc
+                    elif line.strip():
+                        self.logs.append(("[零点维护] " + line)[-4000:])
+            if not isinstance(result, dict):
+                raise RuntimeError("零点维护脚本没有返回结构化结果")
+            if process.returncode or not result.get("ok"):
+                raise RuntimeError(result.get("error") or "零点维护失败")
+            return result
+        finally:
+            with self.lock:
+                if self.maintenance_process is process:
+                    self.maintenance_process = None
+                    self.maintenance = False
+
     def _read(self, process):
         try:
             for line in process.stdout:
@@ -224,6 +290,13 @@ class RecorderSession:
             self.closed = True
         self.stop()
         process = self.process
+        maintenance_process = self.maintenance_process
+        if maintenance_process is not None and maintenance_process.poll() is None:
+            try:
+                maintenance_process.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                with self.lock:
+                    self.logs.append("零点维护仍未结束；为避免标定中断，不强杀进程")
         if process is None or process.poll() is not None:
             return
         try:
@@ -296,6 +369,12 @@ class Handler(LocalHandlerMixin, BaseHTTPRequestHandler):
                         "output": result.stdout + result.stderr,
                     }
                 )
+                return
+            elif route == "/api/joint-zero/inspect":
+                self.send(self.server.session.joint_zero("inspect", body))
+                return
+            elif route == "/api/joint-zero/repair":
+                self.send(self.server.session.joint_zero("repair", body))
                 return
             elif route == "/api/preview":
                 command, config = command_for(body)

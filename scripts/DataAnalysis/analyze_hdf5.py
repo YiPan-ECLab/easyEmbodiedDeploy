@@ -141,6 +141,8 @@ def analyze_file(path: Path, expected_fps: float, gap_factor: float, pose_thresh
                 errors.extend(range_errors(actions, "actions"))
                 errors.extend(range_errors(states, "states"))
 
+            fused = "temporal_fusion" in demo.attrs
+            metrics["sampling_fps"] = "mixed" if fused else expected_fps
             if not np.isfinite(timestamps).all() or not np.all(np.diff(timestamps) > 0):
                 errors.append("timestamps 必须有限且严格递增")
                 task_dt = np.asarray([], dtype=np.float64)
@@ -165,9 +167,9 @@ def analyze_file(path: Path, expected_fps: float, gap_factor: float, pose_thresh
                     task_dt_max_ms=float(task_dt.max() * 1000) if len(task_dt) else 0.0,
                     timing_outliers=int(np.count_nonzero(bad_gap)),
                 )
-                if measured and abs(measured - expected_fps) / expected_fps > 0.02:
+                if not fused and measured and abs(measured - expected_fps) / expected_fps > 0.02:
                     errors.append(f"实测 {measured:.3f} Hz 偏离期望 {expected_fps:g} Hz 超过 2%")
-                if np.any(bad_gap):
+                if not fused and np.any(bad_gap):
                     errors.append(
                         f"task 有 {np.count_nonzero(bad_gap)} 个显著时间异常，"
                         f"范围 {task_dt.min() * 1000:.3f}..{task_dt.max() * 1000:.3f} ms"
@@ -199,8 +201,8 @@ def analyze_file(path: Path, expected_fps: float, gap_factor: float, pose_thresh
                     ) if len(task_states) > 1 else 0.0,
                 )
                 if leading_idle:
-                    errors.append(f"task 开头有 {leading_idle} 个完全静止的相邻帧")
-                if not first_started:
+                    warnings.append(f"task 开头有 {leading_idle} 个完全静止的相邻帧，DataProcessor 将裁剪重复首帧")
+                if not first_started and not fused:
                     errors.append("task 第一帧未达到 Recorder 的人工接管阈值")
                 if trailing_idle:
                     warnings.append(

@@ -1,4 +1,4 @@
-"""Read-only HTTP API and static server for HDF5 episode inspection."""
+"""HDF5 inspection and non-destructive temporal fusion editor."""
 
 from __future__ import annotations
 
@@ -19,7 +19,8 @@ import numpy as np
 
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
-from easy_embodied_deploy.http import LocalHandlerMixin
+from easy_embodied_deploy.http import LocalHandlerMixin, read_json
+from easy_embodied_deploy import temporal_fusion
 
 
 STATIC_ROOT = Path(__file__).resolve().parent.parent / "static"
@@ -140,7 +141,7 @@ def _instruction(demo: h5py.Group) -> str:
 
 def _file_summary(path: Path) -> dict[str, Any]:
     stat = path.stat()
-    with h5py.File(path, "r", swmr=True) as handle:
+    with h5py.File(path, "r") as handle:
         demos = _demo_names(handle)
         counts = []
         first_demo = None
@@ -235,7 +236,7 @@ def _schema(handle: h5py.File) -> list[dict[str, Any]]:
 
 
 def read_episode(path: Path, requested_demo: str | None) -> dict[str, Any]:
-    with h5py.File(path, "r", swmr=True) as handle:
+    with h5py.File(path, "r") as handle:
         demo_name, demo = _demo_group(handle, requested_demo)
         _require_direct_schema(handle, demo)
         demos = _demo_names(handle)
@@ -336,7 +337,7 @@ def read_frame(path: Path, demo_name: str | None, camera: str, index: int) -> by
     cached = IMAGE_CACHE.get(cache_key)
     if cached is not None:
         return cached
-    with h5py.File(path, "r", swmr=True) as handle:
+    with h5py.File(path, "r") as handle:
         selected, demo = _demo_group(handle, demo_name)
         _require_direct_schema(handle, demo)
         available = {item["name"]: item["path"] for item in _camera_datasets(demo)}
@@ -413,6 +414,14 @@ class ViewerHandler(LocalHandlerMixin, BaseHTTPRequestHandler):
                 demo = query.get("demo", [None])[0]
                 self._json(read_episode(path, demo))
                 return
+            if parsed.path == "/api/fusion":
+                path = _safe_hdf5_path(query.get("path", [""])[0])
+                with h5py.File(path, "r") as handle:
+                    _, demo = _demo_group(handle, query.get("demo", [None])[0])
+                    _require_direct_schema(handle, demo)
+                    name = demo.name
+                self._json(temporal_fusion.load_plan(path, name))
+                return
             if parsed.path == "/api/frame":
                 path = _safe_hdf5_path(query.get("path", [""])[0])
                 demo = query.get("demo", [None])[0]
@@ -436,6 +445,29 @@ class ViewerHandler(LocalHandlerMixin, BaseHTTPRequestHandler):
                 self._error(exc)
             else:
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def do_POST(self) -> None:  # noqa: N802
+        try:
+            route = urlparse(self.path).path
+            if route not in ("/api/fusion/preview", "/api/fusion/save", "/api/fusion/export"):
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            body = read_json(self)
+            path = _safe_hdf5_path(body["path"])
+            with h5py.File(path, "r") as handle:
+                _, demo = _demo_group(handle, body.get("demo"))
+                _require_direct_schema(handle, demo)
+                name = demo.name
+            plan = body["plan"]
+            if route.endswith("/export"):
+                result = temporal_fusion.export_episode(path, name, plan, body.get("output_directory"))
+            elif route.endswith("/save"):
+                result = temporal_fusion.save_plan(path, name, plan)
+            else:
+                result = temporal_fusion.preview(path, name, plan)
+            self._json(result)
+        except Exception as exc:
+            self._error(exc)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if args and str(args[1]).startswith("4"):

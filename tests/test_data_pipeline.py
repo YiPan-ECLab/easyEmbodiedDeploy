@@ -30,7 +30,9 @@ import analyze_lerobot
 import analysis_app
 
 
-def make_episode(directory, *, gap=False, offset=0.0):
+def make_episode(directory, *, gap=False, offset=0.0, active_side=None,
+                 gripper_only=False, frames=27, task_frames=24,
+                 last_active=19, image_size=224):
     episode = EpisodeData()
     baseline = [
         0,
@@ -51,30 +53,34 @@ def make_episode(directory, *, gap=False, offset=0.0):
     episode.recording_metadata = dict(
         start_baseline=baseline, start_joint_delta_rad=0.01, start_gripper_delta_m=0.002
     )
-    for index in range(27):
+    for index in range(frames):
         timestamp = 100 + index / 30 + (0.15 if gap and index >= 9 else 0)
         sample = {}
         for side, sign in [("left", -1), ("right", 1)]:
+            step = min(index, last_active) if active_side in (None, side) else 0
             joints = (
-                0.02 + min(index, 19) * 0.002 + offset,
+                0.02 + (0 if gripper_only else step * 0.002) + offset,
                 0.2,
                 -0.2,
                 0,
                 0,
                 sign * 0.7853981634,
             )
-            command = ArmCommand(joints, 0.01, timestamp - 0.001)
-            sample[side] = ArmSample(joints, (0,) * 6, 0.01, 1.0, command)
+            width = 0.01 + (step * 0.00005 if gripper_only else 0)
+            # An unused arm legitimately retains its last accepted command.
+            action_time = 99.0 if active_side not in (None, side) else timestamp - 0.001
+            command = ArmCommand(joints, width, action_time)
+            sample[side] = ArmSample(joints, (0,) * 6, width, 1.0, command)
         frames = {
             name: CameraFrame(
-                np.full((224, 224, 3), index * 5, dtype=np.uint8), timestamp - 0.005
+                np.full((image_size, image_size, 3), index * 5 % 256, dtype=np.uint8), timestamp - 0.005
             )
             for name in CAMERA_NAMES
         }
         episode.append(
             frames,
             sample,
-            0 if index < 24 else 1,
+            0 if index < task_frames else 1,
             timestamp=timestamp,
             scheduled_timestamp=timestamp,
             capture_duration_s=0.001,
@@ -145,6 +151,93 @@ class DataPipelineTests(unittest.TestCase):
             selected, _, _ = processor._task_sample_indices(handle["data/demo_0"], 3)
         np.testing.assert_array_equal(selected, np.arange(0, 22, 3))
         self.assertEqual(report["output_frames"], 7)
+
+    def test_homing_cadence_does_not_determine_task_fps(self):
+        with h5py.File(self.file, "a") as handle:
+            demo = handle["data/demo_0"]
+            demo["trajectory_phase"][...] = [0] * 8 + [1] * 19
+            times = np.r_[np.arange(8) / 30, 7 / 30 + np.arange(1, 20) / 15]
+            demo["timestamps"][...] = times
+            demo["camera_timestamps"][...] = times[:, None] - np.full((27, 3), .005)
+        info = processor.inspect_file(self.file, processor.Settings(str(self.source), target_fps=30))
+        self.assertEqual(info["source_fps"], 30)
+        self.assertEqual(info["output_frames"], 7)
+
+    def test_home_cannot_supply_missing_task_frames(self):
+        with self.assertRaisesRegex(ValueError, "至少需要两帧 task"):
+            make_episode(self.root / "one-task-frame", task_frames=1)
+        with h5py.File(self.file, "a") as handle:
+            handle["data/demo_0/trajectory_phase"][...] = [0] + [1] * 26
+        with self.assertRaisesRegex(ValueError, "task 阶段至少需要两帧"):
+            processor.inspect_file(self.file, processor.Settings(str(self.source)))
+
+    def test_final_off_grid_change_is_reported_without_crossing_home(self):
+        with h5py.File(self.file, "a") as handle:
+            demo = handle["data/demo_0"]
+            demo["actions"][23, 0] += .01
+        info = processor.inspect_file(self.file, processor.Settings(str(self.source)))
+        self.assertTrue(any("末次任务变化" in warning for warning in info["warnings"]))
+        with h5py.File(self.file) as handle:
+            selected, _, _ = processor._task_sample_indices(handle["data/demo_0"], 3)
+        self.assertEqual(selected[-1], 21)
+
+    def test_writer_accepts_reused_camera_frames_but_rejects_backwards_time(self):
+        from piper_recorder.dataset import _validate_episode
+        episode = EpisodeData()
+        command = ArmCommand((0,) * 6, 0, 0)
+        sample = ArmSample(command.joints, (0,) * 6, 0, 1, command)
+        for index in range(2):
+            episode.append(
+                {name: CameraFrame(np.zeros((16, 16, 3), np.uint8), 0) for name in CAMERA_NAMES},
+                {side: sample for side in ("left", "right")}, 0, timestamp=index / 30)
+        _validate_episode(episode)
+        episode.camera_timestamps[1][0] = -.1
+        with self.assertRaisesRegex(ValueError, "不能倒退"):
+            _validate_episode(episode)
+
+    def test_single_arm_and_gripper_only_conversion(self):
+        for side in ("left", "right"):
+            for gripper_only in (False, True):
+                source = self.root / f"{side}-{gripper_only}"
+                file = make_episode(source, active_side=side, gripper_only=gripper_only,
+                                    frames=1000, task_frames=960, last_active=944, image_size=64)
+                for mode in ("absolute_joint", "delta_joint"):
+                    with self.subTest(side=side, gripper_only=gripper_only, mode=mode):
+                        target = self.root / f"{side}-{gripper_only}-{mode}"
+                        result = processor.run(processor.Settings(
+                            str(source), output_root=str(target), target_fps=30,
+                            action_mode=mode, task="single arm test"))
+                        self.assertTrue(result["validation"]["valid"], result["validation"])
+                        columns, rows = processor._read_parquet_rows(target / "lerobot")
+                        with h5py.File(file) as handle:
+                            demo = handle["data/demo_0"]
+                            selected, _, _ = processor._task_sample_indices(demo, 1)
+                            actions = np.asarray(demo["actions"][selected], np.float32)
+                            if mode == "delta_joint":
+                                actions = np.diff(actions, axis=0)
+                            np.testing.assert_array_equal(columns["action"], actions)
+                            np.testing.assert_array_equal(columns["observation.state"],
+                                np.asarray(demo["states"][selected[:rows]], np.float32))
+                        stationary = slice(7, 14) if side == "left" else slice(0, 7)
+                        if mode == "delta_joint":
+                            np.testing.assert_array_equal(columns["action"][:, stationary], 0)
+                        self.assertEqual(rows, 945 - (mode == "delta_joint"))
+
+    def test_statistics_long_constant_and_nearly_constant_axes(self):
+        from lerobot.datasets.compute_stats import RunningQuantileStats, aggregate_stats
+
+        values = np.tile(np.array([2.437108, -1.940876, .785398, .01], np.float32), (10000, 1))
+        values[::3, 0] += .001
+        truth = values.astype(np.float64)
+        episode_stats = []
+        for part in np.array_split(values, 2):
+            accumulator = RunningQuantileStats()
+            for batch in np.array_split(part, 5):
+                accumulator.update(batch)
+            episode_stats.append({"action": accumulator.get_statistics()})
+        stats = aggregate_stats(episode_stats)["action"]
+        np.testing.assert_allclose(stats["mean"], truth.mean(0), atol=1e-10, rtol=0)
+        np.testing.assert_allclose(stats["std"], truth.std(0), atol=2e-6, rtol=0)
 
     def test_rejects_gaps_and_invalid_fps_without_creating_output(self):
         make_episode(self.source, gap=True)

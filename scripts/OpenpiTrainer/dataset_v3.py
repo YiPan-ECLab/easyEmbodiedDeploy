@@ -58,7 +58,7 @@ class LeRobotV3Dataset:
         info = json.loads((self.root / "meta/info.json").read_text(encoding="utf-8"))
         if info.get("codebase_version") != "v3.0":
             raise ValueError(f"只支持 LeRobot v3.0，检测到 {info.get('codebase_version')!r}")
-        self.fps = float(info["fps"])
+        self.fps = float(info["video_fps"] if info["fps"] == "mixed" else info["fps"])
         if not np.isfinite(self.fps) or self.fps <= 0:
             raise ValueError("数据集 fps 必须为有限正数")
         self._video_path_template = str(

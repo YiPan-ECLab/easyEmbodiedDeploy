@@ -275,8 +275,8 @@ def record_episode(
     robot.home(
         on_sample=lambda: capture(HOME_PHASE, time.monotonic()), sample_hz=hz
     )
-    if not any(phase == TASK_PHASE for phase in episode.phases):
-        raise RuntimeError("没有录到任务阶段帧，不能保存")
+    if episode.phases.count(TASK_PHASE) < 2:
+        raise RuntimeError("任务阶段不足两帧，不能保存；请延长实际操作时间")
     return episode
 
 

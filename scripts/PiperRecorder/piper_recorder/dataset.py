@@ -165,9 +165,13 @@ def _validate_episode(episode: EpisodeData) -> None:
     home = np.flatnonzero(phases == HOME_PHASE)
     if len(home) and not np.all(phases[home[0] :] == HOME_PHASE):
         raise ValueError("trajectory_phase 必须是连续 task 前缀和 home 后缀")
+    if np.count_nonzero(phases == TASK_PHASE) < 2:
+        raise ValueError("episode 至少需要两帧 task，home 帧不能补足任务长度")
     camera_timestamps = np.asarray(episode.camera_timestamps, dtype=np.float64)
     if camera_timestamps.shape != (n, len(CAMERA_NAMES)) or not np.isfinite(camera_timestamps).all():
         raise ValueError("camera_timestamps 必须是有限的 (T,3)")
+    if np.any(np.diff(camera_timestamps, axis=0) < 0):
+        raise ValueError("camera_timestamps 不能倒退；允许复用同一相机帧")
     if episode.scheduled_timestamps:
         scheduled = np.asarray(episode.scheduled_timestamps, dtype=np.float64)
         if not np.isfinite(scheduled).all() or not np.all(np.diff(scheduled) > 0):

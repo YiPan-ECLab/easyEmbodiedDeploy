@@ -70,11 +70,16 @@ def verify_can_interface(name: str) -> None:
 def _message_values(message, length: int, name: str) -> tuple[float, ...]:
     if message is None or len(message.msg) != length:
         raise RuntimeError(f"缺少有效的{name}反馈")
-    return tuple(float(value) for value in message.msg)
+    values = tuple(float(value) for value in message.msg)
+    if not all(math.isfinite(value) for value in values):
+        raise RuntimeError(f"{name}反馈含 NaN/Inf")
+    return values
 
 
 def _normalize_gripper_width(value: float, maximum: float, name: str) -> float:
     value = float(value)
+    if not math.isfinite(value):
+        raise RuntimeError(f"{name} 夹爪宽度含 NaN/Inf")
     return min(maximum, max(GRIPPER_LIMITS_M[0], value))
 
 
@@ -182,13 +187,58 @@ class PiperPair:
                 raise RuntimeError(f"{self.follower_name} 没有完整反馈")
 
     @staticmethod
+    def _enable_failure_details(arm) -> str:
+        details = []
+        fault_names = (
+            ("voltage_too_low", "欠压"),
+            ("motor_overheating", "电机过温"),
+            ("driver_overcurrent", "过流"),
+            ("driver_overheating", "驱动器过温"),
+            ("collision_status", "碰撞"),
+            ("driver_error_status", "驱动器错误"),
+            ("stall_status", "堵转"),
+        )
+        try:
+            joints_message = arm.get_joint_angles()
+            joints = None if joints_message is None else tuple(joints_message.msg)
+            for index in range(1, 7):
+                driver_message = arm.get_driver_states(index)
+                if driver_message is None:
+                    details.append(f"J{index}:无驱动反馈")
+                    continue
+                driver = driver_message.msg
+                foc = driver.foc_status
+                if foc.driver_enable_status:
+                    continue
+                faults = [label for attr, label in fault_names if bool(getattr(foc, attr, False))]
+                motor_message = arm.get_motor_states(index)
+                motor = None if motor_message is None else motor_message.msg
+                position = (
+                    "?"
+                    if joints is None or len(joints) < index
+                    else f"{math.degrees(float(joints[index - 1])):+.3f}°"
+                )
+                current = "?" if motor is None else f"{float(motor.current):+.3f}A"
+                torque = "?" if motor is None else f"{float(motor.torque):+.3f}N·m"
+                fault_text = "/".join(faults) if faults else "无故障位"
+                details.append(
+                    f"J{index}:位置{position},状态码0x{int(driver.foc_status_code):02X},"
+                    f"{fault_text},电流{current},力矩{torque}"
+                )
+        except Exception as exc:  # noqa: BLE001 - preserve the original enable error
+            return f"；读取关节诊断失败: {exc}"
+        return "" if not details else "；" + "；".join(details)
+
+    @staticmethod
     def _wait_enabled(arm, name: str, timeout: float = 5.0) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if arm.enable():
                 return
             time.sleep(0.02)
-        raise RuntimeError(f"{name} 使能失败")
+        raise RuntimeError(
+            f"{name} 使能失败{PiperPair._enable_failure_details(arm)}"
+        )
 
     @staticmethod
     def _check_status(arm, name: str) -> None:
@@ -363,6 +413,9 @@ class PiperPair:
 
     @staticmethod
     def _clamp_joints(values) -> tuple[float, ...]:
+        values = tuple(float(value) for value in values)
+        if len(values) != 6 or not all(math.isfinite(value) for value in values):
+            raise RuntimeError("关节控制量必须为有限的 6 维数组")
         return tuple(
             min(high, max(low, float(value)))
             for value, (low, high) in zip(values, JOINT_LIMITS_RAD)
@@ -512,7 +565,9 @@ class PiperPair:
                 arm.set_speed_percent(self.home_speed)
                 self._wait_enabled(arm, name)
             try:
-                start_barrier.wait(timeout=5.0)
+                # A peer can spend up to 5 s switching modes and 5 s enabling
+                # each arm before it reaches this synchronization point.
+                start_barrier.wait(timeout=16.0)
             except threading.BrokenBarrierError as exc:
                 raise RuntimeError("左右两组机械臂回零启动同步失败") from exc
 
@@ -573,6 +628,11 @@ class PiperPair:
                 )
                 for future in futures:
                     future.result()
+        except BaseException:
+            # Wake the peer immediately so its real failure can be collected
+            # instead of leaving one side hidden behind a barrier timeout.
+            start_barrier.abort()
+            raise
         finally:
             self._restore_teaching()
         print(f"{self.side}: 主从臂和两个夹爪回零完成")
@@ -616,8 +676,20 @@ class DualPiper:
     def _run_parallel(self, operation: Callable[[PiperPair], None]) -> None:
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(operation, pair) for pair in self.pairs.values()]
-            for future in futures:
+            self._finish_parallel(futures)
+
+    @staticmethod
+    def _finish_parallel(futures) -> None:
+        errors = []
+        for future in futures:
+            try:
                 future.result()
+            except Exception as exc:  # noqa: BLE001 - report every physical side
+                message = str(exc)
+                if message not in errors:
+                    errors.append(message)
+        if errors:
+            raise RuntimeError("；".join(errors))
 
     def connect(self) -> None:
         print("四臂 CAN 接口预检...")
@@ -653,8 +725,7 @@ class DualPiper:
                     on_sample()
                     if all(future.done() for future in futures):
                         break
-            for future in futures:
-                future.result()
+            self._finish_parallel(futures)
 
     def close(self) -> None:
         error = None

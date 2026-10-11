@@ -4,7 +4,9 @@ let state = null,
   online = false,
   sending = false,
   lastToken = null,
-  configured = false;
+  configured = false,
+  zeroInspection = null;
+const zeroConfirmation = '我已确认J2位于物理零位';
 const phases = {
   idle: ['准备就绪', '从连接设备开始', '连接并回零后，可输入指令开始采集。', 'home'],
   initializing: ['正在连接', '正在初始化设备', '正在连接三台相机与四台机械臂，请等待。', 'home'],
@@ -45,6 +47,33 @@ function config() {
   return values;
 }
 
+function renderZeroInspection() {
+  const output = $('zero-result');
+  if (!zeroInspection) {
+    output.textContent = state?.maintenance ? '零点维护正在运行…' : '尚未检查';
+    return;
+  }
+  const before = zeroInspection.before;
+  if (!before) {
+    output.textContent = zeroInspection.error || '没有收到诊断反馈';
+    return;
+  }
+  const side = zeroInspection.side === 'left' ? '左主臂' : '右主臂';
+  const j2 = before.drivers[1];
+  const motor = before.motors[1];
+  const lines = [
+    `${side} (${zeroInspection.arm})`,
+    `J2: ${before.joints_deg[1].toFixed(3)}° · 状态码 0x${j2.code.toString(16).toUpperCase().padStart(2, '0')} · ${j2.enabled ? '已使能' : '未使能'}`,
+    `电流 ${Number(motor.current_a).toFixed(3)} A · 力矩 ${Number(motor.torque_nm).toFixed(3)} N·m`,
+    zeroInspection.eligible ? '匹配已验证故障，可在人工确认物理零位后恢复。' : `拒绝自动恢复：${zeroInspection.reasons.join('；')}`
+  ];
+  if (zeroInspection.repaired && zeroInspection.after) {
+    const after = zeroInspection.after;
+    lines.push(`恢复完成：J2 ${after.joints_deg[1].toFixed(3)}° · 状态码 0x${after.drivers[1].code.toString(16).toUpperCase().padStart(2, '0')}`);
+  }
+  output.textContent = lines.join('\n');
+}
+
 function render() {
   if (!state) return;
   const phase = phases[state.phase] || phases.idle;
@@ -56,13 +85,19 @@ function render() {
   $('frames').textContent = state.frames || 0;
   $('pulse').classList.toggle('live', state.running);
   document.querySelectorAll('[data-step]').forEach(el => el.classList.toggle('active', el.dataset.step === phase[3]));
-  $('config-fields').disabled = state.running;
-  $('start').disabled = state.running || sending || !online;
+  $('config-fields').disabled = state.running || state.maintenance;
+  $('start').disabled = state.running || state.maintenance || sending || !online;
+  $('check').disabled = state.running || state.maintenance || sending || !online;
   $('stop').disabled = !state.running || state.stopping || sending || !online;
   $('instruction').disabled = state.phase !== 'instruction' || !can;
   $('pedal').disabled = !can || !action;
   $('discard').hidden = state.phase !== 'review';
   $('discard').disabled = !can;
+  document.querySelectorAll('.zero-inspect').forEach(button => {
+    button.disabled = state.running || state.maintenance || sending || !online;
+  });
+  $('zero-confirm').disabled = state.running || state.maintenance || sending || !zeroInspection?.eligible;
+  $('zero-repair').disabled = state.running || state.maintenance || sending || !online || !zeroInspection?.eligible || !$('zero-confirm').checked;
   $('pedal-label').textContent = state.pending ? '操作已发送，请等待' : state.phase === 'instruction' ? '开始本条采集' : state.phase === 'review' ? '保存这一条' : action === 'finish' ? '结束采集并回零' : '请等待当前阶段完成';
   $('connection').textContent = online ? '控制台已连接' : '连接中断，正在重连';
   $('saved-count').textContent = `${state.saved.length} 条`;
@@ -94,6 +129,7 @@ function render() {
       });
     }
   }
+  renderZeroInspection();
 }
 async function perform(fn) {
   if (sending) return;
@@ -135,6 +171,26 @@ $('check').onclick = () => perform(async () => {
   const result = await api('check', {});
   error(result.output);
 });
+document.querySelectorAll('.zero-inspect').forEach(button => {
+  button.onclick = () => perform(async () => {
+    $('zero-confirm').checked = false;
+    zeroInspection = await api('joint-zero/inspect', {side: button.dataset.side});
+    $('zero-panel').open = true;
+  });
+});
+$('zero-confirm').onchange = render;
+$('zero-repair').onclick = () => {
+  if (!zeroInspection?.eligible || !$('zero-confirm').checked) return;
+  const side = zeroInspection.side === 'left' ? '左主臂' : '右主臂';
+  if (!confirm(`最后确认：把${side} J2 当前物理位置写成永久零点？\n\n错误姿态标零会造成碰撞。`)) return;
+  perform(async () => {
+    zeroInspection = await api('joint-zero/repair', {
+      side: zeroInspection.side,
+      confirmation: zeroConfirmation
+    });
+    $('zero-confirm').checked = false;
+  });
+};
 $('copy-log').onclick = () => perform(async () => {
   await navigator.clipboard.writeText($('logs').textContent);
 });

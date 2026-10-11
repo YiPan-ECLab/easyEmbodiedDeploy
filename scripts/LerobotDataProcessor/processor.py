@@ -161,9 +161,8 @@ def _bool_attr(value) -> bool:
     return bool(value)
 
 
-def _task_sample_indices(demo: h5py.Group, stride: int, *, pose: bool = False) -> tuple[np.ndarray, int, int]:
-    """Select task frames, excluding trailing idle and homing frames."""
-    indices = np.arange(0, len(demo["actions"]), stride)
+def _task_end(demo: h5py.Group) -> int:
+    """Validate the phase boundary before using task timestamps or targets."""
     if "trajectory_phase" not in demo:
         raise ValueError(
             "缺少 trajectory_phase；为避免把回零过程混入训练，"
@@ -173,7 +172,6 @@ def _task_sample_indices(demo: h5py.Group, stride: int, *, pose: bool = False) -
     phase = np.asarray(demo["trajectory_phase"])
     if phase.shape != (len(demo["actions"]),):
         raise ValueError("trajectory_phase 必须为 (T,)")
-    sampled_phase = phase[indices]
     invalid = np.setdiff1d(np.unique(phase), (TASK_PHASE, HOME_PHASE))
     if len(invalid):
         raise ValueError(f"trajectory_phase 含未知值：{invalid.tolist()}")
@@ -182,29 +180,45 @@ def _task_sample_indices(demo: h5py.Group, stride: int, *, pose: bool = False) -
     home = np.flatnonzero(phase == HOME_PHASE)
     if len(home) and not np.all(phase[home[0] :] == HOME_PHASE):
         raise ValueError("trajectory_phase 必须是连续 task 前缀和可选 home 后缀")
-    task_indices = indices[sampled_phase == TASK_PHASE]
-    excluded_home_frames = len(indices) - len(task_indices)
-    if not len(task_indices):
-        raise ValueError("trajectory_phase 中没有 task(0) 帧")
-    if len(task_indices) > 1 and np.any(np.diff(task_indices) != stride):
-        raise ValueError("task phase 必须是连续区间，不能跨非任务片段计算 action")
+    return int(home[0]) if len(home) else len(phase)
 
-    task_end = int(home[0]) if len(home) else len(phase)
-    last_active = task_end - 1
-    actions = demo["actions"]
-    while (
-        last_active > 0
-        and np.array_equal(actions[last_active], actions[last_active - 1])
-        and (not pose or all(np.array_equal(demo[key][last_active], demo[key][last_active-1])
-                            for key in ("states", "obs/left_ee_states", "obs/right_ee_states")))
-    ):
-        last_active -= 1
+
+def _task_active_bounds(demo: h5py.Group, task_end: int, *, pose: bool = False) -> tuple[int, int]:
+    """Keep the anchor before the first change and the first final target.
+
+    Joint modes retain the existing full dual-arm command criterion. Pose
+    modes also retain follower settling visible in state or flange feedback.
+    """
+    fields = ["actions"]
+    if pose:
+        fields += ["states", "obs/left_ee_states", "obs/right_ee_states"]
+    changed = np.zeros(max(0, task_end - 1), dtype=bool)
+    for key in fields:
+        values = np.asarray(demo[key][:task_end])
+        changed |= np.any(values[1:] != values[:-1], axis=1)
+    changes = np.flatnonzero(changed)
+    if not len(changes):
+        return 0, 0
+    return int(changes[0]), int(changes[-1] + 1)
+
+
+def _task_sample_indices(demo: h5py.Group, stride: int, *, pose: bool = False) -> tuple[np.ndarray, int, int]:
+    """Trim idle edges and home for every sequence; never resample fused input."""
+    task_end = _task_end(demo)
+    if "temporal_fusion" in demo.attrs:
+        stride = 1
+    task_indices = np.arange(0, task_end, stride)
+    excluded_home_frames = len(range(0, len(demo["actions"]), stride)) - len(task_indices)
+    first_active, last_active = _task_active_bounds(demo, task_end, pose=pose)
     trimmed_idle_frames = task_end - last_active - 1
     # Keep the first fixed-grid sample at or after the final target change. This
-    # preserves the endpoint at lower FPS without retaining the later wait.
+    # preserves the endpoint when that sample exists before the home boundary.
     endpoint = int(np.searchsorted(task_indices, last_active, side="left"))
     if endpoint < len(task_indices):
         task_indices = task_indices[: endpoint + 1]
+    # Keep the grid sample at/before the anchor for ordinary resampling. For
+    # fused input stride=1, this removes exactly the leading duplicate frames.
+    task_indices = task_indices[task_indices >= (first_active // stride) * stride]
     return task_indices, excluded_home_frames, trimmed_idle_frames
 
 
@@ -279,12 +293,18 @@ def inspect_file(path: Path, settings: Settings) -> dict:
         t = np.asarray(demo["timestamps"], dtype=np.float64)
         if t.shape != (n,) or not np.isfinite(t).all() or not np.all(np.diff(t) > 0):
             raise ValueError(f"{path.name}: timestamps 必须有限且严格递增")
-        dt = np.diff(t)
+        task_end = _task_end(demo)
+        if task_end < 2:
+            raise ValueError(f"{path.name}: task 阶段至少需要两帧，不能使用 home 帧估计任务帧率")
+        # Homing is excluded from training and may have a different cadence.
+        # In short demonstrations it can dominate the full-episode median.
+        dt = np.diff(t[:task_end])
         measured = float(1 / np.median(dt))
+        fused = "temporal_fusion" in demo.attrs
         source_fps = settings.source_fps or int(round(measured))
-        if source_fps <= 0 or abs(measured - source_fps) / source_fps > .02:
+        if not fused and (source_fps <= 0 or abs(measured - source_fps) / source_fps > .02):
             raise ValueError(f"{path.name}: 时间戳估计 {measured:.3f} Hz，与源帧率 {source_fps} 不符")
-        if settings.target_fps > source_fps or source_fps % settings.target_fps:
+        if not fused and (settings.target_fps > source_fps or source_fps % settings.target_fps):
             raise ValueError(f"{path.name}: 目标 {settings.target_fps} Hz 必须整除源帧率 {source_fps} Hz，不支持升采样")
         arrays = {}
         for key in ("actions", "states"):
@@ -312,7 +332,7 @@ def inspect_file(path: Path, settings: Settings) -> dict:
                 )
         else:
             max_camera_skew = None
-        stride = source_fps // settings.target_fps
+        stride = 1 if fused else source_fps // settings.target_fps
         selected, excluded_home_frames, trimmed_idle_frames = _task_sample_indices(demo, stride, pose=settings.action_mode in POSE_MODES)
         sampled_frames = len(selected)
         output_frames = sampled_frames - int(settings.action_mode == "delta_joint" or settings.action_mode in POSE_MODES)
@@ -320,8 +340,8 @@ def inspect_file(path: Path, settings: Settings) -> dict:
             from easy_embodied_deploy.pose_conversion import read_raw_poses
             read_raw_poses(demo)
         if output_frames < 1:
-            raise ValueError(f"{path.name}: 降采样后不足以计算增量")
-        selected_dt = np.diff(t[selected])
+            raise ValueError(f"{path.name}: 裁剪及降采样后不足两帧，无法构造未来动作；请延长任务或提高目标帧率")
+        selected_dt = np.full(len(selected)-1, 1/settings.target_fps) if fused else np.diff(t[selected])
         nominal_dt = 1 / settings.target_fps
         gap_positions = np.flatnonzero(
             (selected_dt < nominal_dt / MAX_GAP_FACTOR)
@@ -338,17 +358,24 @@ def inspect_file(path: Path, settings: Settings) -> dict:
                 f"{path.name}: task 段有 {gap_count} 个采样间隔异常，最大 {max_gap:.3f}s；"
                 "严格模式拒绝改变这些间隔"
             )
-        warnings = []
+        warnings = (["人工融合序列：裁剪首尾静止帧并排除 HOME，不再降采样；目标 FPS 仅用于逻辑时间轴"] if fused else [])
+        last_active = task_end - trimmed_idle_frames - 1
+        if selected[-1] < last_active:
+            warnings.append(
+                f"末次任务变化在最后一个固定网格采样之后，末尾 {last_active - int(selected[-1])} "
+                "个源帧未覆盖；可提高目标 FPS，或采集时在最终动作后稍等再结束"
+            )
         if gap_count:
             warnings.append(
                 f"task 段 {gap_count} 个采样间隔异常将被映射到固定 {settings.target_fps} Hz；"
                 f"最大间隔 {max_gap:.3f}s，跨异常间隔动作 {max_gap_action:.4f} rad L2"
             )
-        return dict(name=path.name, frames=n, source_fps=source_fps,
+        return dict(name=path.name, frames=n, source_fps="mixed" if fused else source_fps, temporal_fusion=fused,
                     measured_fps=round(measured, 4), stride=stride,
                     sampled_frames=sampled_frames, output_frames=output_frames,
                     excluded_home_frames=excluded_home_frames,
                     trimmed_idle_frames=trimmed_idle_frames,
+                    trimmed_leading_idle_frames=int(selected[0]),
                     source_task_frames=int(np.count_nonzero(np.asarray(demo["trajectory_phase"]) == TASK_PHASE)),
                     source_home_frames=int(np.count_nonzero(np.asarray(demo["trajectory_phase"]) == HOME_PHASE)),
                     camera_shapes=shapes, max_camera_skew_s=max_camera_skew,
@@ -397,19 +424,20 @@ def scan(settings: Settings) -> dict:
     if any(x["camera_shapes"] != files[0]["camera_shapes"] for x in files):
         raise ValueError("不同 episode 的相机尺寸不一致")
     source_label = sources[0].name if len(sources) == 1 else f"{sources[0].name}_merged"
-    default_out = Path("datasets/lerobot") / f"{source_label}_{settings.target_fps}hz_{settings.action_mode}"
+    frequency_label = "mixed" if any(item.get("temporal_fusion") for item in files) else f"{settings.target_fps}hz"
+    default_out = Path("datasets/lerobot") / f"{source_label}_{frequency_label}_{settings.action_mode}"
     out = resolve_path(settings.output_root or default_out)
     if any(out == source or out in source.parents or source in out.parents for source in sources):
         raise ValueError("输出目录必须与输入目录分开，不能互相包含")
     warnings = [f"{item['name']}: {warning}" for item in files for warning in item["warnings"]]
     return dict(input_dir=portable_path(sources[0]), input_dirs=[portable_path(path) for path in sources],
-                target_fps=settings.target_fps, action_mode=settings.action_mode,
+                target_fps=settings.target_fps, sampling_fps="mixed" if frequency_label == "mixed" else settings.target_fps, action_mode=settings.action_mode,
                 output_root=portable_path(out), files=files,
                 episodes=len(files), input_frames=sum(x["frames"] for x in files),
                 output_frames=sum(x["output_frames"] for x in files),
                 gaps=sum(x["gaps"] for x in files),
                 warnings=warnings,
-                repo_id=settings.repo_id or f"local/piper_{settings.target_fps}hz_{settings.action_mode}")
+                repo_id=settings.repo_id or f"local/piper_{frequency_label}_{settings.action_mode}")
 
 
 def make_features(shapes: list, action_mode="absolute_joint") -> dict:
@@ -494,7 +522,7 @@ def validate_lerobot_bundle(bundle_root: str | Path, *, expected: dict | None = 
     try:
         info = json.loads(info_path.read_text(encoding="utf-8"))
         stats = json.loads(stats_path.read_text(encoding="utf-8"))
-        fps = int(info["fps"])
+        fps = int(info["video_fps"] if info["fps"] == "mixed" else info["fps"])
         total_episodes = int(info["total_episodes"])
         total_frames = int(info["total_frames"])
         if fps <= 0 or total_episodes <= 0 or total_frames <= 0:
@@ -707,7 +735,8 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
             from easy_embodied_deploy.pose_dataset import new_contract
             calibration = load_calibration(resolve_path(settings.calibration_bundle) if settings.calibration_bundle else None,
                                            settings.action_mode, settings.calibration_mount_id)
-            pose_contract = new_contract(settings.action_mode, settings.target_fps, calibration, settings.calibration_mount_id)
+            sampling_fps = "mixed" if any(item.get("temporal_fusion") for item in plan["files"]) else settings.target_fps
+            pose_contract = new_contract(settings.action_mode, sampling_fps, calibration, settings.calibration_mount_id)
         for index, info in enumerate(plan["files"]):
             checkpoint()
             source_dir = resolve_path(info.get("source_dir") or plan["input_dir"])
@@ -776,6 +805,11 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
             checkpoint()
         emit("finalizing", message="保存 LeRobot 元数据与官方统计量")
         dataset.finalize()
+        if any(item.get("temporal_fusion") for item in plan["files"]):
+            from lerobot.datasets.io_utils import write_info
+            dataset.meta.info.video_fps = settings.target_fps
+            dataset.meta.info.fps = "mixed"
+            write_info(dataset.meta.info, output / "lerobot")
         if pose_contract is not None:
             from easy_embodied_deploy.pose_dataset import compute_chunk_statistics
             emit("pose_statistics", message="按固定锚点的完整 50 步 chunk 统计有效位姿目标，排除尾部填充")

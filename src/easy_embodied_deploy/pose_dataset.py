@@ -28,7 +28,7 @@ def new_contract(mode, fps, calibration=None, mount_id=""):
     return dict(schema="piper_pose_actions", version=1, action_mode=mode,
                 state_axes=STATE_AXES, action_axes=POSE_AXES, state_units="rad x6,m per arm",
                 rotation="rotvec_rad", position_units="m", pose_frame="own_base_flange",
-                target_offset=1, chunk_anchor="observation_time", horizon=50, fps=int(fps),
+                target_offset=1, chunk_anchor="observation_time", horizon=50, fps="mixed" if fps == "mixed" else int(fps),
                 padding="repeat_last_target_mask_loss_and_statistics",
                 calibration=calibration, calibration_sha256=fingerprint(calibration),
                 mount_id=mount_id, episodes=[])

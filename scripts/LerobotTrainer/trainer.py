@@ -355,8 +355,8 @@ def validate_dataset(
             pose_dataset = PoseDataset(root)
             if pose_dataset.rows != int(info.get("total_frames", 0)):
                 raise TrainerConfigError("位姿 sidecar 帧数不一致")
-            if len(pose_dataset.episodes) != int(info.get("total_episodes", 0)) or pose_contract["fps"] != info.get("fps"):
-                raise TrainerConfigError("位姿 sidecar 的 episode 数或 FPS 与数据集不一致")
+            if len(pose_dataset.episodes) != int(info.get("total_episodes", 0)):
+                raise TrainerConfigError("位姿 sidecar 的 episode 数与数据集不一致")
             for episode_index in range(len(pose_dataset.episodes)):
                 pose_dataset.episode(episode_index)
             stats = training_stats(root, stats)
@@ -403,7 +403,7 @@ def validate_dataset(
 
     episodes = int(info.get("total_episodes", 0) or 0)
     frames = int(info.get("total_frames", 0) or 0)
-    fps = float(info.get("fps", 0) or 0)
+    fps = float(info.get("video_fps", 0) if info.get("fps") == "mixed" else info.get("fps", 0) or 0)
     if episodes < 1 or frames < 1 or not math.isfinite(fps) or fps <= 0:
         raise TrainerConfigError("数据集 episodes、frames 或 fps 无效")
 
@@ -444,7 +444,8 @@ def validate_dataset(
     return {
         "root": str(root),
         "repo_id": _default_repo_id(root),
-        "fps": fps,
+        "fps": info.get("fps"),
+        "video_fps": fps,
         "episodes": episodes,
         "frames": frames,
         "action_mode": declared_action_mode or action_mode,

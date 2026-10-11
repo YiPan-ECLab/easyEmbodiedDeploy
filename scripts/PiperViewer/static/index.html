@@ -10,7 +10,7 @@
   <header class="topbar">
     <div class="brand">
       <span class="brand-mark"><i data-lucide="scan-line"></i></span>
-      <div><strong>Piper HDF5 Viewer</strong><span>只读数据检查</span></div>
+      <div><strong>Piper HDF5 Viewer</strong><span>轨迹回放与部分融合</span></div>
     </div>
     <form id="directory-form" class="directory-form">
       <i data-lucide="folder-open"></i>
@@ -81,6 +81,32 @@
             <button data-speed="1" class="active">1x</button>
             <button data-speed="2">2x</button>
           </div>
+        </section>
+
+        <section class="fusion-panel" aria-label="部分融合">
+          <div class="fusion-heading"><strong>部分融合</strong><span>简单片段加大步长，复杂片段保留基础密度。原始文件保留。</span></div>
+          <div class="fusion-controls">
+            <label>基础步长<input id="fusion-base" type="number" min="1" step="1" value="1"></label>
+            <label>预览 FPS<input id="fusion-fps" type="number" min="1" step="1" value="30"></label>
+            <label>起始帧<input id="fusion-start" type="number" min="1" step="1" value="1"></label>
+            <button id="fusion-mark-start">当前帧设为起点 [</button>
+            <label>结束帧<input id="fusion-end" type="number" min="2" step="1" value="2"></label>
+            <button id="fusion-mark-end">当前帧设为终点 ]</button>
+            <label>片段倍率<input id="fusion-factor" type="number" min="1" step="1" value="3"></label>
+            <button id="fusion-add">添加片段</button>
+          </div>
+          <p class="fusion-help">帧号从 1 开始，含起点和终点；基础步长 1 = 未标注处逐帧保留，倍率 3 = 片段内每 3 个基础步长保留一帧。保留边界及最后一帧，排除 HOME。预览 FPS 只控制逻辑播放速度。</p>
+          <div id="fusion-strip" class="fusion-strip" aria-label="融合片段分布"></div>
+          <div id="fusion-segments" class="fusion-segments"></div>
+          <div class="fusion-controls">
+            <button id="fusion-preview">预览融合</button><button id="fusion-save">保存标注</button>
+            <span id="fusion-summary" role="status"></span>
+          </div>
+          <div class="fusion-controls fusion-output">
+            <label>导出目录<input id="fusion-directory" type="text" placeholder="与原目录并列的 _fusion 目录"></label>
+            <button id="fusion-export">导出融合 HDF5</button>
+          </div>
+          <div id="fusion-result" role="status"></div>
         </section>
 
         <nav class="tabs" aria-label="数据视图">

@@ -314,6 +314,11 @@ def delete_error_episodes(payload: dict) -> dict:
             dataset = LeRobotDataset(repo_id=repo_id, root=root, download_videos=False)
             delete_episodes(dataset, sorted(requested), output_dir=temp_dir, repo_id=repo_id)
             del dataset
+            if info.get("fps") == "mixed":
+                info_path = temp_dir / "meta/info.json"
+                retained_info = json.loads(info_path.read_text())
+                retained_info.update(fps="mixed", video_fps=info["video_fps"])
+                info_path.write_text(json.dumps(retained_info, indent=2))
             from easy_embodied_deploy.pose_dataset import copy_retained_episodes
             copy_retained_episodes(root, temp_dir, requested)
 

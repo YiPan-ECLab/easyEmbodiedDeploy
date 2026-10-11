@@ -380,8 +380,8 @@ class LeRobotDatasetMetadata:
 
     @property
     def fps(self) -> int:
-        """Frames per second used during data collection."""
-        return self.info.fps
+        """Numeric frame-index/video clock, not necessarily acquisition frequency."""
+        return self.info.video_fps if self.info.fps == "mixed" else self.info.fps
 
     @property
     def features(self) -> dict[str, dict]:

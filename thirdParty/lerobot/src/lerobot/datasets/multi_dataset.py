@@ -126,7 +126,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
 
         NOTE: Fow now, this relies on a check in __init__ to make sure all sub-datasets have the same info.
         """
-        return self._datasets[0].meta.info.fps
+        return self._datasets[0].meta.fps
 
     @property
     def video(self) -> bool:

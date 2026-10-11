@@ -321,3 +321,20 @@ input[type="range"] { width: 100%; height: 18px; margin: 0; accent-color: var(--
 .scan-status.error { color: #ab3434; }
 button, input, select { accent-color: #12664d; }
 [hidden] { display: none !important; }
+/* Fusion remains below the cameras so annotation and visual context stay together. */
+.fusion-panel { padding: 16px; margin: 12px 0; border: 1px solid #d8e4dd; border-radius: 10px; background: #f4faf6; }
+.fusion-heading, .fusion-controls, .fusion-segment { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.fusion-heading { margin-bottom: 12px; }
+.fusion-heading span, .fusion-help { color: #617169; font-size: 12px; line-height: 1.7; }
+.fusion-controls { margin: 10px 0; }
+.fusion-controls label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
+.fusion-controls input { width: 84px; padding: 7px; border: 1px solid #bccdc2; border-radius: 5px; background: white; color: #17201c; }
+.fusion-panel button { border: 1px solid #bccdc2; border-radius: 5px; background: white; padding: 7px 10px; cursor: pointer; color: #165e4d; }
+.fusion-panel button.active, #fusion-export { background: #087f6d; color: white; }
+.fusion-panel button:disabled { opacity: .6; cursor: wait; }
+.fusion-strip { height: 10px; position: relative; background: #dfe7e2; border-radius: 4px; overflow: hidden; margin: 12px 0; }
+.fusion-strip span { position: absolute; top: 0; height: 100%; background: #31a18a; border-right: 1px solid white; }
+.fusion-segment { padding: 6px 0; font-size: 12px; }
+.fusion-output label { flex: 1; min-width: 180px; }
+.fusion-output input { width: 100%; box-sizing: border-box; }
+#fusion-summary, #fusion-result { font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }

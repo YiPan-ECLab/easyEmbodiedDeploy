@@ -60,8 +60,9 @@ class RunningQuantileStats:
             batch: An array where all dimensions except the last are batch dimensions.
         """
         batch = batch.reshape(-1, batch.shape[-1])
-        # Promote integer and low-precision inputs before computing squared statistics.
-        batch = batch.astype(np.result_type(batch.dtype, np.float32), copy=False)
+        # Accumulate in float64: long, nearly constant float32 trajectories lose
+        # precision when variance is computed as E[x²] - E[x]².
+        batch = batch.astype(np.result_type(batch.dtype, np.float64), copy=False)
         num_elements, vector_length = batch.shape
 
         if self._count == 0:

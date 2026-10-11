@@ -106,7 +106,7 @@ function renderHdf5Rows() {
     const detail = [...item.errors, ...item.warnings].join("；") || "—";
     return `<tr class="${rowClass}"><td>${item.valid ? (item.warnings.length ? "WARN" : "PASS") : "FAIL"}</td>
       <td title="${escapeHtml(item.file)}">${escapeHtml(item.file)}</td><td>${m.task_frames}</td><td>${m.home_frames}</td>
-      <td>${m.trailing_idle_frames}</td><td>${Number(m.measured_fps).toFixed(3)}</td>
+      <td>${m.trailing_idle_frames}</td><td>${m.sampling_fps === "mixed" ? "mixed" : Number(m.measured_fps).toFixed(3)}</td>
       <td>${Number(m.task_dt_min_ms).toFixed(2)}–${Number(m.task_dt_max_ms).toFixed(2)} ms</td>
       <td>${Number(m.max_camera_skew_ms).toFixed(1)} ms</td><td>${m.boundary_clipped_values}</td>
       <td>${escapeHtml(poseSummary(m.pose))}</td><td title="${escapeHtml(detail)}">${escapeHtml(detail)}</td></tr>`;
@@ -145,7 +145,7 @@ function renderReport(report) {
   $("metricFrames").textContent = Number(summary.frames || 0).toLocaleString();
   $("metricFramesMeta").textContent = hdf5
     ? `${Number(summary.task_frames || 0).toLocaleString()} task`
-    : `${summary.fps} Hz · ${summary.action_mode}`;
+    : `${summary.fps === "mixed" ? "mixed" : `${summary.fps} Hz`} · ${summary.action_mode}`;
   $("metricErrors").textContent = summary.errors || 0;
   $("metricWarnings").textContent = `${summary.warnings || 0} warning`;
   setGateState(report.status);

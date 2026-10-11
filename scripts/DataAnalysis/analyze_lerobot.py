@@ -63,10 +63,13 @@ def parquet_table(root: Path) -> pa.Table:
         return pa.concat_tables(tables, promote=True)
 
 
-def edge_repeats(actions: np.ndarray, states: np.ndarray, tail: bool) -> int:
+def edge_repeats(actions: np.ndarray, states: np.ndarray, tail: bool, *, delta: bool = False) -> int:
     same = np.all(actions[1:] == actions[:-1], axis=1) & np.all(
         states[1:] == states[:-1], axis=1
     )
+    if delta:
+        # Repeated nonzero increments still move the command target.
+        same &= np.all(actions[:-1] == 0, axis=1)
     count = 0
     for value in (same[::-1] if tail else same):
         if not value:
@@ -89,23 +92,12 @@ def validate_ranges(values: np.ndarray, label: str) -> list[str]:
     return errors
 
 
-def source_indices(demo: h5py.Group, stride: int) -> tuple[np.ndarray, int]:
-    phase = np.asarray(demo["trajectory_phase"])
-    home = np.flatnonzero(phase == 1)
-    task_end = int(home[0]) if len(home) else len(phase)
-    actions = demo["actions"]
-    last_active = task_end - 1
-    while (
-        last_active > 0
-        and np.array_equal(actions[last_active], actions[last_active - 1])
-    ):
-        last_active -= 1
-    selected = np.arange(0, len(phase), stride)
-    selected = selected[phase[selected] == 0]
-    endpoint = int(np.searchsorted(selected, last_active, side="left"))
-    if endpoint < len(selected):
-        selected = selected[: endpoint + 1]
-    return selected, task_end - last_active - 1
+def source_indices(demo: h5py.Group, stride: int, *, pose: bool = False) -> tuple[np.ndarray, int]:
+    # Use the conversion boundary rules, including mixed sequences and poses.
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts/LerobotDataProcessor"))
+    from processor import _task_sample_indices
+    selected, _, idle = _task_sample_indices(demo, stride, pose=pose)
+    return selected, idle
 
 
 def source_paths(
@@ -175,7 +167,7 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
         mode = pose_contract["action_mode"]
     elif mode in POSE_MODES:
         errors.append("缺少 pose_action_contract.json")
-    fps = int(info.get("fps", 0))
+    fps = int(info.get("video_fps", 0) if info.get("fps") == "mixed" else info.get("fps", 0))
     total_frames = int(info.get("total_frames", 0))
     total_episodes = int(info.get("total_episodes", 0))
     total_tasks = int(info.get("total_tasks", 0))
@@ -333,8 +325,17 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
         if not np.allclose(timestamps[positions], expected_frame / fps, rtol=0, atol=2e-5):
             ep_errors.append("timestamp 未严格落在固定 FPS 网格")
         ep_actions, ep_states = actions[positions], states[positions]
-        leading = edge_repeats(ep_actions, ep_states, False) if len(positions) > 1 else 0
-        trailing = edge_repeats(ep_actions, ep_states, True) if len(positions) > 1 else 0
+        edge_actions = ep_actions
+        if pose_data is not None:
+            # A constant camera-relative delta can describe continuous motion.
+            # Inspect physical anchors and targets, including the final target.
+            pose_arrays = pose_data.episode(ep)
+            edge_actions = np.concatenate([
+                pose_arrays["poses"][:-1], pose_arrays["poses"][1:],
+                pose_arrays["grippers"][:-1], pose_arrays["grippers"][1:],
+            ], axis=1)
+        leading = edge_repeats(edge_actions, ep_states, False, delta=mode == "delta_joint") if len(positions) > 1 else 0
+        trailing = edge_repeats(edge_actions, ep_states, True, delta=mode == "delta_joint") if len(positions) > 1 else 0
         if leading:
             ep_errors.append(f"开头有 {leading} 个完全静止相邻帧")
         if trailing:
@@ -379,22 +380,17 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
                 positions = np.flatnonzero(episode == ep)
                 with h5py.File(path, "r") as handle:
                     demo = handle["data/demo_0"]
+                    fused = "temporal_fusion" in demo.attrs
                     file_plan = plan_files[ep] if ep < len(plan_files) else {}
-                    source_fps = int(file_plan.get("source_fps") or settings.get("source_fps") or 0)
+                    source_fps = 0 if fused else int(file_plan.get("source_fps") or settings.get("source_fps") or 0)
                     if source_fps <= 0:
                         source_timestamps = np.asarray(demo["timestamps"], dtype=np.float64)
                         source_fps = int(round(1 / np.median(np.diff(source_timestamps))))
-                    if source_fps <= 0 or source_fps % fps:
+                    if not fused and (source_fps <= 0 or source_fps % fps):
                         errors.append(f"episode {ep}: 源 FPS 无法整除目标 FPS")
                         continue
-                    stride = source_fps // fps
-                    selected, idle = source_indices(demo, stride)
-                    if pose_data is not None:
-                        # Verify saved indices against the current source selector, not
-                        # merely against their own sidecar metadata.
-                        sys.path.insert(0, str(PROJECT_ROOT / "scripts/LerobotDataProcessor"))
-                        from processor import _task_sample_indices
-                        selected, _, idle = _task_sample_indices(demo, stride, pose=True)
+                    stride = 1 if fused else source_fps // fps
+                    selected, idle = source_indices(demo, stride, pose=pose_data is not None)
                     trimmed_idle += idle
                     raw_actions = np.asarray(demo["actions"][selected], dtype=np.float32)
                     if len(raw_actions) > 1:
@@ -408,7 +404,8 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
                             errors.append(f"episode {ep}: 位姿 sidecar 与源帧/原始位姿不一致")
                         if not np.array_equal(saved["grippers"], np.asarray(demo["actions"])[selected][:, [6, 13]]):
                             errors.append(f"episode {ep}: 位姿夹爪 sidecar 与源指令不一致")
-                        if not np.array_equal(saved["timestamps"], np.asarray(demo["timestamps"])[selected]):
+                        expected_times = np.asarray(demo["timestamps"])[selected]
+                        if not np.array_equal(saved["timestamps"], expected_times):
                             errors.append(f"episode {ep}: 位姿实际时间戳与原始采集不一致")
                         expected_actions = np.asarray([pose_data.codec.encode(raw_poses[i], raw_poses[i+1], raw_actions[i+1, [6, 13]]) for i in range(len(selected)-1)])
                         expected_selected = selected[:-1]
@@ -438,12 +435,12 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
                     if len(source_ts) > 1:
                         ep_max_dt = float(np.max(np.diff(source_ts)))
                         max_source_dt = max(max_source_dt, ep_max_dt)
-                        if ep_max_dt > 1.5 / fps:
+                        if not fused and ep_max_dt > 1.5 / fps:
                             errors.append(f"episode {ep}: 相邻源采样间隔 {ep_max_dt:.6f}s 过大")
                     else:
                         ep_max_dt = 0.0
                     episode_results[ep].update(
-                        source_file=path.name, source_fps=source_fps,
+                        source_file=path.name, source_fps="mixed" if fused else source_fps,
                         max_source_dt_ms=ep_max_dt * 1000,
                         action_error=action_error, state_error=state_error,
                         home_frames=home_count, trimmed_source_idle_frames=idle,
@@ -489,7 +486,7 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
             *item["errors"], *(error[len(prefix):] for error in errors if error.startswith(prefix))
         ]))
     summary = {
-        "episodes": total_episodes, "frames": total_frames, "fps": fps,
+        "episodes": total_episodes, "frames": total_frames, "fps": info.get("fps"), "video_fps": fps,
         "action_mode": mode,
         "leading_idle_frames": sum(item["leading_idle_frames"] for item in episode_results),
         "trailing_idle_frames": sum(item["trailing_idle_frames"] for item in episode_results),

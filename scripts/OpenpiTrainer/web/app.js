@@ -1,5 +1,7 @@
 'use strict';
 
+const fpsLabel = (fps) => fps === 'mixed' ? 'mixed' : `${fps} Hz`;
+
 const $ = (id) => document.getElementById(id);
 const numberFields = new Set([
   'rtc_max_delay','lora_rank','lora_alpha','batch_size','steps','save_freq','log_freq',
@@ -86,7 +88,7 @@ function fillDiscoveries(data) {
   $('datasetOptions').replaceChildren(...data.datasets.map((item) => {
     const option = document.createElement('option');
     option.value = item.path;
-    option.label = `${item.label} · ${item.fps} Hz · ${item.action_mode || 'unknown'}`;
+    option.label = `${item.label} · ${fpsLabel(item.fps)} · ${item.action_mode || 'unknown'}`;
     return option;
   }));
   $('modelOptions').replaceChildren(...data.models.map((item) => {
@@ -118,8 +120,8 @@ function updateDatasetSelection() {
     return;
   }
   if (item.action_mode) $('action_mode').value = item.action_mode;
-  $('datasetHint').textContent = `${item.episodes} episodes · ${Number(item.frames).toLocaleString()} frames · ${item.fps} Hz · ${item.action_mode || '动作模式未知'}`;
-  $('flowDataset').textContent = `${item.fps} Hz dataset`;
+  $('datasetHint').textContent = `${item.episodes} episodes · ${Number(item.frames).toLocaleString()} frames · ${fpsLabel(item.fps)} · ${item.action_mode || '动作模式未知'}`;
+  $('flowDataset').textContent = `${fpsLabel(item.fps)} dataset`;
 }
 
 function updateConditionalFields() {
@@ -222,7 +224,7 @@ function renderDataset(report) {
   if (!report) return;
   $('datasetEpisodes').textContent = Number(report.episodes).toLocaleString();
   $('datasetFrames').textContent = Number(report.frames).toLocaleString();
-  $('datasetFps').textContent = `${report.fps} Hz`;
+  $('datasetFps').textContent = `${fpsLabel(report.fps)}`;
   $('datasetState').textContent = report.sample_checked ? '首帧已验证' : '元数据通过';
   document.querySelector('.dataset-panel').classList.add('valid');
   $('stepDataset').className = 'ready';

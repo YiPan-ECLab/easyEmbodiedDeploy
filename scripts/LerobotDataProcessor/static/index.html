@@ -44,6 +44,7 @@
 
             <fieldset>
               <legend><b>02</b>采样与动作</legend>
+              <p class="field wide">部分融合 HDF5：采样频率标记为 mixed，转换时仍裁剪首尾静止帧并排除回零段，不再二次抽帧。下方目标频率仅控制视频编码与索引时间轴，不约束训练和部署节拍。</p>
               <label class="field"><span>目标频率</span><span class="number-input"><input id="targetFps" type="number" min="1" step="1" required><i>Hz</i></span></label>
               <label class="field"><span>源频率 <small>留空自动检测</small></span><span class="number-input"><input id="sourceFps" type="number" min="1" step="1" placeholder="Auto"><i>Hz</i></span></label>
               <div class="field wide"><span>动作表示</span><div class="segmented" id="actionMode">
@@ -76,7 +77,7 @@
             <div class="panel-head compact"><div><p class="eyebrow">RUN CONTROL</p><h2>执行流程</h2></div><span id="statusBadge" class="status idle"><i></i>空闲</span></div>
             <ol class="pipeline">
               <li id="stepInspect"><b>1</b><span><strong>检查源数据</strong><small>阶段、限位、时序、相机</small></span><i></i></li>
-              <li id="stepWrite"><b>2</b><span><strong>写入 LeRobot</strong><small>裁尾、降采样、动作转换</small></span><i></i></li>
+              <li id="stepWrite"><b>2</b><span><strong>写入 LeRobot</strong><small>首尾裁剪、选帧、动作转换</small></span><i></i></li>
               <li id="stepValidate"><b>3</b><span><strong>CPU 验收</strong><small>Parquet、统计量、三路视频</small></span><i></i></li>
             </ol>
             <div class="run-actions">
@@ -100,7 +101,7 @@
           <div class="table-tools"><input id="fileSearch" type="search" placeholder="筛选文件名"><label><input id="issuesOnly" type="checkbox">只看异常</label></div>
         </div>
         <div id="warningBox" class="warning-box hidden"></div>
-        <div class="table-wrap"><table><thead><tr><th>文件</th><th>源帧</th><th>Task</th><th>Home</th><th>裁尾</th><th>实测 FPS</th><th>输出</th><th>最大相机偏差</th><th>空档</th></tr></thead><tbody id="fileTable"></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>文件</th><th>源帧</th><th>Task</th><th>Home</th><th>裁首 / 裁尾</th><th>实测 FPS</th><th>输出</th><th>最大相机偏差</th><th>空档</th></tr></thead><tbody id="fileTable"></tbody></table></div>
       </section>
 
       <section class="execution-grid">

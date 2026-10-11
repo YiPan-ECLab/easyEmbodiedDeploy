@@ -40,7 +40,7 @@ MODULES = {
         "数据",
         "PiperViewer/viewer.py",
         "piper-home",
-        "三路画面 · 逐帧回放 · 动作曲线",
+        "三路回放 · 片段融合 · 动作曲线",
     ),
     "processor": (
         "数据转换",

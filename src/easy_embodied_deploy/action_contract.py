@@ -44,6 +44,7 @@ def validate_pose_contract(contract):
             or contract.get("padding") != "repeat_last_target_mask_loss_and_statistics"
             or contract.get("chunk_anchor") != "observation_time"
             or contract.get("horizon") != 50
-            or not isinstance(contract.get("fps"), int) or contract["fps"] <= 0):
+            or (contract.get("fps") != "mixed" and
+                (not isinstance(contract.get("fps"), int) or contract["fps"] <= 0))):
         raise ValueError("位姿动作契约版本、字段、锚点或 horizon 不兼容")
     return contract

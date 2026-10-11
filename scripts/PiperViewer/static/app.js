@@ -28,6 +28,9 @@ const state = {
   visibleJoints: new Set([0, 1, 2, 3, 4, 5]),
   loadToken: 0,
   playbackToken: 0,
+  fusion: null,
+  fusionPreview: false,
+  fusionBusy: false,
 };
 
 async function api(path, params = {}) {
@@ -150,10 +153,13 @@ async function selectFile(path, demo = null) {
     const episode = await api("api/episode", { path, demo });
     if (token !== state.loadToken) return;
     state.episode = episode;
+    state.fusion = null;
+    state.fusionPreview = false;
     state.curveSource = "actions";
     $("#empty-state").classList.add("hidden");
     $("#episode-view").classList.remove("hidden");
     renderEpisode();
+    await loadFusion(token);
     if (window.innerWidth <= 700) $(".workspace").classList.add("sidebar-collapsed");
   } catch (error) {
     if (token !== state.loadToken) return;
@@ -178,6 +184,7 @@ function renderEpisode() {
   $("#episode-metrics").innerHTML = [
     `<span class="metric ${direct ? "direct" : episode.normalized ? "normalized" : ""}"><strong>${direct ? "直接控制量" : episode.normalized ? "归一化" : escapeHtml(episode.representation)}</strong>${escapeHtml(episode.action_units)}</span>`,
     `<span class="metric"><strong>${episode.frames.toLocaleString()}</strong>帧</span>`,
+    episode.demo_attrs.fps === "mixed" ? '<span class="metric"><strong>mixed</strong>采样频率</span>' : "",
     `<span class="metric"><strong>${formatDuration(episode.duration)}</strong>时长</span>`,
     `<span class="metric"><strong>${episode.cameras.length}</strong>相机</span>`,
     phase.length ? `<span class="metric"><strong>${homeFrames}</strong>HOME 帧</span>` : "",
@@ -267,6 +274,7 @@ function stopPlayback() {
 }
 
 function playbackCycleDuration() {
+  if (state.fusionPreview) return state.fusion.indices.length / state.fusion.plan.playback_fps;
   const frames = state.episode?.frames || 0;
   if (frames <= 1) return 0.05;
   const lastTime = frameTime(frames - 1);
@@ -285,6 +293,12 @@ function preloadFrameImages(index) {
 }
 
 function frameAtMediaTime(mediaTime) {
+  if (state.fusionPreview) {
+    const indices = state.fusion.indices;
+    const position = Math.max(0, Math.min(indices.length - 1,
+      Math.floor(mediaTime * state.fusion.plan.playback_fps)));
+    return indices[position];
+  }
   let low = 0;
   let high = Math.max(0, (state.episode?.frames || 1) - 1);
   while (low < high) {
@@ -298,8 +312,10 @@ function frameAtMediaTime(mediaTime) {
 function playbackTick(now, token) {
   if (!state.playing || !state.episode || token !== state.playbackToken) return;
   const cycleDuration = playbackCycleDuration();
+  // rAF timestamps refer to the start of a rendering frame. A click handler
+  // can start playback later in that same frame, so the first delta is negative.
   let mediaTime = state.playbackStartedMediaTime
-    + (now - state.playbackStartedAt) * state.speed / 1000;
+    + Math.max(0, now - state.playbackStartedAt) * state.speed / 1000;
   if (mediaTime >= cycleDuration) {
     mediaTime %= cycleDuration;
     state.playbackStartedAt = now;
@@ -339,7 +355,9 @@ function togglePlayback() {
   state.frameLoadPending = false;
   if (state.frame >= state.episode.frames - 1) updateFrame(0, true);
   state.playbackStartedAt = performance.now();
-  state.playbackStartedMediaTime = frameTime(state.frame);
+  state.playbackStartedMediaTime = state.fusionPreview
+    ? Math.max(0, state.fusion.indices.findIndex((i) => i >= state.frame)) / state.fusion.plan.playback_fps
+    : frameTime(state.frame);
   const button = $("#play-toggle");
   button.innerHTML = '<i data-lucide="pause"></i>';
   button.title = "暂停";
@@ -515,13 +533,14 @@ function switchTab(name) {
 }
 
 function bindEvents() {
+  bindFusion();
   $("#directory-form").addEventListener("submit", (event) => { event.preventDefault(); scanDirectory($("#directory-input").value.trim()); });
   $("#file-search").addEventListener("input", renderFileList);
   $("#schema-search").addEventListener("input", renderSchema);
   $("#sidebar-toggle").addEventListener("click", () => $(".workspace").classList.add("sidebar-collapsed"));
   $("#sidebar-open").addEventListener("click", () => $(".workspace").classList.remove("sidebar-collapsed"));
-  $("#previous-frame").addEventListener("click", () => { stopPlayback(); updateFrame(state.frame - 1, true); });
-  $("#next-frame").addEventListener("click", () => { stopPlayback(); updateFrame(state.frame + 1, true); });
+  $("#previous-frame").addEventListener("click", () => stepFrame(-1));
+  $("#next-frame").addEventListener("click", () => stepFrame(1));
   $("#play-toggle").addEventListener("click", togglePlayback);
   $("#timeline").addEventListener("input", (event) => { stopPlayback(); updateFrame(Number(event.target.value), true); });
   $("#frame-input").addEventListener("change", (event) => { stopPlayback(); updateFrame(Number(event.target.value) - 1, true); });
@@ -555,11 +574,163 @@ function bindEvents() {
   $$(".tabs button").forEach((button) => button.addEventListener("click", () => switchTab(button.dataset.tab)));
   window.addEventListener("resize", () => requestAnimationFrame(renderCharts));
   document.addEventListener("keydown", (event) => {
-    if (["INPUT", "SELECT"].includes(document.activeElement?.tagName)) return;
+    if (["INPUT", "SELECT", "TEXTAREA"].includes(document.activeElement?.tagName)) return;
     if (event.code === "Space") { event.preventDefault(); togglePlayback(); }
-    if (event.code === "ArrowLeft") { event.preventDefault(); stopPlayback(); updateFrame(state.frame - 1, true); }
-    if (event.code === "ArrowRight") { event.preventDefault(); stopPlayback(); updateFrame(state.frame + 1, true); }
+    if (event.code === "ArrowLeft") { event.preventDefault(); stepFrame(-1); }
+    if (event.code === "ArrowRight") { event.preventDefault(); stepFrame(1); }
+    if (event.code === "BracketLeft") $("#fusion-mark-start").click();
+    if (event.code === "BracketRight") $("#fusion-mark-end").click();
   });
+}
+
+function stepFrame(direction) {
+  stopPlayback();
+  let target = state.frame + direction;
+  if (state.fusionPreview) {
+    const indices = state.fusion.indices;
+    target = direction > 0 ? indices.find((i) => i > state.frame) : indices.findLast((i) => i < state.frame);
+    target ??= state.frame;
+  }
+  updateFrame(target, true);
+}
+
+function fusionPlan() {
+  return {base_stride: Number($("#fusion-base").value), playback_fps: Number($("#fusion-fps").value),
+    segments: state.fusion?.plan.segments || []};
+}
+
+async function fusionRequest(action, plan = fusionPlan()) {
+  const response = await fetch(`api/fusion/${action}`, {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({path: state.episode.path, demo: state.episode.demo, plan,
+      output_directory: $("#fusion-directory").value.trim()})});
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || "融合请求失败");
+  return result;
+}
+
+function renderFusion() {
+  const fusion = state.fusion;
+  if (!fusion) return;
+  $("#fusion-base").value = fusion.plan.base_stride;
+  $("#fusion-fps").value = fusion.plan.playback_fps;
+  $("#fusion-start").max = $("#fusion-end").max = fusion.task_frames;
+  $("#fusion-summary").textContent = `TASK ${fusion.task_frames} → ${fusion.frames} 帧，保留 ${(100*fusion.frames/fusion.task_frames).toFixed(1)}%；采样频率 mixed；标注自动保存`;
+  $("#fusion-preview").textContent = state.fusionPreview ? "返回原始回放" : "预览融合";
+  $("#fusion-preview").classList.toggle("active", state.fusionPreview);
+  $("#fusion-segments").innerHTML = fusion.plan.segments.map((segment, i) =>
+    `<div class="fusion-segment"><button data-seek="${segment.start}">第 ${segment.start+1}–${segment.end+1} 帧</button><span>×${segment.factor} · 实际步长 ${segment.factor*fusion.plan.base_stride}</span><button data-edit="${i}">编辑</button><button data-remove="${i}">删除</button></div>`).join("") || '<span class="fusion-help">未添加片段。拖动时间轴定位，使用 [ 和 ] 标记起止帧。</span>';
+  $("#fusion-strip").innerHTML = fusion.plan.segments.map((segment) =>
+    `<span title="第 ${segment.start+1}–${segment.end+1} 帧 ×${segment.factor}" style="left:${100*segment.start/fusion.task_frames}%;width:${100*(segment.end-segment.start+1)/fusion.task_frames}%"></span>`).join("");
+  $$("#fusion-segments [data-seek]").forEach((button) => button.onclick = () => { stopPlayback(); updateFrame(Number(button.dataset.seek), true); });
+  $$("#fusion-segments [data-remove]").forEach((button) => button.onclick = () => changeFusion((plan) => {
+    plan.segments.splice(Number(button.dataset.remove), 1);
+  }));
+  $$("#fusion-segments [data-edit]").forEach((button) => button.onclick = () => {
+    const i = Number(button.dataset.edit), segment = fusion.plan.segments[i];
+    $("#fusion-start").value = segment.start + 1;
+    $("#fusion-end").value = segment.end + 1;
+    $("#fusion-factor").value = segment.factor;
+    $("#fusion-add").dataset.edit = String(i);
+    $("#fusion-add").textContent = "更新片段";
+  });
+}
+
+function resetFusionEdit() {
+  delete $("#fusion-add").dataset.edit;
+  $("#fusion-add").textContent = "添加片段";
+}
+
+async function loadFusion(token) {
+  $("#fusion-result").textContent = "";
+  resetFusionEdit();
+  try {
+    const result = await api("api/fusion", {path: state.episode.path, demo: state.episode.demo});
+    if (token !== state.loadToken) return;
+    state.fusion = result;
+    state.fusionPreview = state.episode.demo_attrs.fps === "mixed";
+    $("#fusion-directory").value = result.output_directory;
+    $("#fusion-start").value = 1;
+    $("#fusion-end").value = Math.min(2, result.task_frames);
+    renderFusion();
+  } catch (error) {
+    if (token === state.loadToken) $("#fusion-result").textContent = error.message;
+  }
+}
+
+async function changeFusion(mutate = () => {}) {
+  if (!state.fusion || state.fusionBusy) return;
+  const token = state.loadToken;
+  const plan = structuredClone(fusionPlan());
+  mutate(plan);
+  state.fusionBusy = true;
+  stopPlayback();
+  try {
+    const result = await fusionRequest("save", plan);
+    if (token !== state.loadToken) return;
+    state.fusion = result;
+    state.fusionPreview = false;
+    resetFusionEdit();
+    renderFusion();
+    $("#fusion-result").textContent = "标注已保存；可随时重新打开继续编辑。";
+  } catch (error) {
+    if (token === state.loadToken) {
+      $("#fusion-result").textContent = error.message;
+      toast(error.message, true);
+    }
+  } finally { state.fusionBusy = false; }
+}
+
+function bindFusion() {
+  $("#fusion-mark-start").onclick = () => { $("#fusion-start").value = state.frame + 1; };
+  $("#fusion-mark-end").onclick = () => { $("#fusion-end").value = state.frame + 1; };
+  $("#fusion-base").onchange = $("#fusion-fps").onchange = () => changeFusion();
+  $("#fusion-add").onclick = () => changeFusion((plan) => {
+    const segment = {start: Number($("#fusion-start").value)-1, end: Number($("#fusion-end").value)-1,
+      factor: Number($("#fusion-factor").value)};
+    const editing = $("#fusion-add").dataset.edit;
+    if (editing !== undefined) plan.segments[Number(editing)] = segment;
+    else plan.segments.push(segment);
+  });
+  $("#fusion-save").onclick = () => changeFusion();
+  $("#fusion-preview").onclick = async () => {
+    if (!state.fusion || state.fusionBusy) return;
+    stopPlayback();
+    const token = state.loadToken;
+    try {
+      if (!state.fusionPreview) {
+        const result = await fusionRequest("preview");
+        if (token !== state.loadToken) return;
+        state.fusion = result;
+      }
+      state.fusionPreview = !state.fusionPreview;
+      updateFrame(state.fusionPreview ? (state.fusion.indices.find((i) => i >= state.frame) ?? 0) : state.frame, true);
+      renderFusion();
+      $("#fusion-result").textContent = state.fusionPreview ? "正在预览融合序列：播放及前后步进只经过保留帧；时间轴仍显示源帧号，方便继续标注。" : "已返回原始回放。";
+    } catch (error) { toast(error.message, true); }
+  };
+  $("#fusion-export").onclick = async () => {
+    if (!state.fusion || state.fusionBusy) return;
+    state.fusionBusy = true;
+    const token = state.loadToken, button = $("#fusion-export");
+    button.disabled = true;
+    button.textContent = "正在导出…";
+    $("#fusion-result").textContent = "正在同步导出所有图像和轨迹，请等待完成。";
+    try {
+      const result = await fusionRequest("export");
+      if (token !== state.loadToken) return;
+      $("#fusion-result").textContent = `已导出 ${result.frames} 帧：${result.path}。在数据转换页选择目录 ${result.output_directory}；目标 FPS 仅设置逻辑时间，不会再次抽帧。`;
+      const open = document.createElement("button");
+      open.textContent = "打开导出文件";
+      open.onclick = () => selectFile(result.path);
+      $("#fusion-result").append(document.createElement("br"), open);
+    } catch (error) {
+      if (token === state.loadToken) $("#fusion-result").textContent = error.message;
+    } finally {
+      state.fusionBusy = false;
+      button.disabled = false;
+      button.textContent = "导出融合 HDF5";
+    }
+  };
 }
 
 async function init() {
