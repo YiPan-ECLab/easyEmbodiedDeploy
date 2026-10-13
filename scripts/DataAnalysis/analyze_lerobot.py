@@ -436,7 +436,14 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
                         ep_max_dt = float(np.max(np.diff(source_ts)))
                         max_source_dt = max(max_source_dt, ep_max_dt)
                         if not fused and ep_max_dt > 1.5 / fps:
-                            errors.append(f"episode {ep}: 相邻源采样间隔 {ep_max_dt:.6f}s 过大")
+                            from easy_embodied_deploy.trajectory_files import revision
+                            approved = (file_plan.get("timing_ignored")
+                                        and file_plan.get("revision") == revision(path))
+                            message = f"episode {ep}: 相邻源采样间隔 {ep_max_dt:.6f}s 过大"
+                            if approved:
+                                warnings.append(message + "（转换前已人工允许，源文件版本未变）")
+                            else:
+                                errors.append(message)
                     else:
                         ep_max_dt = 0.0
                     episode_results[ep].update(

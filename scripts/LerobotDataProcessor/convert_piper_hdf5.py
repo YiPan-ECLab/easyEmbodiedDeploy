@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from tqdm import tqdm
 from processor import ACTION_MODES, GAP_POLICIES, Settings, run, scan, validate_lerobot_bundle
 
@@ -28,6 +29,8 @@ def defaults() -> Settings:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--allow-timing", nargs=2, action="append", default=[], metavar=("PATH", "REVISION"),
+                        help="人工允许指定文件版本的物理时序异常（由检查页面生成）")
     parser.add_argument("--input-dir", action="append", dest="input_dirs", default=None,
                         help="HDF5 目录；可重复传入多个目录，按传入顺序合并")
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT, help="New output bundle directory")
@@ -60,7 +63,8 @@ def main() -> None:
                         task=args.task, target_fps=args.fps, source_fps=args.source_fps,
                         action_mode=args.action_mode, repo_id=args.repo_id, limit=args.limit,
                         gap_policy=args.gap_policy, calibration_bundle=args.calibration_bundle,
-                        calibration_mount_id=args.calibration_mount_id)
+                        calibration_mount_id=args.calibration_mount_id,
+                        timing_overrides={str(Path(path).expanduser().resolve()): rev for path, rev in args.allow_timing})
     if args.inspect:
         import json
         print(json.dumps(scan(settings), ensure_ascii=False, indent=2))

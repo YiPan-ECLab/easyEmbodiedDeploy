@@ -40,6 +40,7 @@ from processor import (  # noqa: E402
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from easy_embodied_deploy.http import LocalHandlerMixin, read_json
+from easy_embodied_deploy.trajectory_files import trash_trajectory, restore_trajectory
 
 STATIC_ROOT = Path(__file__).parent / "static"
 STATE_LOCK = threading.Lock()
@@ -93,6 +94,7 @@ def settings_from(payload: dict) -> Settings:
         gap_policy=str(payload.get("gap_policy") or DEFAULT_GAP_POLICY),
         calibration_bundle=payload.get("calibration_bundle") or None,
         calibration_mount_id=str(payload.get("calibration_mount_id") or "").strip(),
+        timing_overrides=payload.get("timing_overrides") or {},
     )
 
 
@@ -245,8 +247,18 @@ class Handler(LocalHandlerMixin, BaseHTTPRequestHandler):
                 self.send_payload({"status": "cancelling"}, HTTPStatus.ACCEPTED)
                 return
             payload = self.read_json()
+            if route in ("/api/trajectory/delete", "/api/trajectory/restore"):
+                with STATE_LOCK:
+                    if STATE["status"] == "running":
+                        raise RuntimeError("转换期间不能删除或恢复输入轨迹")
+                    if route.endswith("/delete"):
+                        result = trash_trajectory(payload["path"], payload.get("revision"))
+                    else:
+                        result = restore_trajectory(payload["path"], payload["id"])
+                self.send_payload(result)
+                return
             if route == "/api/inspect":
-                self.send_payload(scan(settings_from(payload)))
+                self.send_payload(scan(settings_from(payload), collect_errors=True))
                 return
             if route == "/api/start":
                 settings = settings_from(payload)

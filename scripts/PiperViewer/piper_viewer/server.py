@@ -21,6 +21,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "src"))
 from easy_embodied_deploy.http import LocalHandlerMixin, read_json
 from easy_embodied_deploy import temporal_fusion
+from easy_embodied_deploy.trajectory_files import revision, trash_trajectory, restore_trajectory
 
 
 STATIC_ROOT = Path(__file__).resolve().parent.parent / "static"
@@ -287,6 +288,7 @@ def read_episode(path: Path, requested_demo: str | None) -> dict[str, Any]:
         )
         return {
             "path": str(path),
+            "revision": revision(path),
             "name": path.name,
             "demo": demo_name,
             "demos": demos,
@@ -493,6 +495,14 @@ class ViewerHandler(LocalHandlerMixin, BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         try:
             route = urlparse(self.path).path
+            if route in ("/api/trajectory/delete", "/api/trajectory/restore"):
+                body = read_json(self)
+                if route.endswith("/delete"):
+                    result = trash_trajectory(body["path"], body.get("revision"))
+                else:
+                    result = restore_trajectory(body["path"], body["id"])
+                self._json(result)
+                return
             if route not in ("/api/fusion/preview", "/api/fusion/save", "/api/fusion/export"):
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return

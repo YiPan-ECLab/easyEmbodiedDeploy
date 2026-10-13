@@ -315,3 +315,9 @@ form fieldset legend { grid-column: 1 / -1; float: none; }
 
 #actionMode { grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); }
 [data-camera-pose][hidden] { display: none; }
+.file-issues { min-width: 260px; max-width: 440px; white-space: normal; overflow-wrap: anywhere; line-height: 1.6; }
+.file-actions { min-width: 140px; white-space: normal; }
+.file-actions button { display: block; margin: 4px 0; padding: 6px 10px; border: 1px solid #cedad4; border-radius: 6px; background: #fff; cursor: pointer; }
+.file-actions [data-delete] { color: #a33434; }
+.audit-help { padding: 0 22px; color: #586b60; line-height: 1.7; }
+.warning-box { white-space: pre-line; }

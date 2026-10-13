@@ -609,6 +609,7 @@ function switchTab(name) {
 
 function bindEvents() {
   bindFusion();
+  $("#delete-episode").addEventListener("click", deleteEpisode);
   $("#directory-form").addEventListener("submit", (event) => { event.preventDefault(); scanDirectory($("#directory-input").value.trim()); });
   $("#file-search").addEventListener("input", renderFileList);
   $("#schema-search").addEventListener("input", renderSchema);
@@ -656,6 +657,48 @@ function bindEvents() {
     if (event.code === "BracketLeft") $("#fusion-mark-start").click();
     if (event.code === "BracketRight") $("#fusion-mark-end").click();
   });
+}
+
+async function trajectoryRequest(action, payload) {
+  const response = await fetch(`api/trajectory/${action}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  });
+  const result = await response.json();
+  if (!response.ok) throw new Error(result.error || "轨迹操作失败");
+  return result;
+}
+
+async function deleteEpisode() {
+  const episode = state.episode;
+  if (!episode || state.fusionBusy) return;
+  if (!window.confirm(`将整条轨迹移入回收站？\n${episode.path}\n可以撤销删除。`)) return;
+  stopPlayback();
+  $("#delete-episode").disabled = true;
+  try {
+    const result = await trajectoryRequest("delete", {path: episode.path, revision: episode.revision});
+    ++state.loadToken;
+    state.episode = null; state.selectedPath = ""; state.fusion = null;
+    state.imageFrames.clear();
+    $("#episode-view").classList.add("hidden");
+    $("#empty-state").classList.remove("hidden");
+    const notice = $("#delete-result");
+    notice.classList.remove("hidden");
+    notice.textContent = `${episode.name} 已移入回收站。 `;
+    const undo = document.createElement("button");
+    undo.textContent = "撤销删除";
+    undo.onclick = async () => {
+      undo.disabled = true;
+      try {
+        await trajectoryRequest("restore", {path: episode.path, id: result.id});
+        notice.classList.add("hidden");
+        await scanDirectory($("#directory-input").value.trim());
+        await selectFile(episode.path);
+      } catch (error) { toast(error.message, true); undo.disabled = false; }
+    };
+    notice.append(undo);
+    await scanDirectory($("#directory-input").value.trim());
+  } catch (error) { toast(error.message, true); }
+  finally { $("#delete-episode").disabled = false; }
 }
 
 function stepFrame(direction) {

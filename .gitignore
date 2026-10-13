@@ -2,6 +2,10 @@
 /datasets/
 /models/
 
+# Local documentation and logs are not published to GitHub.
+/docs/
+/logs/
+
 # Recreate environments with thirdParty/setup_envs.sh.
 /thirdParty/.venvs/
 **/.venv/

@@ -7,6 +7,8 @@ const ui = {
   lastJob: null,
   lastEventSeq: 0,
   locked: false,
+  timingOverrides: {},
+  inspectionToken: 0,
 };
 const statusNames = {
   idle: "空闲", running: "处理中", complete: "已完成",
@@ -60,6 +62,7 @@ function formPayload() {
     calibration_bundle: $("calibrationBundle").value.trim(),
     calibration_mount_id: $("calibrationMountId").value.trim(),
     gap_policy: checked("gapPolicy"),
+    timing_overrides: {...ui.timingOverrides},
     repo_id: $("repoId").value.trim() || null,
     limit: Number($("limit").value || 0),
   };
@@ -94,11 +97,15 @@ function updateCommand() {
   if (value.source_fps) parts.push(`  --source-fps ${value.source_fps} \\`);
   parts.push(`  --fps ${value.target_fps} --action-mode ${value.action_mode} \\`);
   parts.push(`  --gap-policy ${value.gap_policy}${value.limit ? ` --limit ${value.limit}` : ""}`);
+  for (const [path, revision] of Object.entries(value.timing_overrides)) {
+    parts[parts.length - 1] += " \\";
+    parts.push(`  --allow-timing ${shellQuote(path)} ${shellQuote(revision)}`);
+  }
   $("commandPreview").textContent = parts.join("\n");
 }
 
 function formatNumber(value) {
-  return Number.isFinite(Number(value)) ? Number(value).toLocaleString() : "—";
+  return value != null && Number.isFinite(Number(value)) ? Number(value).toLocaleString() : "—";
 }
 
 function formatTime(seconds) {
@@ -121,11 +128,15 @@ function setLocked(locked) {
   $("startButton").classList.toggle("hidden", locked);
   $("cancelButton").classList.toggle("hidden", !locked);
   $("cancelButton").disabled = false;
+  renderFileTable();
   updateCommand();
 }
 
 function invalidatePlan() {
   if (ui.locked) return;
+  ui.inspectionToken += 1;
+  ui.timingOverrides = {};
+  $("inspectButton").disabled = false;
   ui.plan = null;
   $("metricQuality").textContent = "需重新检查";
   $("metricQualityMeta").textContent = "配置已修改";
@@ -142,13 +153,13 @@ function renderPlan(plan) {
   $("metricInputMeta").textContent = `${formatNumber(plan.files.reduce((sum, file) => sum + file.source_task_frames, 0))} task`;
   $("metricOutput").textContent = formatNumber(plan.output_frames);
   $("metricOutputMeta").textContent = `${plan.target_fps ?? '—'} Hz · ${plan.action_mode ?? '—'}`;
-  $("metricQuality").textContent = plan.warnings.length ? "有警告" : "检查通过";
-  $("metricQualityMeta").textContent = `${plan.gaps} 个时间空档`;
+  $("metricQuality").textContent = plan.invalid_files ? "有待处理错误" : plan.warnings.length ? "有警告" : "检查通过";
+  $("metricQualityMeta").textContent = `${plan.invalid_files || 0} 个文件未通过 · ${plan.gaps} 个时序异常`;
   $("stepInspect").className = plan.warnings.length ? "active" : "done";
   $("writtenFrames").textContent = formatNumber(plan.output_frames);
   const warnings = $("warningBox");
-  warnings.classList.toggle("hidden", !plan.warnings.length);
-  warnings.textContent = plan.warnings.join("\n");
+  warnings.classList.toggle("hidden", !plan.warnings.length && !plan.errors?.length);
+  warnings.textContent = [...(plan.errors || []), ...plan.warnings].join("\n");
   renderFileTable();
 }
 
@@ -157,22 +168,67 @@ function renderFileTable() {
   const query = $("fileSearch").value.trim().toLowerCase();
   const issuesOnly = $("issuesOnly").checked;
   const files = ui.plan.files.filter((file) => {
-    const issue = file.gaps || file.warnings?.length;
+    const issue = file.errors?.length || file.gaps || file.warnings?.length;
     return file.name.toLowerCase().includes(query) && (!issuesOnly || issue);
   });
   $("fileTable").innerHTML = files.map((file) => {
-    const issue = file.gaps || file.warnings?.length;
+    const issue = file.errors?.length || file.gaps || file.warnings?.length;
+    const index = ui.plan.files.indexOf(file);
+    const details = [...(file.errors || []), ...(file.timing_ignored ? ["已人工允许时序异常", ...(file.timing_errors || [])] : []), ...(file.warnings || [])];
     return `<tr class="${issue ? "issue" : ""}">
-      <td title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</td>
+      <td title="${escapeHtml(file.path || file.name)}">${escapeHtml(file.name)}</td>
       <td>${formatNumber(file.frames)}</td><td>${formatNumber(file.source_task_frames)}</td>
       <td>${formatNumber(file.source_home_frames)}</td><td>${formatNumber(file.trimmed_leading_idle_frames || 0)} / ${formatNumber(file.trimmed_idle_frames)}</td>
-      <td>${file.temporal_fusion ? "mixed" : Number(file.measured_fps).toFixed(3)}</td><td>${formatNumber(file.output_frames)}</td>
-      <td>${(Number(file.max_camera_skew_s) * 1000).toFixed(1)} ms</td>
-      <td>${file.gaps || "0"}</td></tr>`;
-  }).join("") || '<tr><td colspan="9">没有匹配的文件</td></tr>';
+      <td>${file.temporal_fusion ? "mixed" : file.measured_fps != null ? Number(file.measured_fps).toFixed(3) : "—"}</td><td>${formatNumber(file.output_frames)}</td>
+      <td>${file.max_camera_skew_s != null ? (Number(file.max_camera_skew_s) * 1000).toFixed(1) + " ms" : "—"}</td>
+      <td>${file.gaps || "0"}</td>
+      <td class="file-issues">${details.length ? details.map(escapeHtml).join("<br>") : "通过"}</td>
+      <td class="file-actions"><button data-delete="${index}" ${ui.locked ? "disabled" : ""}>删除轨迹</button>
+      ${file.can_ignore_timing || file.timing_ignored ? `<button data-timing="${index}" ${ui.locked ? "disabled" : ""}>${file.timing_ignored ? "撤销时序放行" : "忽略时序错误"}</button>` : ""}</td></tr>`;
+  }).join("") || '<tr><td colspan="11">没有匹配的文件</td></tr>';
+}
+
+async function handleFileAction(event) {
+  if (ui.locked || !ui.plan) return;
+  const button = event.target.closest("button");
+  if (!button) return;
+  const file = ui.plan.files[Number(button.dataset.delete ?? button.dataset.timing)];
+  if (!file) return;
+  button.disabled = true;
+  try {
+    if (button.dataset.timing !== undefined) {
+      if (file.timing_ignored) delete ui.timingOverrides[file.path];
+      else {
+        if (!window.confirm(`仅忽略这条轨迹的物理时序错误？\n${file.path}\n${file.errors.join("\n")}\n保留现有选帧方式，不插值。其他数据错误仍会拦截。`)) return;
+        ui.timingOverrides[file.path] = file.revision;
+      }
+      updateCommand();
+    } else {
+      if (!window.confirm(`将轨迹移入回收站？\n${file.path}\n可以撤销删除。`)) return;
+      const result = await request("api/trajectory/delete", {method: "POST", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({path: file.path, revision: file.revision})});
+      delete ui.timingOverrides[file.path];
+      const notice = $("deleteResult");
+      notice.classList.remove("hidden"); notice.textContent = `${file.name} 已移入回收站。 `;
+      const undo = document.createElement("button"); undo.textContent = "撤销删除";
+      undo.onclick = async () => {
+        if (ui.locked) return;
+        undo.disabled = true;
+        try {
+          await request("api/trajectory/restore", {method: "POST", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({path: file.path, id: result.id})});
+          notice.classList.add("hidden"); await inspectInput(false);
+        } catch (error) { toast(error.message, true); undo.disabled = false; }
+      };
+      notice.append(undo);
+    }
+    await inspectInput(false);
+  } catch (error) { toast(error.message, true); }
+  finally { button.disabled = false; }
 }
 
 async function inspectInput(showMessage = true) {
+  const token = ++ui.inspectionToken;
   $("inspectButton").disabled = true;
   $("runNote").textContent = "正在读取全部 HDF5 元数据与质量指标…";
   $("stepInspect").className = "active";
@@ -181,13 +237,15 @@ async function inspectInput(showMessage = true) {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(formPayload()),
     });
+    if (token !== ui.inspectionToken) throw new Error("配置已变化，请重新检查");
     renderPlan(plan);
-    $("runNote").textContent = plan.warnings.length
+    $("runNote").textContent = plan.invalid_files ? `有 ${plan.invalid_files} 条轨迹未通过，请查看下方具体问题。` : plan.warnings.length
       ? `检查完成，发现 ${plan.warnings.length} 条警告。`
       : "检查通过，可以开始转换。";
-    if (showMessage) toast(`检查通过：${plan.episodes} 条，预计 ${formatNumber(plan.output_frames)} 帧`);
+    if (showMessage) toast(`检查完成：${plan.episodes} 条，${plan.invalid_files || 0} 条未通过`, !!plan.invalid_files);
     return plan;
   } catch (error) {
+    if (token !== ui.inspectionToken) throw error;
     ui.plan = null;
     $("stepInspect").className = "";
     $("metricQuality").textContent = "检查失败";
@@ -196,7 +254,7 @@ async function inspectInput(showMessage = true) {
     toast(error.message, true);
     throw error;
   } finally {
-    $("inspectButton").disabled = ui.locked;
+    if (token === ui.inspectionToken) $("inspectButton").disabled = ui.locked;
   }
 }
 
@@ -232,7 +290,8 @@ function appendEvents(events, jobId) {
 function renderStatus(state) {
   const running = state.status === "running";
   setLocked(running);
-  if (state.plan) renderPlan(state.plan);
+  // Polling a previous job must not replace a newer input review or its actions.
+  if (state.plan && (running || ui.lastJob !== state.job_id)) renderPlan(state.plan);
   const badge = $("statusBadge");
   badge.className = `status ${state.status}`;
   badge.lastChild.textContent = statusNames[state.status] || state.status;
@@ -284,7 +343,8 @@ async function startConversion() {
   try {
     // The backend rejects invalid inputs; warnings also include informational
     // notices such as preserving an intentionally fused sequence.
-    await inspectInput(false);
+    const plan = await inspectInput(false);
+    if (plan.invalid_files) throw new Error("请先处理下方轨迹错误，或人工确认允许对应的时序异常");
     const response = await request("api/start", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(formPayload()),
@@ -342,6 +402,7 @@ $("cancelButton").addEventListener("click", cancelConversion);
 $("refresh").addEventListener("click", refreshStatus);
 $("fileSearch").addEventListener("input", renderFileTable);
 $("issuesOnly").addEventListener("change", renderFileTable);
+$("fileTable").addEventListener("click", handleFileAction);
 $("clearLog").addEventListener("click", () => $("log").replaceChildren());
 $("copyCommand").addEventListener("click", async () => {
   try { await navigator.clipboard.writeText($("commandPreview").textContent); toast("命令已复制"); }

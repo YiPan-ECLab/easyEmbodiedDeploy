@@ -37,6 +37,7 @@
     </aside>
 
     <main class="main">
+      <div id="delete-result" role="status" class="hidden"></div>
       <section id="empty-state" class="empty-state">
         <i data-lucide="database"></i>
         <h1>选择一个 episode</h1>
@@ -55,6 +56,7 @@
           <div class="episode-actions">
             <label id="demo-select-wrap" class="compact-select hidden">Demo<select id="demo-select"></select></label>
             <button id="copy-path" class="icon-button" title="复制文件路径" aria-label="复制文件路径"><i data-lucide="copy"></i></button>
+            <button id="delete-episode" class="icon-button" title="删除轨迹（移入回收站）" aria-label="删除轨迹"><i data-lucide="trash-2"></i></button>
           </div>
           <div id="episode-metrics" class="metrics"></div>
           <p id="instruction" class="instruction hidden"></p>

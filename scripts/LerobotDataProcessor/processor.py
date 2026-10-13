@@ -26,6 +26,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from easy_embodied_deploy.statistics import statistics_close
 from easy_embodied_deploy.action_contract import ACTION_MODES, POSE_MODES, action_axes, read_pose_contract
+from easy_embodied_deploy.trajectory_files import revision, hold_trajectories
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 AXES = [f"{side}_{axis}" for side in ("left", "right")
         for axis in ("j1", "j2", "j3", "j4", "j5", "j6", "gripper")]
@@ -63,6 +64,13 @@ MAX_READ_SPAN = 512
 
 class ProcessingCancelled(RuntimeError):
     """Raised when the user cancels between safe processing checkpoints."""
+
+
+class TimingError(ValueError):
+    def __init__(self, info, errors):
+        self.info = info
+        self.errors = errors
+        super().__init__("；".join(errors))
 
 
 def available_cpu_count() -> int:
@@ -105,6 +113,7 @@ class Settings:
     input_dirs: list[str] | None = None
     calibration_bundle: str | None = None
     calibration_mount_id: str = ""
+    timing_overrides: dict[str, str] | None = None
 
 
 def canonical_action_mode(value: str) -> str:
@@ -113,6 +122,11 @@ def canonical_action_mode(value: str) -> str:
 
 
 def canonical_settings(settings: Settings) -> Settings:
+    if settings.timing_overrides is not None and (
+        not isinstance(settings.timing_overrides, dict)
+        or any(not isinstance(k, str) or not isinstance(v, str) for k, v in settings.timing_overrides.items())
+    ):
+        raise ValueError("时序放行记录必须为文件路径与版本的映射")
     raw_dirs = settings.input_dirs
     if isinstance(raw_dirs, str):
         raw_dirs = raw_dirs.splitlines()
@@ -276,6 +290,9 @@ def _joint_l2(values: np.ndarray) -> np.ndarray:
 
 def inspect_file(path: Path, settings: Settings) -> dict:
     settings = canonical_settings(settings)
+    source_revision = revision(path)
+    timing_errors = []
+    approved = (settings.timing_overrides or {}).get(str(path.resolve())) == source_revision
     with h5py.File(path, "r") as f:
         demo = f["data/demo_0"]
         actions, states = demo["actions"], demo["states"]
@@ -302,8 +319,10 @@ def inspect_file(path: Path, settings: Settings) -> dict:
         measured = float(1 / np.median(dt))
         fused = "temporal_fusion" in demo.attrs
         source_fps = settings.source_fps or int(round(measured))
-        if not fused and (source_fps <= 0 or abs(measured - source_fps) / source_fps > .02):
-            raise ValueError(f"{path.name}: 时间戳估计 {measured:.3f} Hz，与源帧率 {source_fps} 不符")
+        if not fused and source_fps <= 0:
+            raise ValueError("无法估计有效源频率，请填写源频率后重新检查")
+        if not fused and abs(measured - source_fps) / source_fps > .02:
+            timing_errors.append(f"时间戳估计 {measured:.3f} Hz，与源帧率 {source_fps} 不符")
         if not fused and (settings.target_fps > source_fps or source_fps % settings.target_fps):
             raise ValueError(f"{path.name}: 目标 {settings.target_fps} Hz 必须整除源帧率 {source_fps} Hz，不支持升采样")
         arrays = {}
@@ -312,6 +331,24 @@ def inspect_file(path: Path, settings: Settings) -> dict:
             if not np.isfinite(arrays[key]).all():
                 raise ValueError(f"{path.name}: {key} 含 NaN/Inf")
             _validate_piper_range(arrays[key], f"{path.name}/{key}")
+        problems = []
+        def check_numeric(name, dataset):
+            if not isinstance(dataset, h5py.Dataset) or dataset.ndim >= 4:
+                return
+            values = np.asarray(dataset)
+            if values.ndim and len(values) != n:
+                problems.append(f"{name} 帧数与 actions 不一致")
+            if values.dtype.kind in "fiu" and not np.isfinite(values).all():
+                problems.append(f"{name} 含 NaN/Inf")
+        demo.visititems(check_numeric)
+        for combined, parts in (("actions", ("left_actions", "right_actions")),
+                                ("states", ("obs/left_joint_states", "obs/left_gripper_states",
+                                            "obs/right_joint_states", "obs/right_gripper_states"))):
+            if all(key in demo for key in parts):
+                if not np.array_equal(arrays[combined], np.concatenate([demo[key][:] for key in parts], axis=1)):
+                    problems.append(f"{combined} 与左右臂拆分字段不一致")
+        if problems:
+            raise ValueError("；".join(problems))
         shapes = []
         for camera in CAMERAS:
             image = demo[f"obs/{camera}"]
@@ -354,9 +391,9 @@ def inspect_file(path: Path, settings: Settings) -> dict:
             float(_joint_l2(action_steps[gap_positions]).max()) if gap_count else 0.0
         )
         if gap_count and settings.gap_policy == "reject":
-            raise ValueError(
-                f"{path.name}: task 段有 {gap_count} 个采样间隔异常，最大 {max_gap:.3f}s；"
-                "严格模式拒绝改变这些间隔"
+            timing_errors.append(
+                f"task 段有 {gap_count} 个采样间隔异常，异常范围 "
+                f"{selected_dt[gap_positions].min()*1000:.2f}–{max_gap*1000:.2f} ms"
             )
         warnings = (["人工融合序列：裁剪首尾静止帧并排除 HOME，不再降采样；目标 FPS 仅用于逻辑时间轴"] if fused else [])
         last_active = task_end - trimmed_idle_frames - 1
@@ -370,7 +407,9 @@ def inspect_file(path: Path, settings: Settings) -> dict:
                 f"task 段 {gap_count} 个采样间隔异常将被映射到固定 {settings.target_fps} Hz；"
                 f"最大间隔 {max_gap:.3f}s，跨异常间隔动作 {max_gap_action:.4f} rad L2"
             )
-        return dict(name=path.name, frames=n, source_fps="mixed" if fused else source_fps, temporal_fusion=fused,
+        info = dict(name=path.name, path=str(path.resolve()), revision=source_revision,
+                    errors=[], timing_errors=timing_errors, timing_ignored=bool(approved and timing_errors),
+                    frames=n, source_fps="mixed" if fused else source_fps, temporal_fusion=fused,
                     measured_fps=round(measured, 4), stride=stride,
                     sampled_frames=sampled_frames, output_frames=output_frames,
                     excluded_home_frames=excluded_home_frames,
@@ -381,9 +420,16 @@ def inspect_file(path: Path, settings: Settings) -> dict:
                     camera_shapes=shapes, max_camera_skew_s=max_camera_skew,
                     gaps=gap_count, max_gap_s=round(max_gap, 6),
                     max_gap_action_joint_l2=round(max_gap_action, 6), warnings=warnings)
+        if revision(path) != source_revision:
+            raise ValueError("检查期间文件已变化，请重新检查")
+        if timing_errors and not approved:
+            raise TimingError(info, timing_errors)
+        if timing_errors:
+            warnings.append("已人工允许物理时序异常；保持选帧与动作语义，未插值修补原始时间戳")
+        return info
 
 
-def scan(settings: Settings) -> dict:
+def scan(settings: Settings, *, collect_errors: bool = False) -> dict:
     settings = canonical_settings(settings)
     if (isinstance(settings.target_fps, bool) or not isinstance(settings.target_fps, int)
             or isinstance(settings.limit, bool) or not isinstance(settings.limit, int)
@@ -418,13 +464,30 @@ def scan(settings: Settings) -> dict:
         raise ValueError("输入目录中没有 .hdf5/.h5 文件（只扫描各目录当前层）")
     files = []
     for source, path in paths:
-        info = inspect_file(path, settings)
+        try:
+            info = inspect_file(path, settings)
+        except TimingError as exc:
+            if not collect_errors:
+                raise
+            info = {**exc.info, "errors": exc.errors, "can_ignore_timing": True}
+        except Exception as exc:
+            if not collect_errors:
+                raise
+            info = dict(name=path.name, path=str(path.resolve()), revision=revision(path) if path.exists() else None,
+                        errors=[str(exc)], timing_errors=[], can_ignore_timing=False, warnings=[],
+                        frames=0, output_frames=0, source_task_frames=0, source_home_frames=0, gaps=0)
         info["source_dir"] = portable_path(source)
         files.append(info)
-    if any(x["camera_shapes"] != files[0]["camera_shapes"] for x in files):
-        raise ValueError("不同 episode 的相机尺寸不一致")
+    shaped = [x for x in files if "camera_shapes" in x]
+    if shaped and any(x["camera_shapes"] != shaped[0]["camera_shapes"] for x in shaped):
+        if not collect_errors:
+            raise ValueError("不同 episode 的相机尺寸不一致")
+        for item in shaped:
+            if item["camera_shapes"] != shaped[0]["camera_shapes"]:
+                item["errors"].append("相机尺寸与其他 episode 不一致")
+                item["can_ignore_timing"] = False
     source_label = sources[0].name if len(sources) == 1 else f"{sources[0].name}_merged"
-    frequency_label = "mixed" if any(item.get("temporal_fusion") for item in files) else f"{settings.target_fps}hz"
+    frequency_label = "mixed" if any(item.get("temporal_fusion") or item.get("timing_ignored") for item in files) else f"{settings.target_fps}hz"
     default_out = Path("datasets/lerobot") / f"{source_label}_{frequency_label}_{settings.action_mode}"
     out = resolve_path(settings.output_root or default_out)
     if any(out == source or out in source.parents or source in out.parents for source in sources):
@@ -433,6 +496,8 @@ def scan(settings: Settings) -> dict:
     return dict(input_dir=portable_path(sources[0]), input_dirs=[portable_path(path) for path in sources],
                 target_fps=settings.target_fps, sampling_fps="mixed" if frequency_label == "mixed" else settings.target_fps, action_mode=settings.action_mode,
                 output_root=portable_path(out), files=files,
+                errors=[f"{x['name']}: {error}" for x in files for error in x.get("errors", [])],
+                invalid_files=sum(bool(x.get("errors")) for x in files),
                 episodes=len(files), input_frames=sum(x["frames"] for x in files),
                 output_frames=sum(x["output_frames"] for x in files),
                 gaps=sum(x["gaps"] for x in files),
@@ -689,6 +754,20 @@ def validate_lerobot_bundle(bundle_root: str | Path, *, expected: dict | None = 
 def run(settings: Settings, progress: Callable[[dict], None] | None = None,
         cancel_event: threading.Event | None = None,
         prepared_plan: dict | None = None) -> dict:
+    if cancel_event is not None and cancel_event.is_set():
+        raise ProcessingCancelled("用户取消了处理")
+    plan = prepared_plan if prepared_plan is not None else scan(settings)
+    if plan.get("errors"):
+        raise ValueError("仍有未处理的输入错误：" + "；".join(plan["errors"]))
+    paths = [(resolve_path(info.get("source_dir") or plan["input_dir"]) / info["name"],
+              info.get("revision")) for info in plan["files"]]
+    with hold_trajectories(paths):
+        return _run(settings, progress, cancel_event, plan)
+
+
+def _run(settings: Settings, progress: Callable[[dict], None] | None = None,
+         cancel_event: threading.Event | None = None,
+         prepared_plan: dict | None = None) -> dict:
     settings = canonical_settings(settings)
     start_time = time.monotonic()
     def emit(stage, **fields):
@@ -735,7 +814,7 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
             from easy_embodied_deploy.pose_dataset import new_contract
             calibration = load_calibration(resolve_path(settings.calibration_bundle) if settings.calibration_bundle else None,
                                            settings.action_mode, settings.calibration_mount_id)
-            sampling_fps = "mixed" if any(item.get("temporal_fusion") for item in plan["files"]) else settings.target_fps
+            sampling_fps = plan["sampling_fps"]
             pose_contract = new_contract(settings.action_mode, sampling_fps, calibration, settings.calibration_mount_id)
         for index, info in enumerate(plan["files"]):
             checkpoint()
@@ -805,7 +884,7 @@ def run(settings: Settings, progress: Callable[[dict], None] | None = None,
             checkpoint()
         emit("finalizing", message="保存 LeRobot 元数据与官方统计量")
         dataset.finalize()
-        if any(item.get("temporal_fusion") for item in plan["files"]):
+        if plan["sampling_fps"] == "mixed":
             from lerobot.datasets.io_utils import write_info
             dataset.meta.info.video_fps = settings.target_fps
             dataset.meta.info.fps = "mixed"

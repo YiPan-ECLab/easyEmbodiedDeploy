@@ -153,6 +153,9 @@ button { color: inherit; }
 .list-message { padding: 28px 18px; text-align: center; color: var(--muted); font-size: 12px; line-height: 1.7; }
 
 .main { min-width: 0; overflow: auto; }
+#delete-result { margin: 16px 24px; padding: 12px; border: 1px solid #c8d9cf; border-radius: 8px; overflow-wrap: anywhere; }
+#delete-result button { margin-left: 8px; cursor: pointer; }
+#delete-episode { color: #a33434; }
 .empty-state { min-height: 100%; display: grid; place-content: center; justify-items: center; color: var(--muted); }
 .empty-state > svg { width: 34px; height: 34px; margin-bottom: 12px; color: #96a49e; }
 .empty-state h1 { margin: 0; color: var(--text); font-size: 17px; }
