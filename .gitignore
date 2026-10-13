@@ -2,8 +2,9 @@
 /datasets/
 /models/
 
-# Local documentation and logs are not published to GitHub.
-/docs/
+# Keep documentation images; other local docs and logs are not published.
+/docs/*
+!/docs/images/
 /logs/
 
 # Recreate environments with thirdParty/setup_envs.sh.
