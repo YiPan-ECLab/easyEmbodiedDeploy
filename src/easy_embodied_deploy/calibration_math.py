@@ -185,6 +185,71 @@ def inverse(value):
     return transform(rotation, -rotation @ value[:3, 3])
 
 
+def transform_error(actual, expected):
+    actual, expected = checked_transform(actual), checked_transform(expected)
+    return dict(
+        translation_mm=float(np.linalg.norm(actual[:3, 3] - expected[:3, 3]) * 1000),
+        rotation_deg=float(np.degrees(np.linalg.norm(
+            cv2.Rodrigues(actual[:3, :3] @ expected[:3, :3].T)[0]))),
+    )
+
+
+def mean_transform(values):
+    values = [checked_transform(value) for value in values]
+    u, _, vt = np.linalg.svd(sum(value[:3, :3] for value in values))
+    rotation = u @ np.diag([1, 1, np.linalg.det(u @ vt)]) @ vt
+    return transform(rotation, np.mean([value[:3, 3] for value in values], axis=0))
+
+
+def base_transform(left_camera, right_camera):
+    """T_left_base_right_base = T_left_base_camera @ inv(T_right_base_camera)."""
+    return checked_transform(left_camera) @ inverse(right_camera)
+
+
+def validate_observation(sample, training_samples, result, camera, mounting):
+    """Evaluate held-out observations without refitting any calibration parameter."""
+    target, rms = board_pose(sample["objects"], sample["pixels"], camera)
+    report = dict(reprojection_rms_px=rms, T_camera_board=target.tolist(), warnings=[])
+    if mounting is not None:
+        solution = checked_transform(result["matrix"])
+        pose = checked_transform(sample["T_base_flange"])
+        def constant(s):
+            p = checked_transform(s["T_base_flange"])
+            t, _ = board_pose(s["objects"], s["pixels"], camera)
+            return (p if mounting == "wrist" else inverse(p)) @ solution @ t
+        reference = result.get("reference_transform")
+        if reference is None:  # Old sessions remain readable and verifiable.
+            reference = mean_transform([constant(s) for s in training_samples])
+        observed = (pose if mounting == "wrist" else inverse(pose)) @ solution @ target
+        report.update(transform_error(observed, reference))
+        report["reference_frame"] = "base_board" if mounting == "wrist" else "flange_board"
+        report["observed_constant"] = observed.tolist()
+        near = [transform_error(pose, s["T_base_flange"]) for s in training_samples]
+        report["novel_pose"] = not any(e["translation_mm"] < 2 and e["rotation_deg"] < .5 for e in near)
+        if not report["novel_pose"]:
+            report["warnings"].append("此姿态与求解样本接近，请再用不同位置/方向验证")
+        if report["translation_mm"] > 5 or report["rotation_deg"] > 2:
+            report["warnings"].append("独立验证偏差超过 5 mm / 2°，请检查固定关系、角点方向及标定结果")
+    if rms > 2:
+        report["warnings"].append("验证图像重投影误差超过 2 px")
+    report["within_thresholds"] = (rms <= 2 and report.get("translation_mm", 0) <= 5
+                                   and report.get("rotation_deg", 0) <= 2)
+    return report
+
+
+def compare_board_observations(left_pose, left_handeye, left_target,
+                               right_pose, right_handeye, right_target, left_right):
+    """Independent wrist observations of the same stationary physical board."""
+    left_board = checked_transform(left_pose) @ checked_transform(left_handeye) @ checked_transform(left_target)
+    right_board = checked_transform(left_right) @ checked_transform(right_pose) @ checked_transform(right_handeye) @ checked_transform(right_target)
+    report = transform_error(left_board, right_board)
+    report.update(T_left_base_board_from_left=left_board.tolist(),
+                  T_left_base_board_from_right=right_board.tolist(),
+                  within_thresholds=report["translation_mm"] <= 5 and report["rotation_deg"] <= 2,
+                  thresholds=dict(translation_mm=5, rotation_deg=2))
+    return report
+
+
 def flange_transform(pose):
     """pyAgxArm get_flange_pose: meters, fixed-axis XYZ Euler radians."""
     pose = np.asarray(pose, dtype=float)
@@ -352,6 +417,8 @@ def solve_extrinsics(samples, camera, mounting):
         )
     return dict(
         matrix=solution.tolist(),
+        reference_transform=mean_transform(constants).tolist(),
+        reference_frame="base_board" if mounting == "wrist" else "flange_board",
         units="m",
         rotation="matrix_rows",
         method="OpenCV PARK",

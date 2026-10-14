@@ -18,7 +18,7 @@ python3 workbench.py
 | --- | --- | --- |
 | 模型与数据目录 | models / datasets 浏览、新建、重命名、复制路径、回收站与恢复 | piper-home |
 | Piper 采集 | 四臂示教、脚踏板 / 回车、保存与丢弃 | piper-home |
-| 相机标定 | 自定义棋盘 / ChArUco、内参、左右腕与全局双 base 外参、导出 | piper-home |
+| [相机标定](scripts/CameraCalibration/README.md) | 自定义棋盘 / ChArUco、内外参、独立验证、双基座变换导出 | piper-home |
 | 轨迹浏览 | HDF5 三路图像、时间轴、关节曲线 | piper-home |
 | 数据转换 | 多目录、task 筛选、尾部裁剪、降采样、absolute / delta | lerobot-pi05 |
 | 质量分析 | HDF5 / LeRobot 全量检查、异常 episode 清理与备份 | lerobot-pi05 |

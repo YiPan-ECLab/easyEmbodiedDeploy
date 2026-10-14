@@ -1,6 +1,7 @@
 """Persistent calibration sessions and an explicitly opened, read-only rig."""
 
 import json
+import hashlib
 import sys
 import threading
 import time
@@ -9,6 +10,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from .calibration_math import (
     JOBS,
@@ -17,6 +19,11 @@ from .calibration_math import (
     flange_transform,
     solve_extrinsics,
     solve_intrinsics,
+    transform_error,
+    base_transform,
+    inverse,
+    validate_observation,
+    compare_board_observations,
 )
 from .module_http import ROOT
 from .resources import hardware_lease
@@ -27,6 +34,47 @@ DEFAULT_SERIALS = dict(
     right_eye_in_hand="CV2L3600003K",
 )
 CAMERAS = tuple(DEFAULT_SERIALS)
+SAMPLING_LIMITS = dict(window_s=.35, max_age_s=.25, max_skew_s=.10,
+                       translation_mm=2.0, rotation_deg=.5, corner_rms_px=2.0)
+
+
+def check_sampling_window(frames, board, reverse=False, rotation_quarters=0):
+    """Check actual feedback and board observations; never infer stillness from a checkbox."""
+    if len({m["camera_received_monotonic_s"] for _, m in frames}) < 3:
+        raise ValueError("采样窗口内不足三张新图像，请检查相机是否冻结")
+    points = []
+    for rgb, metadata in (frames[0], frames[len(frames)//2], frames[-1]):
+        _, pixels, ids, _ = detect(rgb, board, reverse, rotation_quarters)
+        points.append(dict(zip(ids, pixels)))
+    drift = 0.0
+    for i, a in enumerate(points):
+        for b in points[i+1:]:
+            common = sorted(a.keys() & b.keys())
+            if len(common) < 6:
+                raise ValueError("静止检查中共同可见角点不足，请保持板面可见且静止")
+            drift = max(drift, float(np.sqrt(np.mean([
+                np.sum((a[k]-b[k])**2) for k in common]))))
+    quality = dict(limits=dict(SAMPLING_LIMITS), image_count=len(frames),
+                   window_s=frames[-1][1]["sample_monotonic_s"]-frames[0][1]["sample_monotonic_s"],
+                   corner_drift_rms_px=drift, timing_basis="host_receive_not_exposure",
+                   pose_verified=False)
+    if drift > SAMPLING_LIMITS["corner_rms_px"]:
+        raise ValueError(f"标定板图像仍在移动（角点漂移 {drift:.2f} px），请静止后重试")
+    poses = [m for _, m in frames if m.get("pose") is not None]
+    if poses:
+        if len({m["pose_sdk_timestamp_s"] for m in poses}) < 3:
+            raise ValueError("采样窗口内法兰反馈未持续更新，请检查机械臂反馈")
+        matrices = [flange_transform(m["pose"]) for m in poses]
+        errors = [transform_error(a, b) for i, a in enumerate(matrices) for b in matrices[i+1:]]
+        translation = max(e["translation_mm"] for e in errors)
+        rotation = max(e["rotation_deg"] for e in errors)
+        if translation > SAMPLING_LIMITS["translation_mm"] or rotation > SAMPLING_LIMITS["rotation_deg"]:
+            raise ValueError(f"法兰仍在移动（{translation:.2f} mm / {rotation:.2f}°），请静止后重试")
+        quality.update(pose_verified=True, translation_span_mm=translation, rotation_span_deg=rotation,
+                       max_pose_age_s=max(m["pose_age_s"] for m in poses),
+                       max_image_pose_skew_s=max(m["image_pose_skew_s"] for m in poses))
+    quality["max_image_age_s"] = max(m["image_age_s"] for _, m in frames)
+    return quality
 
 
 def atomic_json(path, value):
@@ -188,16 +236,47 @@ class CalibrationRig:
                     )
                 pose, timestamp = list(message.msg), float(message.timestamp)
                 flange_transform(pose)
+            monotonic_before = time.monotonic()
+            wall = time.time()
+            monotonic_after = time.monotonic()
+            now = (monotonic_before + monotonic_after) / 2
+            image_age = now - frame.timestamp
+            pose_age = None if timestamp is None else wall - timestamp
+            skew = None if pose_age is None else abs(now - pose_age - frame.timestamp)
+            if with_pose:
+                if not np.isfinite(pose_age) or not -.02 <= pose_age <= SAMPLING_LIMITS["max_age_s"]:
+                    raise ValueError("法兰反馈已过期或时间戳异常，请等待新反馈；不会使用缓存位姿采样")
+                if skew > SAMPLING_LIMITS["max_skew_s"]:
+                    raise ValueError(f"图像与法兰反馈接收时间差 {skew*1000:.0f} ms 超过 100 ms，请静止后重试")
             return (
                 frame.rgb,
                 dict(
                     camera_received_monotonic_s=frame.timestamp,
-                    sample_wall_time_s=time.time(),
+                    sample_wall_time_s=wall,
+                    sample_monotonic_s=now,
                     pose_sdk_timestamp_s=timestamp,
                     pose=pose,
+                    image_age_s=image_age,
+                    pose_age_s=pose_age,
+                    image_pose_skew_s=skew,
+                    clock_mapping_uncertainty_s=monotonic_after-monotonic_before,
                 ),
                 dict(self.metadata),
             )
+
+    def capture(self, with_pose=False):
+        with self.lock:
+            frames = []
+            started = time.monotonic()
+            while True:
+                rgb, metadata, camera = self.read(with_pose)
+                age = metadata["image_age_s"]
+                if not np.isfinite(age) or not -.02 <= age <= SAMPLING_LIMITS["max_age_s"]:
+                    raise ValueError("图像已过期或时间戳异常，请等待新帧")
+                frames.append((rgb.copy(), metadata))
+                if time.monotonic()-started >= SAMPLING_LIMITS["window_s"]:
+                    return frames[-1][0], dict(metadata), camera, frames
+                time.sleep(.05)
 
     def status(self):
         with self.lock:
@@ -227,7 +306,32 @@ class CalibrationStore:
         path = self.directory_for(identifier) / "session.json"
         if path.is_symlink():
             raise ValueError("标定记录不能是符号链接")
-        return json.loads(path.read_text())
+        session = json.loads(path.read_text())
+        session.setdefault("validation_samples", [])
+        return session
+
+    @staticmethod
+    def solution_id(session):
+        result = session.get("result")
+        if not result:
+            return None
+        return result.get("solution_id") or hashlib.sha256(
+            json.dumps(result, sort_keys=True).encode()).hexdigest()
+
+    def validation_summary(self, session):
+        key = self.solution_id(session)
+        current = [s for s in session.get("validation_samples", [])
+                   if key is not None and s.get("validation", {}).get("solution_id") == key]
+        reports = [s["validation"] for s in current if s.get("purpose") != "dual_validation"]
+        return dict(status=("unvalidated" if not reports else "passed" if all(
+                        r["within_thresholds"] for r in reports) else "needs_review"),
+                    sample_count=len(reports),
+                    dual_observation_count=sum(s.get("purpose") == "dual_validation" for s in current),
+                    stale_sample_count=len(session.get("validation_samples", []))-len(current),
+                    novel_pose_count=sum(bool(r.get("novel_pose")) for r in reports),
+                    max_translation_mm=max((r.get("translation_mm", 0) for r in reports), default=None),
+                    max_rotation_deg=max((r.get("rotation_deg", 0) for r in reports), default=None),
+                    max_reprojection_rms_px=max((r["reprojection_rms_px"] for r in reports), default=None))
 
     def save(self, session):
         atomic_json(self.directory_for(session["id"]) / "session.json", session)
@@ -260,6 +364,7 @@ class CalibrationStore:
                 board=board,
                 created_at=time.time(),
                 samples=[],
+                validation_samples=[],
                 result=None,
             )
             self.save(session)
@@ -287,6 +392,7 @@ class CalibrationStore:
                         }
                         | dict(
                             sample_count=len(session["samples"]),
+                            validation=self.validation_summary(session),
                             solved=session["result"] is not None,
                         )
                     )
@@ -303,9 +409,21 @@ class CalibrationStore:
         pose=None,
         reverse=False,
         rotation_quarters=0,
+        purpose="calibration",
+        scene_id="",
     ):
         with self.lock:
             session = self.load(identifier)
+            if purpose not in ("calibration", "validation", "dual_validation"):
+                raise ValueError("请选择求解样本、独立验证或双臂检查观测")
+            if purpose != "calibration" and not session["result"]:
+                raise ValueError("请先求解，再采集不参与求解的新验证样本")
+            if purpose == "dual_validation" and session["job"] not in ("left_wrist", "right_wrist"):
+                raise ValueError("双臂检查观测须使用左腕或右腕记录")
+            if not isinstance(scene_id, str) or len(scene_id) > 120:
+                raise ValueError("验证场景名称须为不超过 120 字的文本")
+            if purpose == "dual_validation" and not scene_id.strip():
+                raise ValueError("请填写双臂验证场景名称，方便匹配左右对同一固定板的观测")
             for key in ("role", "serial", "sensor", "width", "height"):
                 if session["camera"][key] != camera[key]:
                     raise ValueError("相机身份或视频配置与此记录不一致，请新建标定记录")
@@ -329,22 +447,36 @@ class CalibrationStore:
                 T_base_flange=matrix.tolist() if matrix is not None else None,
                 pose_xyz_rpy=pose,
                 metadata=metadata,
+                purpose=purpose,
+                scene_id=scene_id.strip(),
             )
+            if purpose != "calibration":
+                camera_intrinsics = (session["result"]["intrinsics"] if session["job"] == "intrinsics"
+                                     else session["camera"]["intrinsics"])
+                report = validate_observation(sample, session["samples"], session["result"],
+                                              camera_intrinsics, None if purpose == "dual_validation" else JOBS[session["job"]]["mounting"])
+                sample["validation"] = dict(report, solution_id=self.solution_id(session), evaluated_at=time.time())
             directory = self.directory_for(identifier)
             (directory / f"{sample_id}.png").write_bytes(encode_image(rgb, ".png"))
             (directory / f"{sample_id}.jpg").write_bytes(encode_image(overlay))
-            session["samples"].append(sample)
-            session["result"] = None
+            if purpose != "calibration":
+                session["validation_samples"].append(sample)
+            else:
+                session["samples"].append(sample)
+                session["result"] = None
             self.save(session)
             return session
 
     def remove_sample(self, identifier, sample_id):
         with self.lock:
             session = self.load(identifier)
-            if sample_id not in [s["id"] for s in session["samples"]]:
+            collection = next((key for key in ("samples", "validation_samples")
+                               if any(s["id"] == sample_id for s in session[key])), None)
+            if collection is None:
                 raise ValueError("样本不存在")
-            session["samples"] = [s for s in session["samples"] if s["id"] != sample_id]
-            session["result"] = None
+            session[collection] = [s for s in session[collection] if s["id"] != sample_id]
+            if collection == "samples":
+                session["result"] = None
             self.save(session)
             for suffix in (".jpg", ".png"):
                 (self.directory_for(identifier) / (sample_id + suffix)).unlink(
@@ -383,37 +515,77 @@ class CalibrationStore:
                     session["samples"], session["camera"]["intrinsics"], job["mounting"]
                 )
                 result["transform"] = job["transform"]
-            session["result"] = {**result, "solved_at": time.time(), "accepted": False}
+            session["result"] = {**result, "solved_at": time.time(), "solution_id": uuid.uuid4().hex, "accepted": False}
             self.save(session)
             return session
 
+    def compare_bases(self, identifiers, left_sample, right_sample, board_fixed=False):
+        with self.lock:
+            if board_fixed is not True:
+                raise ValueError("请确认两次观测是同一块保持固定的标定板，且角点原点一致")
+            sessions = self._export_sessions(identifiers, True)
+            jobs = {s["job"]: s for s in sessions}
+            required = ("left_wrist", "right_wrist", "global_left", "global_right")
+            if any(job not in jobs for job in required):
+                raise ValueError("双臂独立一致性检查需勾选左右腕和全局对左右 base 四项结果")
+            samples = []
+            for job, sample_id in (("left_wrist", left_sample), ("right_wrist", right_sample)):
+                session = jobs[job]
+                sample = next((s for s in session["validation_samples"] if s["id"] == sample_id), None)
+                if sample is None or sample["validation"]["solution_id"] != self.solution_id(session):
+                    raise ValueError("请选择当前求解结果下新采集的腕部验证样本；旧验证样本已失效")
+                samples.append(sample)
+            left, right = samples
+            if jobs["left_wrist"]["board"] != jobs["right_wrist"]["board"]:
+                raise ValueError("左右验证必须使用相同标定板参数")
+            if not left.get("scene_id") or left["scene_id"] != right.get("scene_id"):
+                raise ValueError("左右验证样本须填写同一场景名称，并观测同一块固定标定板")
+            relation = base_transform(jobs["global_left"]["result"]["matrix"], jobs["global_right"]["result"]["matrix"])
+            report = compare_board_observations(
+                left["T_base_flange"], jobs["left_wrist"]["result"]["matrix"], left["validation"]["T_camera_board"],
+                right["T_base_flange"], jobs["right_wrist"]["result"]["matrix"], right["validation"]["T_camera_board"], relation)
+            report["max_reprojection_rms_px"] = max(s["validation"]["reprojection_rms_px"] for s in samples)
+            report["thresholds"]["reprojection_rms_px"] = 2
+            report["within_thresholds"] &= report["max_reprojection_rms_px"] <= 2
+            report.update(schema="easy_embodied_dual_base_validation", id=uuid.uuid4().hex,
+                          created_at=time.time(), scene_id=left["scene_id"],
+                          source_sessions={job: jobs[job]["id"] for job in required},
+                          source_solutions={job: self.solution_id(jobs[job]) for job in required},
+                          source_samples=dict(left=left_sample, right=right_sample),
+                          method="independent_wrist_observations_of_same_fixed_board",
+                          T_left_base_right_base=relation.tolist())
+            directory = self.directory_for(report["id"])
+            directory.mkdir(parents=True)
+            atomic_json(directory / "dual_base_validation.json", report)
+            return report
+
+    def _export_sessions(self, identifiers, accept_warnings):
+        if not isinstance(identifiers, list) or not 1 <= len(identifiers) <= 7:
+            raise ValueError("请选择 1–7 项已求解的记录")
+        sessions = [self.load(i) for i in identifiers]
+        seen = set()
+        for session in sessions:
+            result = session["result"]
+            key = (session["job"], session["camera"]["role"])
+            if key in seen:
+                raise ValueError("同一任务不能导出两份结果")
+            seen.add(key)
+            if not result:
+                raise ValueError("请先求解所有选中的记录")
+            if (result["warnings"] or self.validation_summary(session)["status"] == "needs_review") and not accept_warnings:
+                raise ValueError("结果包含质量提示或独立验证超差，请检查后勾选接受提示再导出")
+        extrinsics = [s for s in sessions if s["job"] != "intrinsics"]
+        if len({s["mount_id"] for s in extrinsics}) > 1:
+            raise ValueError("安装版本不一致，不可合并为同一标定包")
+        globals_ = [s for s in sessions if s["job"].startswith("global_")]
+        if len(globals_) == 2 and any(globals_[0]["camera"][k] != globals_[1]["camera"][k]
+                                    for k in ("serial", "sensor", "width", "height")):
+            raise ValueError("左右 base 的全局相机标定必须使用同一台相机、同一视频配置")
+        return sessions
+
     def export(self, identifiers, accept_warnings=False):
         with self.lock:
-            if not isinstance(identifiers, list) or not 1 <= len(identifiers) <= 7:
-                raise ValueError("请选择 1–7 项已求解的记录")
-            sessions = [self.load(i) for i in identifiers]
-            seen = set()
-            for session in sessions:
-                result = session["result"]
-                key = (session["job"], session["camera"]["role"])
-                if key in seen:
-                    raise ValueError("同一任务不能导出两份结果")
-                seen.add(key)
-                if not result:
-                    raise ValueError("请先求解所有选中的记录")
-                if result["warnings"] and not accept_warnings:
-                    raise ValueError("结果包含质量提示，请检查后勾选接受提示再导出")
-            extrinsics = [s for s in sessions if s["job"] != "intrinsics"]
-            if len({s["mount_id"] for s in extrinsics}) > 1:
-                raise ValueError("安装版本不一致，不可合并为同一标定包")
-            global_sessions = [s for s in sessions if s["job"].startswith("global_")]
-            if len(global_sessions) == 2 and any(
-                global_sessions[0]["camera"][k] != global_sessions[1]["camera"][k]
-                for k in ("serial", "sensor", "width", "height")
-            ):
-                raise ValueError(
-                    "左右 base 的全局相机标定必须使用同一台相机、同一视频配置"
-                )
+            sessions = self._export_sessions(identifiers, accept_warnings)
             bundle = dict(
                 schema="easy_embodied_camera_calibration",
                 schema_version=1,
@@ -442,11 +614,48 @@ class CalibrationStore:
                     for s in sessions
                 ],
             )
+            jobs = {s["job"]: s for s in sessions}
+            bundle["derived_transforms"] = {}
+            if "global_left" in jobs and "global_right" in jobs:
+                relation = base_transform(jobs["global_left"]["result"]["matrix"], jobs["global_right"]["result"]["matrix"])
+                for name, matrix, direction, method in (
+                    ("T_left_base_right_base", relation, "right_base -> left_base",
+                     "T_left_base_camera @ inverse(T_right_base_camera)"),
+                    ("T_right_base_left_base", inverse(relation), "left_base -> right_base",
+                     "T_right_base_camera @ inverse(T_left_base_camera)"),
+                ):
+                    bundle["derived_transforms"][name] = dict(matrix=matrix.tolist(), units="m", maps=direction,
+                        mount_id=jobs["global_left"]["mount_id"],
+                        source_sessions=[jobs[j]["id"] for j in ("global_left", "global_right")],
+                        method=method,
+                        independently_validated=False)
+            current_ids = {s["job"]: s["id"] for s in sessions}
+            current_solutions = {s["job"]: self.solution_id(s) for s in sessions}
+            checks = []
+            for path in self.directory.glob("*/dual_base_validation.json"):
+                if path.is_symlink() or path.parent.is_symlink():
+                    continue
+                report = json.loads(path.read_text())
+                if all(current_ids.get(j) == i for j, i in report["source_sessions"].items()) and all(
+                        current_solutions.get(j) == i for j, i in report["source_solutions"].items()):
+                    # Deleting an observation also retires reports made from it.
+                    if all(any(s["id"] == report["source_samples"][side]
+                               for s in jobs[f"{side}_wrist"]["validation_samples"])
+                           for side in ("left", "right")):
+                        checks.append(report)
+            bundle["dual_base_validation"] = sorted(checks, key=lambda r: r["created_at"])
+            if any(not report["within_thresholds"] for report in checks) and not accept_warnings:
+                raise ValueError("双臂独立一致性检查存在超差结果，请检查后勾选接受提示再导出")
+            for value in bundle["derived_transforms"].values():
+                value["independently_validated"] = bool(checks) and all(r["within_thresholds"] for r in checks)
+            for calibration, source in zip(bundle["calibrations"], sessions):
+                calibration["validation_summary"] = self.validation_summary(source)
+                calibration["validation_samples"] = source["validation_samples"]
             for calibration in bundle["calibrations"]:
                 calibration["result"] = {
                     **calibration["result"],
                     "accepted": True,
-                    "warnings_accepted": bool(calibration["result"]["warnings"]),
+                    "warnings_accepted": bool(calibration["result"]["warnings"] or calibration["validation_summary"]["status"] == "needs_review"),
                 }
             export_id = uuid.uuid4().hex
             folder = self.directory_for(export_id)

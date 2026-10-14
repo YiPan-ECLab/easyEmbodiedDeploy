@@ -13,7 +13,8 @@ let defaults, sessions = [],
   },
   busy = false,
   previewBusy = false,
-  exportPath = '';
+  exportPath = '', dualSelection = [];
+const purposeNames = {calibration:'求解样本', validation:'独立验证', dual_validation:'双臂观测'};
 const status = (message, error = false) => {
   $('status').textContent = message;
   $('status').className = error ? 'error' : '';
@@ -87,13 +88,15 @@ function updateRig() {
   $('open').disabled = rig.open || busy;
   $('close').disabled = !rig.open || busy;
   $('create').disabled = !rig.open || busy;
-  $('capture').disabled = !rig.open || !session || busy;
+  $('capture').disabled = !rig.open || !session || busy || defaults?.validation_version !== 1 || ($('sample-purpose').value !== 'calibration' && !session.result);
   $('detect').disabled = !rig.open || !session || busy;
   $('solve').disabled = !session || busy;
   $('job').disabled = rig.open;
   $('camera').disabled = rig.open || !!defaults?.jobs[$('job').value].camera;
   $('serial').disabled = rig.open;
   $('read-pose').disabled = rig.open || !defaults?.jobs[$('job').value].side;
+  $('compare-bases').disabled = busy || !dualSelection.length || !$('dual-left').value || !$('dual-right').value || defaults?.validation_version !== 1;
+  $('load-dual').disabled = busy || defaults?.validation_version !== 1;
   renderIntrinsics();
 }
 
@@ -177,6 +180,9 @@ function renderSession() {
   for(const option of $('corner-rotation').options)option.disabled=Number(option.value)%2===1&&b.columns!==b.rows;
   if(b.kind!=='chessboard'||(b.columns!==b.rows&&Number($('corner-rotation').value)%2))$('corner-rotation').value='0';
   $('manual-pose').disabled = session.job === 'intrinsics';
+  $('sample-purpose').querySelector('[value=dual_validation]').disabled=!session.job.endsWith('wrist');
+  if($('sample-purpose').value==='dual_validation'&&!session.job.endsWith('wrist'))$('sample-purpose').value='calibration';
+  updatePurpose();
   $('sample-list').replaceChildren();
   session.samples.forEach((sample, index) => {
     const tr = document.createElement('tr');
@@ -211,6 +217,7 @@ function renderSession() {
   });
   $('result').textContent = JSON.stringify({intrinsics: session.camera.intrinsics, result: session.result || '尚未求解'}, null, 2);
   renderQuality();
+  renderValidation();
   updateRig();
 }
 
@@ -228,8 +235,8 @@ function renderQuality() {
     ['重投影 RMS', `${result.rms_px.toFixed(3)} px`],
     ['板面倾角范围', `${result.normal_spread_deg.toFixed(1)}°`]
   ] : [
-    ['平移一致性 RMS', `${result.translation_rms_mm.toFixed(2)} mm`],
-    ['旋转一致性 RMS', `${result.rotation_rms_deg.toFixed(2)}°`],
+    ['求解集平移 RMS', `${result.translation_rms_mm.toFixed(2)} mm`],
+    ['求解集旋转 RMS', `${result.rotation_rms_deg.toFixed(2)}°`],
     ['最大重投影误差', `${Math.max(...result.per_sample_rms_px).toFixed(3)} px`]
   ];
   for (const [label, value] of values) {
@@ -250,6 +257,56 @@ function renderQuality() {
     $('quality').append(notice);
   }
 }
+
+function updatePurpose() {
+  const purpose=$('sample-purpose').value;
+  $('scene-field').hidden=purpose!=='dual_validation';
+  $('purpose-help').textContent=purpose==='calibration'?'用于求解；增加或移除后需要重新求解。':purpose==='validation'?'保持求解时板与环境（腕部）或板与法兰（全局）的固定关系；换一个新姿态，仅验证、不重新拟合。':'可把板重新固定在两只腕部相机都能看见的位置；左右使用同一场景名称。本观测不与求解时板的位置比较。';
+  $('capture').textContent=purpose==='calibration'?'保存求解样本':purpose==='validation'?'保存独立验证样本':'保存双臂检查观测';
+  updateRig();
+}
+function renderValidation() {
+  const summary=session?.validation_summary;
+  $('validation-summary').textContent=!summary||!summary.sample_count?'当前求解尚未完成单项独立验证。':`${summary.sample_count} 个独立验证样本 · ${summary.status==='passed'?'均在参考阈值内':'存在超差，请检查'} · 最大重投影 ${summary.max_reprojection_rms_px.toFixed(3)} px`+(session.job==='intrinsics'?'':` · 最大偏差 ${summary.max_translation_mm.toFixed(2)} mm / ${summary.max_rotation_deg.toFixed(2)}° · ${summary.novel_pose_count} 个新姿态`);
+  if(summary?.stale_sample_count)$('validation-summary').textContent+=`；${summary.stale_sample_count} 个旧验证已失效。`;
+  $('validation-list').replaceChildren();
+  for(const sample of session?.validation_samples||[]) {
+    const r=sample.validation, current=session.result && (session.result.solution_id?r.solution_id===session.result.solution_id:!summary?.stale_sample_count);
+    const row=document.createElement('tr');
+    for(const value of [`${purposeNames[sample.purpose]||'验证'} ${sample.scene_id||''}`,`${r.reprojection_rms_px.toFixed(3)} px`,r.translation_mm===undefined?'—':`${r.translation_mm.toFixed(2)} mm / ${r.rotation_deg.toFixed(2)}°`,!current?'已失效':r.within_thresholds?'阈值内':'超差']) {
+      const cell=document.createElement('td');cell.textContent=value;row.append(cell);
+    }
+    row.title=(r.warnings||[]).join('；');
+    const cell=document.createElement('td'),view=document.createElement('button'),remove=document.createElement('button');
+    view.textContent='查看';view.onclick=()=>{$('preview-live').checked=false;showPreview(`api/sample?id=${session.id}&sample=${sample.id}`);status((r.warnings||[]).join('；')||'验证观测未参与求解');};
+    remove.textContent='移除';remove.onclick=()=>run(async()=>{session=await api('remove-sample',{id:session.id,sample:sample.id});renderSession();await reload();status('已移除验证样本，求解结果保留');});
+    cell.append(view,remove);row.append(cell);$('validation-list').append(row);
+  }
+  const all=[...(session?.samples||[]),...(session?.validation_samples||[])];
+  const latest=all.filter(s=>s.metadata?.quality).sort((a,b)=>(a.metadata.sample_wall_time_s||0)-(b.metadata.sample_wall_time_s||0)).at(-1);
+  $('capture-quality').hidden=!latest;
+  if(latest){const q=latest.metadata.quality;$('capture-quality').textContent=`最近采样：角点漂移 ${q.corner_drift_rms_px.toFixed(2)} px；`+(q.pose_verified?`法兰变化 ${q.translation_span_mm.toFixed(2)} mm / ${q.rotation_span_deg.toFixed(2)}°，最大接收时间差 ${(q.max_image_pose_skew_s*1000).toFixed(0)} ms。`:'位姿时间与机械臂静止性未自动验证。');}
+}
+$('sample-purpose').onchange=updatePurpose;
+function exportIds(){return [...document.querySelectorAll('#export-list input:checked')].map(i=>i.value);}
+$('load-dual').onclick=()=>run(async()=>{
+  const ids=exportIds(), rows=await Promise.all(ids.map(id=>api(`session?id=${id}`)));
+  const jobs=Object.fromEntries(rows.map(s=>[s.job,s]));
+  if(!['left_wrist','right_wrist','global_left','global_right'].every(j=>jobs[j]))throw new Error('请先在导出列表勾选四项外参结果');
+  dualSelection=ids;
+  for(const side of ['left','right']){
+    const record=jobs[`${side}_wrist`],select=$(`dual-${side}`);select.replaceChildren(option('','选择验证观测'));
+    for(const sample of record.validation_samples||[])if(sample.scene_id&&(!record.result.solution_id||sample.validation.solution_id===record.result.solution_id))select.append(option(sample.id,`${sample.scene_id} · ${sample.id.slice(0,8)}`));
+  }
+  status('已载入观测；请选择左右同一固定板场景');
+});
+for(const side of ['left','right'])$(`dual-${side}`).onchange=updateRig;
+$('export-list').onchange=()=>{dualSelection=[];updateRig();};
+$('compare-bases').onclick=()=>run(async()=>{
+  const r=await api('compare-bases',{ids:dualSelection,left_sample:$('dual-left').value,right_sample:$('dual-right').value,board_fixed:$('dual-fixed').checked});
+  $('dual-summary').textContent=`同一标定板在左基座下：${r.translation_mm.toFixed(2)} mm / ${r.rotation_deg.toFixed(2)}°，最大重投影 ${r.max_reprojection_rms_px.toFixed(3)} px · ${r.within_thresholds?'在 5 mm / 2° / 2 px 参考阈值内':'超过参考阈值，请检查标定、图像与板固定情况'}。报告已保存，将随对应标定包导出。`;
+  $('dual-report').textContent=JSON.stringify(r,null,2);status('双臂独立一致性检查已完成');
+});
 
 function requireSession() {
   if (!session) throw new Error('请先新建或选择标定记录');
@@ -303,6 +360,7 @@ $('sessions').onchange = () => run(async () => {
     $('sample-list').replaceChildren();
     $('quality').replaceChildren();
     $('result').textContent = '尚未选择记录';
+    renderValidation();
     $('procedure').textContent = procedure($('job').value);
     return;
   }
@@ -349,12 +407,14 @@ $('capture').onclick = () => run(async () => {
     id: session.id,
     rotation_quarters: Number($('corner-rotation').value),
     pose,
+    purpose: $('sample-purpose').value,
+    scene_id: $('scene-id').value,
     still_confirmed: $('still').checked
   });
   renderSession();
   await reload();
   $('still').checked = false;
-  status(`已保存第 ${session.samples.length} 个样本。改变姿态并静止后再采样。`);
+  status(`已保存${purposeNames[$('sample-purpose').value]}。求解样本 ${session.samples.length} 个，验证观测 ${(session.validation_samples||[]).length} 个。`);
 });
 $('solve').onclick = () => run(async () => {
   requireSession();
@@ -376,18 +436,19 @@ $('apply-intrinsics').onclick = () => run(async () => {
   status('已应用内参，请重新求解外参');
 });
 $('export').onclick = () => run(async () => {
-  const ids = [...document.querySelectorAll('#export-list input:checked')].map(i => i.value);
+  const ids = exportIds();
   const result = await api('export', {
     ids,
     accept_warnings: $('accept-warnings').checked
   });
   exportPath = result.path;
+  $('export-validation').textContent=JSON.stringify({derived_transforms:result.bundle.derived_transforms,validation:result.bundle.calibrations.map(c=>({job:c.job,...c.validation_summary})),dual_base_validation:result.bundle.dual_base_validation},null,2);
   $('export-path').textContent = exportPath;
   $('export-path').hidden = false;
   $('copy-export').hidden = false;
   $('download-export').hidden = false;
   $('download-export').href = `api/export?id=${result.export_id}`;
-  status(result.bundle.missing_jobs.length ? `已导出部分标定；尚缺：${result.bundle.missing_jobs.map(j=>titles[j]).join('、')}` : '四项外参已导出。位姿转换与训练接入等待数据流文档确认。');
+  status(result.bundle.missing_jobs.length ? `已导出部分标定；尚缺：${result.bundle.missing_jobs.map(j=>titles[j]).join('、')}` : '四项外参、双基座变换及验证记录已导出。');
 });
 $('copy-export').onclick = async () => {
   try {
@@ -438,5 +499,7 @@ run(async () => {
   changeJob();
   updateBoard();
   await reload();
+  updatePurpose();
+  if(defaults.validation_version!==1)status('标定服务仍运行旧代码，请关闭设备后重启标定模块以使用新采样与验证功能',true);
 });
 setInterval(preview, 500);

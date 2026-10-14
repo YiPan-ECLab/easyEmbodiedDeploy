@@ -9,7 +9,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import cv2
 
-from .calibration import CalibrationRig, CalibrationStore, DEFAULT_SERIALS, encode_image
+from .calibration import (CalibrationRig, CalibrationStore, DEFAULT_SERIALS, encode_image,
+                          SAMPLING_LIMITS, check_sampling_window)
 from .calibration_math import DEFAULT_BOARD, JOBS, board_config, board_image, detect
 from .http import read_json
 from .contracts import boolean
@@ -31,18 +32,21 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
                         directory=str(store.directory),
                         sessions=store.listing(),
                         rig=rig.status(),
+                        sampling_limits=SAMPLING_LIMITS,
+                        validation_version=1,
                     )
                 )
             elif route.path == "/api/state":
                 self.send(dict(sessions=store.listing(), rig=rig.status()))
             elif route.path == "/api/session":
-                self.send(store.load(query.get("id")))
+                session = store.load(query.get("id"))
+                self.send(dict(session, validation_summary=store.validation_summary(session)))
             elif route.path == "/api/frame":
                 self.send(encode_image(rig.read()[0]), content_type="image/jpeg")
             elif route.path == "/api/sample":
                 session = store.load(query.get("id"))
                 sample_id = query.get("sample")
-                if sample_id not in [s["id"] for s in session["samples"]]:
+                if sample_id not in [s["id"] for s in session["samples"]+session["validation_samples"]]:
                     raise ValueError("样本不存在")
                 self.send(
                     (
@@ -133,11 +137,16 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
                     job = JOBS[session["job"]]
                     manual = body.get("pose")
                     use_sdk = job["side"] is not None and manual is None
-                    rgb, metadata, camera = rig.read(with_pose=use_sdk)
-                    if use_sdk and camera["pose_side"] != job["side"]:
-                        raise ValueError("当前位姿来源与任务的左/右臂不一致")
                     if body.get("still_confirmed") is not True:
                         raise ValueError("请在机械臂和标定板静止后确认再采样")
+                    rgb, metadata, camera, frames = rig.capture(with_pose=use_sdk)
+                    if use_sdk and camera["pose_side"] != job["side"]:
+                        raise ValueError("当前位姿来源与任务的左/右臂不一致")
+                    reverse = boolean(body.get("reverse", False), "角点反转")
+                    quarters = body.get("rotation_quarters", 0)
+                    metadata["quality"] = check_sampling_window(frames, session["board"], reverse, quarters)
+                    if manual is not None:
+                        metadata["quality"]["note"] = "手动位姿的时间对应和机械臂静止性未自动验证"
                     pose = metadata["pose"] if use_sdk else manual
                     metadata["pose_source"] = (
                         "pyAgxArm_follower_flange"
@@ -152,8 +161,10 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
                         metadata,
                         camera,
                         pose,
-                        boolean(body.get("reverse", False), "角点反转"),
-                        body.get("rotation_quarters", 0),
+                        reverse,
+                        quarters,
+                        body.get("purpose", "calibration"),
+                        body.get("scene_id", ""),
                     )
                 elif route == "/api/remove-sample":
                     result = store.remove_sample(body.get("id"), body.get("sample"))
@@ -165,8 +176,13 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
                     result = store.export(
                         body.get("ids"), body.get("accept_warnings") is True
                     )
+                elif route == "/api/compare-bases":
+                    result = store.compare_bases(body.get("ids"), body.get("left_sample"),
+                                                 body.get("right_sample"), body.get("board_fixed") is True)
                 else:
                     raise ValueError("未知操作")
+            if isinstance(result, dict) and "samples" in result:
+                result = dict(result, validation_summary=store.validation_summary(result))
             self.send(result)
         except (
             OSError,
