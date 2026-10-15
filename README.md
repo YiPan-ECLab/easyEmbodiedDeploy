@@ -1,88 +1,111 @@
 # easyEmbodiedDeploy
 
-Piper 双臂采集、数据浏览与转换、质量分析、LeRobot / OpenPI 训练和部署的本地工作台。
+**从示教采集到 VLA 真机部署，一个本地 Web 工作台。**
 
-![统一工作台](docs/images/workbench.png)
+面向 **Piper 双臂 + Orbbec 三路相机**，串起数据采集、轨迹编辑、数据转换、相机标定和 **π0.5（PI05）** 训练部署。支持 **LeRobot / PyTorch** 与 **OpenPI / JAX** 两套后端，也可以把固定关键点与多个 VLA 模型编排成自定义工作流。
 
-## 启动统一 Web
+[快速开始](#快速开始) · [模块与用法](#模块与用法) · [界面预览](#界面预览) · [详细文档](#详细文档)
 
-在仓库根目录执行：
+![统一工作台：11 个模块，从采集到部署](docs/images/modules/workbench.png)
+
+## 快速开始
+
+在 Linux 上安装 [uv](https://docs.astral.sh/uv/getting-started/installation/)，然后执行：
 
 ```bash
+git clone --recurse-submodules https://github.com/YiPan-ECLab/easyEmbodiedDeploy.git
+cd easyEmbodiedDeploy
+
+bash thirdParty/setup_envs.sh         # 采集、数据工具、LeRobot 训练与部署
+# bash thirdParty/setup_openpi_env.sh # 使用 OpenPI 时再安装
+
 python3 workbench.py
 ```
 
-打开 **http://127.0.0.1:8088**。可用 `--port 8090` 更换端口，`--port 0` 自动选择空闲端口。入口仅使用 Python 标准库，各模块在各自的虚拟环境里按需启动。
+打开 **http://127.0.0.1:8088**，从左侧选择模块。已有环境只需执行最后一行；端口冲突时用 `python3 workbench.py --port 8090`。
 
-| 模块 | 功能 | 环境 |
+工作台按需启动各模块的独立服务，打开页面不会自动连接机械臂或启动训练。首次使用的 GPU 驱动、相机权限、CAN 接口和环境配置见 [安装指南](thirdParty/README.md)。数据和模型放在 `datasets/`、`models/`，不随 Git 分发。
+
+## 模块与用法
+
+常用路线：**采集 → 浏览 / 部分融合 → 转换 → 质量检查 → 训练 → 部署或工作流**。使用相机坐标动作或深度选点时，先完成相应相机标定。
+
+| 模块 | 主要功能 | 怎么用 |
 | --- | --- | --- |
-| 模型与数据目录 | models / datasets 浏览、新建、重命名、复制路径、回收站与恢复 | piper-home |
-| [Piper 采集](scripts/PiperRecorder/README.md) | 四臂示教、自定义起点、脚踏板 / 回车、保存与丢弃 | piper-home |
-| [相机标定](scripts/CameraCalibration/README.md) | 自定义棋盘 / ChArUco、内外参、独立验证、双基座变换导出 | piper-home |
-| 轨迹浏览 | HDF5 三路图像、时间轴、关节曲线 | piper-home |
-| 数据转换 | 多目录、task 筛选、尾部裁剪、降采样、absolute / delta | lerobot-pi05 |
-| 质量分析 | HDF5 / LeRobot 全量检查、异常 episode 清理与备份 | lerobot-pi05 |
-| LeRobot 训练 | PI05、LoRA / 全参数、RTC、恢复、GPU 和日志 | lerobot-pi05 |
-| OpenPI 训练 | JAX、LoRA / 全参数、RTC、FSDP、恢复 | openpi-jax |
-| LeRobot 部署 | 同步 / RTC、硬件桥、dry-run、诊断 | lerobot-pi05 |
-| OpenPI 部署 | 同步 / RTC、硬件桥、离线数据推理、诊断 | openpi-jax |
-| [自定义工作流](scripts/Workflow/README.md) | 共享关键点与 VLA 模型库、步骤编排、平滑运动、多模型预加载 | piper-home |
+| [Piper 采集](scripts/PiperRecorder/README.md) | 四臂主从示教、三路实时预览、脚踏板采集、自定义起点 | 选起点 → 连接归位 → 输入指令 → 踏板 / 回车开始、结束、保存 |
+| [相机标定](scripts/CameraCalibration/README.md) | 腕部手眼 / 全局相机外参、独立验证、双基座变换导出 | 选任务与标定板 → 多姿态采样 → 求解 → 新姿态验证 → 导出 |
+| [轨迹浏览](scripts/PiperViewer/README.md) | 三路同步回放、关节曲线、逐帧检查、片段融合 | 打开 episode → 标记简单片段与抽帧倍率 → 预览 → 导出新 HDF5 |
+| [数据转换](scripts/LerobotDataProcessor/README.md) | 多目录、多任务 HDF5 → LeRobot v3；关节与末端位姿动作 | 选输入目录、动作表示 → 检查输入 → 转换并自动复验 |
+| [质量分析](scripts/DataAnalysis/README.md) | HDF5 / LeRobot 全量检查、异常定位、报告导出与清理 | 选数据类型和路径 → 全面检查 → 查看逐条结果 |
+| [LeRobot 训练](scripts/LerobotTrainer/README.md) | PI05、LoRA / 直接权重微调、RTC 训练、单 / 多卡、断点续训 | 选数据集和基座 → 配置训练方式与 GPU → 验证 → 启动 |
+| [OpenPI 训练](scripts/OpenpiTrainer/README.md) | JAX PI05、LoRA / 直接权重微调、RTC 训练、FSDP、断点续训 | 选数据集和基座 → 配置训练方式与 GPU → 验证 → 启动 |
+| [LeRobot 部署](scripts/LerobotDeployer/README.md) | PyTorch 推理、同步 / RTC、硬件桥、运行诊断 | 选 checkpoint、动作模式和 policy Hz → 检查配置 → 启动部署 |
+| [OpenPI 部署](scripts/OpenpiDeployer/README.md) | JAX 推理、同步 / RTC、预热、离线数据推理与真机部署 | 选 checkpoint、动作模式和 policy Hz → 配置输入 → 启动部署 |
+| [自定义工作流](scripts/Workflow/README.md) | 共享关键点 / 模型库、步骤拖拽、多模型预加载、平滑衔接 | 录点 / 选点 → 添加关键点、VLA、夹爪或等待步骤 → 保存 → 执行 |
+| 模型与数据目录 | 浏览、重命名、复制路径、回收站与恢复 | 在工作台管理 `models/` 和 `datasets/`，复制路径供其他模块使用 |
 
-打开页面只启动网页服务。连接机械臂、采集、训练和部署均由模块内的按钮启动。切换模块保留页面状态；“服务日志”中可以查看启动故障或停止模块及其任务。终端 Ctrl+C 会等待各模块清理；正在回零时可能需要一段时间。
+**自定义起点：**在采集设置中导入工作流共享点，或读取从臂姿态，核对后保存。每条采集前后返回该点，各侧主从臂目标一致。
 
-现有独立脚本与 Web 入口继续可用。首次部署的环境、GPU/CUDA、Orbbec 与 CAN 配置见 [thirdParty/README.md](thirdParty/README.md)。Web 默认仅监听本机；远程使用可转发 SSH 端口。
+**混合工作流：**关键点和模型跨流程共享、反复引用。用从臂机身按钮拖动录点，也可手动输入、从 HDF5 提取或通过深度相机选点。固定点运动期间可后台加载 VLA，执行前按需平滑回零。
 
-## 脚踏板采集
+**部分融合：**简单片段抽稀，复杂片段保留密度，另存新文件并标记 `fps: mixed`。训练按新序列读取 chunk，部署独立设置 **policy Hz**；快慢能力是否能被学到，由训练实验验证。
 
-1. 打开“Piper 采集”，确认输出目录和采集起点，再连接设备。默认回零；自定义起点可导入工作流共享点或读取从臂姿态，每侧主从臂使用同一目标。
-2. 输入任务指令，踩踏板 / 回车开始；留空沿用上一条指令。
-3. 默认零位执行 J6 预定位，自定义起点跳过预摆；随后照常示教。达到动作检测阈值前的静止帧不保存。
-4. 踩踏板 / 回车结束 task；自动返回所选起点期间仍记录 home 帧。
-5. 再踩一次保存，或点击“丢弃本条”；随后进入下一条任务。
+## 界面预览
 
-网页必须获得键盘焦点，页内会显示踏板就绪提示。阶段令牌与按键去重避免长按或重复请求跨阶段触发。“结束会话并归位”会结束当前记录、等待回零并丢弃尚未保存的数据。关闭浏览器标签不会自动终止正在运行的会话，可重新打开工作台继续操作。
+以下均为 **2026-10-15 当前版本的浏览器截图**。采集、标定和部署页面展示未连接设备的配置界面；轨迹浏览使用已有录制，工作流展示内置模拟编排示例。点击图片可查看原图。
 
-采集与部署桥接共用设备锁，不允许同时占用设备。机械臂连接、反馈、预定位和回零直接沿用已验证的原版硬件实现，详见[位姿扩展验收](docs/POSE_ACTION_ACCEPTANCE.md)中的硬件验收记录。
+<details open>
+<summary><strong>自定义工作流 · 关键点与 VLA 混合编排</strong></summary>
 
-“动作检测阈值”决定何时开始保存 task 帧：任一侧任一关节或夹爪的动作值相对本条起始基线达到阈值即可触发。默认关节 `0.01 rad`（约 `0.573°`）、夹爪 `0.002 m`（`2 mm`）。触发后连续采样，中途停顿也保留；详见[采集说明](scripts/PiperRecorder/README.md#动作检测阈值)。
+[![工作流：基准点 → VLA → 返回基准点](docs/images/modules/workflow.png)](docs/images/modules/workflow.png)
 
-## 工作流共享资源
+</details>
 
-在“自定义工作流”录点或保存 VLA 配置后，所有工作流均可直接引用；新建工作流只清空编排。共享点和模型配置分别存入 `datasets/workflows/point_library.json`、`model_library.json`，工作流文件保存步骤引用和运动参数。编辑共享资源影响所有引用，正在执行的流程保持启动时快照；独立变体可先复制资源。
+<details>
+<summary><strong>采集与标定 · 包含自定义采集起点</strong></summary>
 
-采集模块继续读取共享关键点，已保存的采集起点独立保留，不随共享点编辑自动改变。旧工作流迁移备份、模型操作和验证范围见[工作流说明](scripts/Workflow/README.md)。
+| Piper 采集 | 相机标定 |
+| --- | --- |
+| [![Piper 采集设置与会话](docs/images/modules/recorder.png)](docs/images/modules/recorder.png) | [![相机标定控制台](docs/images/modules/calibration.png)](docs/images/modules/calibration.png) |
 
-## 验证
+自定义采集起点：导入共享点、读取从臂、核对两侧目标后保存。
 
-新增模块的使用和约定见 [相机标定说明](docs/CAMERA_CALIBRATION.md) 与 [位姿动作数据流](docs/POSE_ACTION_DATAFLOW.md)。标定板默认 **4×6 内角点、53.5 mm**，可在网页修改；实际为 5×7 格。位姿转换、两套训练和部署现支持各自 base 绝对位姿、各自腕部 camera delta 和全局 camera delta；state 固定复用 14 维关节反馈，action 为 14 维 xyz / 三维旋转向量 / 夹爪。绝对位姿使用左右自身 base，不依赖相机标定。
+[![自定义采集起点](docs/images/modules/recorder-start-point.png)](docs/images/modules/recorder-start-point.png)
 
-标定页面默认直接使用实际 RGB 视频配置的出厂内参；打开相机即可查看 K、畸变和来源，新建记录时自动保存，无需点击“应用内参”。“相机 → 左法兰”是 `T_left_flange_left_camera`，操作顺序和 base / 法兰区别见上述标定说明。
+</details>
 
-目录管理只操作仓库 `models/` 和 `datasets/`。删除默认移入对应根目录的回收站；恢复不覆盖同名项目；永久删除需输入完整名称。符号链接可管理链接本身，但不进入链接目标。运行任务中请勿移动其模型和数据；页面会阻止能识别到的进程路径引用，但无法替代所有外部程序的文件占用管理。
+<details>
+<summary><strong>数据工具 · 轨迹浏览、部分融合、转换与质量分析</strong></summary>
 
-OpenPI 的控制循环指标现持续记录每个 tick 的推理延迟、累计饿死次数、限幅次数、队列和桥接频率。网页诊断路径留空时，每次运行独立保存到 `outputs/openpi_deployer/`，结束后保留同名 `.summary.json`。自定义路径仍可使用。推理中位数为最近最多 1000 个 chunk 的统计，排除 warmup；离线运行没有机械臂实测频率。
+[![三路轨迹回放与部分融合](docs/images/modules/viewer.png)](docs/images/modules/viewer.png)
 
-已安装三套环境后，运行项目的 CPU 回归矩阵：
+| 数据转换 | 质量分析 |
+| --- | --- |
+| [![HDF5 转 LeRobot](docs/images/modules/processor.png)](docs/images/modules/processor.png) | [![数据质量检查](docs/images/modules/analysis.png)](docs/images/modules/analysis.png) |
 
-```bash
-python3 tests/run_checks.py
-```
+</details>
 
-工作台启动后，还可执行真实 HTTP 数据链路和浏览器测试（均不启动机械臂）：
+<details>
+<summary><strong>训练与部署 · LeRobot / PyTorch、OpenPI / JAX</strong></summary>
 
-```bash
-thirdParty/.venvs/lerobot-pi05/bin/python tests/http_smoke.py
-uv run --no-project --with playwright python tests/browser_smoke.py
-uv run --no-project --with playwright python tests/browser_resources.py --url http://127.0.0.1:8088
-uv run --no-project --with playwright python tests/browser_theme.py --url http://127.0.0.1:8088
-```
+| LeRobot | OpenPI |
+| --- | --- |
+| [![LeRobot 训练](docs/images/modules/lerobot-trainer.png)](docs/images/modules/lerobot-trainer.png) | [![OpenPI 训练](docs/images/modules/openpi-trainer.png)](docs/images/modules/openpi-trainer.png) |
+| [![LeRobot 部署](docs/images/modules/lerobot-deployer.png)](docs/images/modules/lerobot-deployer.png) | [![OpenPI 部署](docs/images/modules/openpi-deployer.png)](docs/images/modules/openpi-deployer.png) |
 
-浏览器测试需要安装 Playwright Chromium；也可通过 `--browser /path/to/chromium` 指定已有浏览器。非默认端口用 `--url http://127.0.0.1:8090`。
+</details>
 
-具体修复、验证结果和剩余现场验收见 [位姿扩展验收](docs/POSE_ACTION_ACCEPTANCE.md)；各模块具体改动见 [模块改动清单](docs/MODULE_CHANGES.md)。
+<details>
+<summary><strong>模型与数据目录 · 文件浏览与回收站</strong></summary>
 
-此前目录管理、相机标定与 OpenPI 指标修复的内容已合并进 [模块改动清单](docs/MODULE_CHANGES.md)，当前完整验收以 [位姿扩展验收](docs/POSE_ACTION_ACCEPTANCE.md) 为准。
+[![模型与数据目录](docs/images/modules/files.png)](docs/images/modules/files.png)
 
-统一界面与出厂内参的结果已合并进 [相机标定说明](docs/CAMERA_CALIBRATION.md) 与 [模块改动清单](docs/MODULE_CHANGES.md)。最新位姿扩展、相对关节修复、GPU / 网页 / 真机测试见 [位姿扩展验收](docs/POSE_ACTION_ACCEPTANCE.md)；使用前按 [标定说明](docs/CAMERA_CALIBRATION.md) 和 [位姿数据链路](docs/POSE_ACTION_DATAFLOW.md) 配置所选动作模式。
+</details>
 
-Git 仅保存源码与环境锁。`datasets/`、`models/`、虚拟环境、测试产生的数据和权重均不会上传，需要在目标机器上单独复制或重新生成。
+## 详细文档
+
+各模块的操作步骤见上表链接；进一步了解：
+
+[安装与迁移](thirdParty/README.md) · [标定流程](scripts/CameraCalibration/README.md) · [关节与位姿数据链路](docs/POSE_ACTION_DATAFLOW.md) · [多硬件 / 多 Policy 扩展设计](docs/MULTI_HARDWARE_MULTI_POLICY_DESIGN.md)
+
+转换、训练、部署应使用同一动作语义。开发检查：安装所需环境后运行 `python3 tests/run_checks.py`。
