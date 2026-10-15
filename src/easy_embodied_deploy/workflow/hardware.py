@@ -367,8 +367,9 @@ class PiperHardware:
             values = self.point_values("joint", active_sides)
             for side in active_sides:
                 self._status(side)
-                if side in self.armed_sides:
-                    continue
+                # A physical teaching-button cycle can change motor enable
+                # state without a web teaching session. Reconfirm on every
+                # motion handoff; armed_sides only tracks ownership for stop().
                 self._check_emergency()
                 # Prime the current measured target before enabling; no role
                 # switch and no old leader target is involved.

@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from easy_embodied_deploy.workflow.plan import (new_plan, validate, PlanStore, interpolate,
                                                tangent, camera_point)
 from easy_embodied_deploy.workflow.hardware import MockHardware, PiperHardware
-from easy_embodied_deploy.workflow.models import ModelPool
+from easy_embodied_deploy.workflow.models import ModelPool, ModelProcess
 from easy_embodied_deploy.workflow.runtime import WorkflowController, smooth_target
 
 
@@ -272,6 +272,27 @@ class HardwareAdapterTests(unittest.TestCase):
             self.rig.home(lambda: None, progress.append, True)
         self.assertTrue(all(g.width == 0 for g in self.rig.grippers.values()))
 
+    def test_record_then_home_rechecks_enable_without_reconnecting(self):
+        self.rig.prepare()
+        for _ in range(2):
+            # Physical teaching can happen without the web teach() button.
+            arm = self.rig.arms['right']
+            arm.q[0] = .08
+            arm.powered = False
+            count = arm.enabled
+            self.rig.capture_point('joint', ('right',))
+            original = arm.move_j
+            arm.move_j = lambda q: original(q) if arm.powered else None
+            try:
+                with patch.dict(sys.modules, record=self.record):
+                    self.rig.home(lambda: None, lambda p: None)
+            finally:
+                arm.move_j = original
+            self.assertGreater(arm.enabled, count)
+            self.assertTrue(arm.powered)
+            self.assertEqual(arm.q, [0.0]*6)
+        self.assertFalse(any(c[1] == 'disable' for c in self.calls))
+
     def test_physical_button_stop_allows_home_with_latched_teach_control_mode(self):
         # Actual right follower 0x2A1: 02 00 01 02 01 00 00 00.
         state = SimpleNamespace(ctrl_mode=2, arm_status=0, teach_status=1)
@@ -504,6 +525,69 @@ class RuntimeTests(unittest.TestCase):
 
 
 class VLASettingsTests(unittest.TestCase):
+    def test_model_unload_does_not_block_progress_snapshot(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        pool = ModelPool()
+        model = Mock()
+        def close():
+            entered.set()
+            release.wait(3)
+        model.close.side_effect = close
+        pool.models['m'] = model
+        worker = threading.Thread(target=pool.close)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                self.assertEqual(executor.submit(pool.snapshot).result(timeout=.5), [])
+        finally:
+            release.set()
+            worker.join(2)
+
+    def test_cancelled_inference_never_starts_another_rpc(self):
+        import threading
+        model = ModelProcess.__new__(ModelProcess)
+        model.rpc_lock = threading.Lock()
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(InterruptedError):
+            model.infer({}, '', cancel_event=cancel)
+
+    def test_preloaded_model_reused_and_unreferenced_draft_does_not_block(self):
+        controller = WorkflowController()
+        self.addCleanup(controller.close)
+        controller.connect(True)
+        plan = new_plan()
+        plan['settings']['control_hz'] = 80
+        plan['models'] = [dict(id='ready', name='已配置模型', backend='mock', action_mode='absolute_joint'),
+                          dict(id='draft', name='待编辑模型', backend='lerobot', action_mode='delta_joint', checkpoint='')]
+        plan['steps'] = [dict(id='vla', type='vla', model='ready', until='actions', value=1)]
+        with tempfile.TemporaryDirectory() as directory:
+            store = PlanStore(directory)
+            self.assertEqual(len(store.load(store.save(plan))['models']), 2)
+        controller.preload(plan, ['ready'])
+        model = controller.models.get('ready')
+        wait_for(lambda: model.stage in ('ready', 'failed'), timeout=15)
+        self.assertEqual(model.stage, 'ready', model.detail)
+        self.assertEqual(model.config['control_hz'], 80)
+        controller.start(plan, home_before=False)
+        wait_for(lambda: not controller.busy(), timeout=15)
+        self.assertEqual(controller.status['state'], 'completed', controller.snapshot())
+        self.assertIs(controller.models.get('ready'), model)
+        plan['models'][0]['name'] = '只改名称'
+        controller.preload(plan, ['ready'])
+        self.assertIs(controller.models.get('ready'), model)
+        self.assertEqual(model.snapshot()['config']['name'], '只改名称')
+        plan['steps'][0]['model'] = 'draft'
+        with self.assertRaisesRegex(ValueError, '待编辑模型.*checkpoint'):
+            controller.start(plan, home_before=False)
+        with self.assertRaisesRegex(ValueError, '待编辑模型.*checkpoint'):
+            controller.preload(plan, ['draft'])
+        with self.assertRaisesRegex(ValueError, '模型不存在'):
+            controller.preload(plan, ['missing'])
+
     def test_runtime_uses_queue_threshold_and_sync_reuse_count(self):
         from concurrent.futures import Future
         for mode in ('rtc','sync'):

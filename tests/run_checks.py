@@ -23,6 +23,7 @@ SUITES = [
     ("lerobot-pi05", "tests", "test_pose_pipeline.py"),
     ("piper-home", "tests", "test_pose_hardware.py"),
     ("piper-home", "tests", "test_workflow.py"),
+    ("piper-home", "tests", "test_workflow_library.py"),
 ]
 
 

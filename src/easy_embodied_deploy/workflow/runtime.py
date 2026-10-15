@@ -14,7 +14,7 @@ from ..target_runtime import validate_live_cameras
 from .hardware import (MockHardware, PiperHardware, selected_sides,
                        bounded_joints, HOLD_FEEDBACK_TOLERANCE)
 from .models import ModelPool
-from .plan import new_plan, validate, interpolate, tangent
+from .plan import new_plan, validate, interpolate, tangent, require_models
 
 
 def vector(snapshot, space):
@@ -77,6 +77,8 @@ class WorkflowController:
         self.plan = None
         self.last_verification = None
         self.prefills = {}
+        self.inferences = set()
+        self.inference_cancel = threading.Event()
         self.command = self.space = None
         self.active_model = self.policy_anchor = None
         self.active_sides = ("left", "right")
@@ -212,8 +214,10 @@ class WorkflowController:
 
     def preload(self, plan, identifiers=None):
         selected = new_plan()
+        selected["settings"] = copy.deepcopy(plan.get("settings", {}))
         selected["models"] = [m for m in plan["models"] if identifiers is None or m["id"] in identifiers]
         selected = validate(selected)
+        require_models(selected["models"], identifiers if identifiers is not None else [m['id'] for m in selected['models']])
         if self.busy():
             raise ValueError("执行中模型由工作流管理，请停止后更改配置")
         self.models.preload(selected["models"])
@@ -229,9 +233,10 @@ class WorkflowController:
                 raise ValueError("请添加步骤并选择有效的起始步骤")
             if not 1 <= int(repetitions) <= 10000:
                 raise ValueError("重复次数须为 1–10000")
+            run_steps = plan["steps"][int(start_index):] if int(repetitions) == 1 else plan["steps"]
+            used_models = {s["model"] for s in run_steps if s["type"] == "vla"}
+            require_models(plan["models"], used_models)
             if not self.hardware.simulated:
-                run_steps = plan["steps"][int(start_index):] if int(repetitions) == 1 else plan["steps"]
-                used_models = {s["model"] for s in run_steps if s["type"] == "vla"}
                 used_points = {s["point"] for s in run_steps if s["type"] == "point"}
                 if any(m["backend"] == "mock" and m["id"] in used_models for m in plan["models"]):
                     raise ValueError("模拟模型不能连接真实机械臂")
@@ -293,6 +298,7 @@ class WorkflowController:
         if not self.paused.is_set():
             return False
         self.hardware.stop()
+        self._cancel_inferences()
         while self.paused.is_set():
             self._check()
             self.stop_event.wait(.02)
@@ -413,7 +419,7 @@ class WorkflowController:
                 self.update(state="failed", error=str(exc), detail=f"执行中止：{exc}")
             self.event(f"执行失败：{exc}")
         finally:
-            self.prefills.clear()
+            self._cancel_inferences()
             self.active_model = self.policy_anchor = None
             self._hold_after_run()
 
@@ -536,7 +542,28 @@ class WorkflowController:
             return None
         obs = self._observation(model)
         task = step.get("task") or model.config.get("task", "")
-        return self.executor.submit(model.infer, obs, task, prefix, prefix_start)
+        future = self.executor.submit(model.infer, obs, task, prefix, prefix_start,
+                                      cancel_event=self.inference_cancel)
+        with self.lock:
+            self.inferences.add(future)
+        future.add_done_callback(self._inference_done)
+        return future
+
+    def _inference_done(self, future):
+        with self.lock:
+            self.inferences.discard(future)
+
+    def _cancel_inferences(self):
+        # Running GPU kernels finish normally; queued work must not start after
+        # pause/stop or leak into a subsequent workflow run.
+        with self.lock:
+            self.inference_cancel.set()
+            self.inference_cancel = threading.Event()
+            pending = list(self.inferences)
+            self.inferences.clear()
+            self.prefills.clear()
+        for future in pending:
+            future.cancel()
 
     def _prefetch_next(self, index, remaining):
         future_index = index+1

@@ -1,6 +1,5 @@
 """Recorder start-point UI through real HTTP; synthetic feedback, no devices."""
 import asyncio
-import json
 import os
 import tempfile
 import threading
@@ -11,6 +10,7 @@ from unittest.mock import patch
 from playwright.async_api import async_playwright
 from easy_embodied_deploy import recording_start
 from easy_embodied_deploy.recorder_console import Handler, RecorderSession
+from easy_embodied_deploy.workflow.library import SharedPlanStore
 
 
 async def main():
@@ -19,8 +19,9 @@ async def main():
         library=root/'datasets/workflows';library.mkdir(parents=True)
         right=[.1,.2,-.3,0,0,.4,.03]
         left=[-.1,.3,-.4,0,0,-.5,.04]
-        (library/'point_library.json').write_text(json.dumps([
-            dict(name='右侧基准',space='joint',arms={'right':right})]))
+        shared=SharedPlanStore(library)
+        shared.save_resource('points',dict(id='right-start',name='右侧基准',space='joint',arms={'right':right}))
+        shared.save_resource('models',dict(id='vla',name='不应出现在采集起点选项中',backend='mock',action_mode='absolute_joint'))
         def defaults():
             return dict(output='/tmp/record-test',hz=30,max_task_gap_s=.35,
                         start_joint_delta_rad=.01,start_gripper_delta_m=.002,
@@ -42,6 +43,7 @@ async def main():
                     await page.locator('#start-point-panel summary').click()
                     assert await page.locator('#start-point-custom').is_hidden()
                     await page.locator('#start-point-mode').select_option('custom')
+                    assert len(recording_start.workflow_points()) == 1
                     await page.locator('#start-point-import').click()
                     await page.wait_for_function("startPoint.mode==='custom'")
                     assert await page.evaluate('startPoint.arms.right')==right

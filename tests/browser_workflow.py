@@ -37,8 +37,8 @@ async def main():
                 await page.wait_for_function("live.state === 'completed' || live.state === 'failed'",timeout=20000)
                 assert await page.evaluate("live.state === 'completed'"),await page.locator('#run-detail').inner_text()
                 assert '已就绪' in await page.locator('#model-status').inner_text()
-                await page.locator('.tabs .tool-menu summary').click()
                 await page.locator('[data-tab="models"]').click()
+                await page.locator('[data-model-action="edit"]').first.click()
                 await page.locator('#model-editor details summary').click()
                 for key,value in dict(policy_hz='12',control_hz='80',smoothing_time_constant='0',
                                       rtc_horizon='12',rtc_queue_threshold='30').items():
@@ -52,7 +52,8 @@ async def main():
                 await page.locator('[data-model-field="rtc_schedule"]').select_option('linear')
                 await page.locator('[data-model-field="rtc_mask_grippers"]').uncheck()
                 await page.locator('[data-model-field="backend"]').select_option('mock')
-                await page.locator('.tabs .tool-menu summary').click()
+                await page.locator('#model-form button[type="submit"]').click()
+                await page.wait_for_function("!document.getElementById('model-dialog').open")
                 await page.locator('[data-tab="points"]').click()
                 original_arms = await page.evaluate('JSON.stringify(plan.points[0].arms)')
                 await page.locator('[data-point-action="edit"]').first.click()
@@ -94,9 +95,7 @@ async def main():
                 assert any('自动平滑回零' in e['message'] for e in server.controller.events)
                 await page.locator('#point-tools summary').click()
                 await page.locator('#import-library').click()
-                await page.locator('#library-dialog').wait_for(state='visible')
-                assert await page.locator('[data-library-import]').count() >= 2
-                await page.locator('#close-library').click()
+                assert await page.locator('#points [data-point]').count() >= 2
 
                 # Depth selection uses an exported calibration bundle and does not move.
                 rgb,depth,camera=server.controller.hardware.camera('agentview')
@@ -117,10 +116,10 @@ async def main():
                 await page.wait_for_function('plan.points.length === 3')
                 assert len(server.controller.hardware.commands) == before
                 assert await page.evaluate("plan.points.at(-1).space === 'pose'")
-                await page.locator('.point-more summary').last.click()
+                await page.locator('#points .point-more summary').last.click()
                 await page.locator('[data-point-action="copy"]').last.click()
                 await page.wait_for_function('plan.points.length === 4')
-                await page.locator('.point-more summary').last.click()
+                await page.locator('#points .point-more summary').last.click()
                 await page.locator('[data-point-action="delete"]').last.click()
                 await page.wait_for_function('plan.points.length === 3')
                 assert await page.evaluate('plan.steps.length') == 4

@@ -9,6 +9,10 @@ main{max-width:1650px}.toolbar{display:flex;align-items:center;gap:8px;flex-wrap
 .joint-values { display: flex; flex-wrap: wrap; gap: 5px 12px; margin: 5px 0; font-variant-numeric: tabular-nums; }
 .joint-values span { white-space: nowrap; font-size: 12px; }
 .point-coordinates small { color: var(--muted, #63736d); overflow-wrap: anywhere; }
+.model-row .model-path { overflow-wrap: anywhere; }
+#model-dialog .model-card { padding: 0; border: 0; }
+#model-dialog .toolbar { position: sticky; bottom: -24px; padding: 12px 0; background: white; }
+#model-error { color: #a52a34; }
 #steps { position: relative; }
 #steps.sorting { overflow-anchor: none; }
 .step.drag-source { position: absolute; top: 0; left: 0; right: 0; opacity: 0; pointer-events: none; }

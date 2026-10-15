@@ -13,11 +13,12 @@ from urllib.parse import parse_qs, urlsplit
 
 import numpy as np
 
-from ..calibration import DEFAULT_SERIALS, atomic_json, encode_image
+from ..calibration import DEFAULT_SERIALS, encode_image
 from ..contracts import boolean
 from ..http import read_json
 from ..module_http import ROOT, ModuleHandler
-from .plan import PlanStore, camera_point, new_plan, validate
+from .plan import camera_point, new_plan, validate, require_models
+from .library import SharedPlanStore
 from .runtime import WorkflowController
 
 
@@ -27,24 +28,16 @@ class WorkflowServer(ThreadingHTTPServer):
     def __init__(self, address, directory=None, controller=None):
         super().__init__(address, Handler)
         self.controller = controller or WorkflowController()
-        self.store = PlanStore(directory or ROOT / "datasets/workflows")
+        self.store = SharedPlanStore(directory or ROOT / "datasets/workflows")
         self.operations = threading.RLock()
         self.snapshots = OrderedDict()
-        self.library_path = self.store.directory / "point_library.json"
 
     def library(self):
-        return json.loads(self.library_path.read_text()) if self.library_path.exists() else []
+        return self.store.snapshot()['points']
 
     def save_point(self, point):
         point = dict(point, id=point.get("id") or uuid.uuid4().hex)
-        check = new_plan()
-        check["points"] = [point]
-        validate(check)
-        points = self.library()
-        points = [p for p in points if p["id"] != point["id"]] + [point]
-        self.library_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_json(self.library_path, points)
-        return point
+        return self.store.save_resource('points', point)
 
 
 class Handler(ModuleHandler, BaseHTTPRequestHandler):
@@ -55,10 +48,14 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
             controller = self.server.controller
             if parsed.path == "/api/bootstrap":
                 calibrations = [str(p) for p in (ROOT / "datasets/calibration").glob("*/calibration_bundle.json")]
-                self.send(dict(api_version=4, plan=new_plan(), workflows=self.server.store.listing(), points=self.server.library(),
+                resources = self.server.store.snapshot()
+                self.send(dict(api_version=6, plan=self.server.store.resolve(new_plan()), workflows=self.server.store.listing(),
+                               library=resources, points=resources['points'], models=resources['models'],
                                calibrations=calibrations, serials=DEFAULT_SERIALS, state=controller.snapshot()))
+            elif parsed.path == "/api/library":
+                self.send(self.server.store.snapshot())
             elif parsed.path == "/api/state":
-                self.send(controller.snapshot())
+                self.send(dict(controller.snapshot(), library_revision=self.server.store.revision()))
             elif parsed.path == "/api/workflow":
                 self.send(self.server.store.load(query["id"]))
             elif parsed.path == "/api/telemetry":
@@ -95,9 +92,27 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
             with self.server.operations:
                 if route == "/api/save":
                     identifier = self.server.store.save(body["plan"], body.get("id"))
-                    self.send(dict(id=identifier, workflows=self.server.store.listing()))
+                    self.send(dict(id=identifier, plan=self.server.store.load(identifier), workflows=self.server.store.listing()))
                 elif route == "/api/validate":
-                    self.send(validate(body["plan"]))
+                    self.send(self.server.store.resolve(body["plan"]))
+                elif route in ("/api/model/validate", "/api/model/save"):
+                    check = new_plan()
+                    check['settings'] = body.get('settings', {})
+                    check['models'] = [body['model']]
+                    model = validate(check)['models'][0]
+                    if not isinstance(model.get('name'), str) or not model['name'].strip():
+                        raise ValueError('请为模型命名')
+                    model['name'] = model['name'].strip()
+                    require_models([model], [model['id']])
+                    if route.endswith('/save'):
+                        model = self.server.store.save_resource('models', model, body.get('settings'))
+                    self.send(model)
+                elif route == "/api/model/delete":
+                    if controller.busy():
+                        raise ValueError('执行中不能删除模型；请结束执行后再删除')
+                    controller.models.close(body['id'])
+                    self.server.store.delete_resource('models', body['id'])
+                    self.send(self.server.store.snapshot())
                 elif route == "/api/connect":
                     controller.connect(boolean(body.get("simulated", True), "模拟模式"), body.get("config", {}))
                     self.send(controller.snapshot())
@@ -120,10 +135,8 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
                 elif route == "/api/point/save":
                     self.send(self.server.save_point(body["point"]))
                 elif route == "/api/point/delete":
-                    points = [p for p in self.server.library() if p["id"] != body["id"]]
-                    self.server.library_path.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_json(self.server.library_path, points)
-                    self.send({"points": points})
+                    self.server.store.delete_resource('points', body['id'])
+                    self.send(self.server.store.snapshot())
                 elif route == "/api/from-hdf5":
                     # Read recorded feedback, never replay the recorder or mutate a file.
                     import h5py
@@ -170,7 +183,7 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
                     point.update(id=uuid.uuid4().hex, name=body.get("name", "相机选点"), notes="")
                     self.send(self.server.save_point(point))
                 elif route == "/api/preload":
-                    controller.preload(body["plan"], body.get("ids"))
+                    controller.preload(self.server.store.resolve(body["plan"]), body.get("ids"))
                     self.send(controller.snapshot())
                 elif route == "/api/unload":
                     if controller.busy():
@@ -178,7 +191,7 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
                     controller.models.close(body.get("id"))
                     self.send(controller.snapshot())
                 elif route == "/api/run":
-                    controller.start(body["plan"], body.get("start", 0), body.get("repetitions", 1),
+                    controller.start(self.server.store.resolve(body["plan"]), body.get("start", 0), body.get("repetitions", 1),
                                      boolean(body.get("home_before", True), "执行前回零"))
                     self.send(controller.snapshot())
                 else:

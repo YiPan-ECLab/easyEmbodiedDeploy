@@ -76,8 +76,11 @@ def validate(plan):
             raise ValueError("模型后端须为 LeRobot 或 OpenPI")
         if model.get("action_mode") not in ACTION_MODES:
             raise ValueError("模型动作模式无效")
-        if model["backend"] != "mock" and not model.get("checkpoint"):
-            raise ValueError("请选择模型 checkpoint")
+        # Drafts may contain unfinished models. Check required checkpoints only
+        # for models being loaded/executed, not unrelated library entries.
+        if not isinstance(model.get("checkpoint", ""), str):
+            raise ValueError(f"模型「{model.get('name', model['id'])}」的 checkpoint 须为路径文本")
+        model["checkpoint"] = model.get("checkpoint", "").strip()
         model["policy_hz"] = number(model.get("policy_hz", 10), "policy Hz", .001)
         model["control_hz"] = number(model.get("control_hz", settings["control_hz"]), "VLA control Hz", .001)
         model["smoothing_time_constant"] = number(model.get("smoothing_time_constant", .1), "时间平滑常数", 0)
@@ -123,6 +126,16 @@ def validate(plan):
         else:
             raise ValueError(f"未知步骤：{kind}")
     return plan
+
+
+def require_models(models, identifiers):
+    table = {model['id']: model for model in models}
+    for identifier in identifiers:
+        if identifier not in table:
+            raise ValueError(f"模型不存在：{identifier}")
+        model = table[identifier]
+        if model['backend'] != 'mock' and not model.get('checkpoint', '').strip():
+            raise ValueError(f"模型「{model.get('name', identifier)}」未填写 checkpoint；请编辑该模型")
 
 
 class PlanStore:

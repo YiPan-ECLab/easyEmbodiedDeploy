@@ -15,6 +15,11 @@ import numpy as np
 from ..module_http import ROOT
 
 
+def inference_config(config):
+    """Presentation edits must not reload model weights."""
+    return {key: value for key, value in config.items() if key not in ('name', 'notes')}
+
+
 class ModelProcess:
     def __init__(self, config):
         self.config = copy.deepcopy(config)
@@ -63,11 +68,14 @@ class ModelProcess:
     def snapshot(self):
         with self.lock:
             return dict(id=self.config["id"], name=self.config.get("name", self.config["id"]),
+                        config=copy.deepcopy(self.config),
                         stage=self.stage, detail=self.detail, elapsed=round(time.monotonic()-self.started, 1),
                         pid=self.process.pid, logs=list(self.logs))
 
-    def infer(self, observation, task, prefix=None, prefix_start=1):
+    def infer(self, observation, task, prefix=None, prefix_start=1, cancel_event=None):
         with self.rpc_lock:
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError('推理请求已取消')
             started = time.monotonic()
             with self.lock:
                 if self.stage != "ready" or self.process.poll() is not None:
@@ -103,17 +111,25 @@ class ModelProcess:
 class ModelPool:
     def __init__(self):
         self.lock = threading.RLock()
+        self.operations = threading.RLock()
         self.models = {}
 
     def preload(self, configs):
-        with self.lock:
+        with self.operations:
             for config in configs:
-                existing = self.models.get(config["id"])
-                if existing and existing.config == config and existing.stage != "failed":
+                with self.lock:
+                    existing = self.models.get(config["id"])
+                if existing and inference_config(existing.config) == inference_config(config) and existing.stage != "failed":
+                    with existing.lock:
+                        existing.config = copy.deepcopy(config)
                     continue
                 if existing:
+                    with self.lock:
+                        self.models.pop(config["id"], None)
                     existing.close()
-                self.models[config["id"]] = ModelProcess(config)
+                model = ModelProcess(config)
+                with self.lock:
+                    self.models[config["id"]] = model
 
     def get(self, identifier):
         with self.lock:
@@ -121,12 +137,15 @@ class ModelPool:
 
     def snapshot(self):
         with self.lock:
-            return [model.snapshot() for model in self.models.values()]
+            models = list(self.models.values())
+        return [model.snapshot() for model in models]
 
     def close(self, identifier=None):
-        with self.lock:
-            ids = [identifier] if identifier else list(self.models)
+        with self.operations:
+            with self.lock:
+                ids = [identifier] if identifier else list(self.models)
             for key in ids:
-                model = self.models.pop(key, None)
+                with self.lock:
+                    model = self.models.pop(key, None)
                 if model:
                     model.close()
