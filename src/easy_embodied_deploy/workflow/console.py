@@ -17,6 +17,7 @@ from ..calibration import DEFAULT_SERIALS, encode_image
 from ..contracts import boolean
 from ..http import read_json
 from ..module_http import ROOT, ModuleHandler
+from ..system import gpu_status
 from .plan import camera_point, new_plan, validate, require_models
 from .library import SharedPlanStore
 from .runtime import WorkflowController
@@ -49,11 +50,13 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
             if parsed.path == "/api/bootstrap":
                 calibrations = [str(p) for p in (ROOT / "datasets/calibration").glob("*/calibration_bundle.json")]
                 resources = self.server.store.snapshot()
-                self.send(dict(api_version=6, plan=self.server.store.resolve(new_plan()), workflows=self.server.store.listing(),
+                self.send(dict(api_version=7, plan=self.server.store.resolve(new_plan()), workflows=self.server.store.listing(),
                                library=resources, points=resources['points'], models=resources['models'],
                                calibrations=calibrations, serials=DEFAULT_SERIALS, state=controller.snapshot()))
             elif parsed.path == "/api/library":
                 self.send(self.server.store.snapshot())
+            elif parsed.path == "/api/devices":
+                self.send(dict(gpus=gpu_status()))
             elif parsed.path == "/api/state":
                 self.send(dict(controller.snapshot(), library_revision=self.server.store.revision()))
             elif parsed.path == "/api/workflow":
@@ -100,9 +103,6 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
                     check['settings'] = body.get('settings', {})
                     check['models'] = [body['model']]
                     model = validate(check)['models'][0]
-                    if not isinstance(model.get('name'), str) or not model['name'].strip():
-                        raise ValueError('请为模型命名')
-                    model['name'] = model['name'].strip()
                     require_models([model], [model['id']])
                     if route.endswith('/save'):
                         model = self.server.store.save_resource('models', model, body.get('settings'))
@@ -189,6 +189,12 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
                     if controller.busy():
                         raise ValueError("执行中不能卸载模型")
                     controller.models.close(body.get("id"))
+                    self.send(controller.snapshot())
+                elif route == "/api/release-model":
+                    identifier = body.get('id')
+                    if not isinstance(identifier, str) or not identifier:
+                        raise ValueError('请选择要释放的模型')
+                    controller.release_model(identifier)
                     self.send(controller.snapshot())
                 elif route == "/api/run":
                     controller.start(self.server.store.resolve(body["plan"]), body.get("start", 0), body.get("repetitions", 1),

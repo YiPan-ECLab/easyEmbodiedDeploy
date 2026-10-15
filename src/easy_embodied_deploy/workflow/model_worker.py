@@ -117,7 +117,10 @@ def main():
                     except Exception as exc:
                         connection.send({"ok": False, "error": str(exc)})
     except BaseException as exc:
-        progress("failed", detail=str(exc))
+        detail = str(exc)
+        if any(word in detail.lower() for word in ('out of memory', 'resource_exhausted', 'cuda_error_out_of_memory')):
+            detail = f"{config.get('requested_device', config.get('device', 'cuda:0'))} 显存不足；请卸载不用的模型或改用其他 GPU 后重试。{detail}"
+        progress("failed", detail=detail)
         traceback.print_exc()
         sys.exit(1)
 

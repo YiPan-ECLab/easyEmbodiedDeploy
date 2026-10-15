@@ -14,7 +14,7 @@ from easy_embodied_deploy.workflow.models import ModelProcess
 
 class TestModelProcess(ModelProcess):
     """Keep real UI configs and pool matching; only the worker uses fake inference."""
-    def __init__(self, config):
+    def __init__(self, config, launch=None):
         super().__init__({**config, 'backend': 'mock'})
         self.config = copy.deepcopy(config)
 

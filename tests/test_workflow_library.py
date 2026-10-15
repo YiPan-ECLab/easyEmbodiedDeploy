@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 
 from easy_embodied_deploy import recording_start
 from easy_embodied_deploy.workflow.library import SharedPlanStore
-from easy_embodied_deploy.workflow.plan import PlanStore, new_plan
+from easy_embodied_deploy.workflow.plan import PlanStore, new_plan, validate
 
 
 def example():
@@ -89,10 +89,83 @@ class SharedLibraryTests(unittest.TestCase):
         second = SharedPlanStore(self.temp.name)
         def save(index):
             store = self.store if index % 2 else second
-            store.save_resource('points', dict(example()['points'][0], id=f'p{index}'))
+            store.save_resource('points', dict(example()['points'][0], id=f'p{index}', name=f'点 {index}'))
         with ThreadPoolExecutor(max_workers=4) as workers:
             list(workers.map(save, range(20)))
         self.assertEqual(len(self.store.snapshot()['points']), 20)
+
+    def test_names_unique_for_create_rename_import_and_reuse_after_delete(self):
+        for kind in ('points', 'models'):
+            with self.subTest(kind=kind):
+                row = example()[kind][0]
+                first = self.store.save_resource(kind, dict(row, name='  同名  '))
+                self.assertEqual(first['name'], '同名')
+                self.store.save_resource(kind, first)  # editing itself is valid
+                before = self.store.snapshot()
+                with self.assertRaisesRegex(ValueError, '已存在'):
+                    self.store.save_resource(kind, dict(row, id='other', name='同名'))
+                self.assertEqual(self.store.snapshot(), before)
+                other = self.store.save_resource(kind, dict(row, id='other', name='另一个'))
+                before = self.store.snapshot()
+                with self.assertRaisesRegex(ValueError, '已存在'):
+                    self.store.save_resource(kind, dict(other, name=' 同名 '))
+                imported = new_plan()
+                imported[kind] = [dict(row, id='new', name='同名')]
+                with self.assertRaisesRegex(ValueError, '已存在'):
+                    self.store.resolve(imported)
+                self.assertEqual(self.store.snapshot(), before)
+                self.store.delete_resource(kind, first['id'])
+                self.assertEqual(self.store.save_resource(kind, dict(row, id='replacement', name='同名'))['name'], '同名')
+
+    def test_concurrent_same_name_has_exactly_one_winner(self):
+        second = SharedPlanStore(self.temp.name)
+        def save(index):
+            try:
+                (self.store if index % 2 else second).save_resource(
+                    'points', dict(example()['points'][0], id=f'p{index}'))
+                return True
+            except ValueError as exc:
+                self.assertIn('已存在', str(exc))
+                return False
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            self.assertEqual(sum(workers.map(save, range(20))), 1)
+        self.assertEqual(len(self.store.snapshot()['points']), 1)
+
+    def test_vla_names_distinct_while_model_references_can_repeat(self):
+        plan = example()
+        plan['steps'] = [dict(id='a', type='vla', model='m', name='取件'),
+                         dict(id='b', type='vla', model='m', name='放件')]
+        self.assertEqual(len(validate(plan)['steps']), 2)
+        plan['steps'][1]['name'] = ' 取件 '
+        with self.assertRaisesRegex(ValueError, 'VLA 步骤.*已存在'):
+            self.store.save(plan)
+        self.assertEqual(self.store.snapshot()['models'], [])  # no partial import
+        for step in plan['steps']:
+            step.pop('name')
+        self.assertEqual([s['name'] for s in validate(plan)['steps']], ['模型', '模型 2'])
+
+    def test_upgrade_old_duplicate_names_keeps_resource_ids_and_coordinates(self):
+        rows = [dict(example()['points'][0], id=f'p{i}') for i in range(2)]
+        path = Path(self.temp.name) / 'point_library.json'
+        path.write_text(json.dumps(rows))
+        migrated = SharedPlanStore(self.temp.name)
+        points = migrated.snapshot()['points']
+        self.assertEqual([p['name'] for p in points], ['基准点', '基准点 2'])
+        for old, new in zip(rows, points):
+            self.assertEqual(old['id'], new['id'])
+            self.assertEqual(old['arms'], new['arms'])
+        backup = Path(self.temp.name) / 'legacy_snapshots/names_point_library.json'
+        self.assertEqual(json.loads(backup.read_text()), rows)
+        # Existing saved flows can contain duplicate VLA labels from old copies.
+        plan = example()
+        plan['points'] = points
+        plan['steps'] = [dict(id='s', type='vla', model='m')]
+        identifier = migrated.save(plan)
+        raw = json.loads(migrated.path(identifier).read_text())
+        raw['steps'] = [dict(id='a', type='vla', model='m', name='模型'),
+                        dict(id='b', type='vla', model='m', name='模型')]
+        migrated.path(identifier).write_text(json.dumps(raw))
+        self.assertEqual([s['name'] for s in migrated.load(identifier)['steps']], ['模型', '模型 2'])
 
     def test_recorder_import_after_migration_and_saved_start_is_independent(self):
         root = Path(self.temp.name)

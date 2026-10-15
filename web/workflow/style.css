@@ -17,3 +17,8 @@ main{max-width:1650px}.toolbar{display:flex;align-items:center;gap:8px;flex-wrap
 #steps.sorting { overflow-anchor: none; }
 .step.drag-source { position: absolute; top: 0; left: 0; right: 0; opacity: 0; pointer-events: none; }
 .step-placeholder { box-sizing: border-box; display: flex; align-items: center; justify-content: center; margin: 12px 0; border: 2px dashed #83b497; border-radius: 10px; background: #edf6ef; color: #53735f; pointer-events: none; }
+
+/* Numbered workspace cards keep resource counts separate from navigation. */
+.tabs > button[data-tab]{flex:1 1 170px;display:flex;flex-direction:column;align-items:flex-start;gap:9px;padding:14px 16px;border-radius:12px;box-shadow:0 2px 7px #18362e08}
+.tab-title{display:flex;align-items:center;gap:9px;font-weight:600}.tab-index{display:inline-grid;place-items:center;width:25px;height:25px;border-radius:8px;background:#edf3ef;color:#53735f;font-size:13px}.tabs .active .tab-index{background:#12664d;color:white}.tab-count{font-size:12px;color:#5e786b;font-weight:400}.tabs > .tool-menu{flex-basis:100%;margin-top:0}
+.gpu-overview{padding:14px 16px;background:#f1f6f3;border:1px solid #dbe7df;border-radius:12px;margin:12px 0 16px}.gpu-overview .section-head{margin-bottom:8px}.gpu-overview p{margin:6px 0;font-size:12px}.model-device{font-size:12px;max-width:340px;margin:8px 0}.model-device select{font-size:12px}.model-status-row small{overflow-wrap:anywhere}

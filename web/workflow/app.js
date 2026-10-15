@@ -4,7 +4,7 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;',
 const uid = () => crypto.randomUUID().replaceAll('-', '');
 let plan, savedId = null, selected = 0, live = {}, editingPoint = null, frozen = null, pixel = null, dirty = false, toastTimer, previewTimer;
 let compatible = false, actionError = "", libraryRevision = -1, polling = false;
-let editingModel=null, addModelAfterSave=false;
+let editingModel=null, addModelAfterSave=false, gpus=[];
 const sideName = {left:'左从臂',right:'右从臂'};
 const modeNames = {absolute_joint:'绝对关节角',delta_joint:'增量关节角',absolute_base_pose:'绝对末端位姿',camera_delta_wrist:'腕部相机增量位姿',camera_delta_global:'全局相机增量位姿'};
 async function api(path, body) {
@@ -24,6 +24,30 @@ const act = fn => async event => {
 function changed() { dirty=true; $('dirty').textContent='草稿已在浏览器自动保存'; localStorage.setItem('workflowDraft',JSON.stringify({plan,savedId})); }
 function tab(name) { document.querySelectorAll('.panel').forEach(p=>p.hidden=p.id!==`tab-${name}`);document.querySelectorAll('[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===name)); }
 function options(rows, chosen) { return rows.map(([value,label])=>`<option value="${esc(value)}" ${value===chosen?'selected':''}>${esc(label)}</option>`).join(''); }
+function uniqueName(name, rows) {
+  const names=new Set(rows.map(row=>(row.name||'').trim()));
+  let candidate=name,index=2;
+  while(names.has(candidate))candidate=`${name} ${index++}`;
+  return candidate;
+}
+function checkName(row, rows, label) {
+  const name=(row.name||'').trim();
+  if(!name)throw new Error(`请为${label}命名`);
+  if(rows.some(other=>other.id!==row.id&&(other.name||'').trim()===name))throw new Error(`${label}名称「${name}」已存在，请使用不同名称`);
+  return name;
+}
+function vlaSteps() {return plan.steps.filter(s=>s.type==='vla');}
+function deviceOptions(chosen='cuda:0') {
+  const rows=gpus.map(g=>[`cuda:${g.index}`,`GPU ${g.index} · ${g.name}`]);
+  if(chosen!=='cpu'&&!rows.some(([value])=>value===chosen))rows.push([chosen,`${chosen} · 未检测到`]);
+  rows.push(['cpu','CPU']);
+  return options(rows,chosen);
+}
+async function refreshDevices() {
+  const result=await api('devices');gpus=result.gpus;
+  $('gpu-status').textContent=gpus.length?gpus.map(g=>`GPU ${g.index} · ${g.name} · 显存 ${g.memory_used_mb??'?'} / ${g.memory_total_mb??'?'} MiB`).join(' ｜ '):'未检测到 NVIDIA GPU；可选择 CPU，或检查驱动后刷新。';
+  document.querySelectorAll('[data-model-device], [data-model-field="device"]').forEach(input=>{input.innerHTML=deviceOptions(input.value);});
+}
 function pointOptions(chosen) { return options(plan.points.map(p=>[p.id,p.name]),chosen); }
 function modelOptions(chosen) { return options(plan.models.map(p=>[p.id,p.name]),chosen); }
 function renderSaved(rows) { $('saved').innerHTML='<option value="">打开已保存工作流</option>'+options(rows.map(p=>[p.id,`${p.name} · ${p.steps} 步`]),savedId); }
@@ -44,7 +68,7 @@ function pointCoordinates(point) {
 }
 function renderPoints() {
   const expanded=[...$('points').querySelectorAll('details[open]')].map(node=>node.closest('[data-point]').dataset.point);
-  $('point-count').textContent=plan.points.length;
+  $('point-count').textContent=`已有关键点：${plan.points.length}`;
   $('add-point-select').innerHTML=pointOptions($('add-point-select').value);
   const search=$('point-search').value.trim().toLowerCase();
   const points=plan.points.filter(p=>`${p.name} ${p.notes||''}`.toLowerCase().includes(search));
@@ -56,6 +80,7 @@ function renderPoints() {
 }
 function pointSummary(id) { const p=plan.points.find(p=>p.id===id);return p?`${Object.keys(p.arms).map(s=>sideName[s]).join(' / ')} · ${p.space==='joint'?'关节角':'末端位姿'}`:'请选择关键点'; }
 function renderSteps() {
+  $('step-count').textContent=`已有步骤：${plan.steps.length}`;
   $('steps').innerHTML=plan.steps.length?plan.steps.map((s,i)=>{
     let fields='';
     if(s.type==='point') fields=`<label>关键点引用<select data-field="point">${pointOptions(s.point)}</select><small>${pointSummary(s.point)}</small></label><label>期望运动时长（秒）<input data-field="duration" type="number" min=".05" step=".1" value="${s.duration}"></label><label class="check"><input data-field="blend" type="checkbox" ${s.blend!==false?'checked':''}>与下一个关节点平滑衔接</label>`;
@@ -71,7 +96,7 @@ function addStep(type, reference) {
   if(type==='vla'&&!plan.models.some(m=>m.id===reference)) {openModel(null,true);return;}
   let s={id:uid(),type};
   if(type==='point') Object.assign(s,{name:plan.points.find(p=>p.id===reference).name,point:reference,duration:1,blend:true});
-  if(type==='vla') Object.assign(s,{name:plan.models.find(m=>m.id===reference).name,model:reference,until:'duration',value:10,task:''});
+  if(type==='vla') Object.assign(s,{name:uniqueName(plan.models.find(m=>m.id===reference).name,vlaSteps()),model:reference,until:'duration',value:10,task:''});
   if(type==='gripper') Object.assign(s,{name:'夹爪开合',side:'both',width:.04,duration:1});
   if(type==='wait') Object.assign(s,{name:'等待',duration:1});
   plan.steps.push(s);selected=plan.steps.length-1;changed();renderSteps();renderPoints();tab('flow');
@@ -147,20 +172,20 @@ function installStepSorting() {
 }
 function renderModels() {
   const expanded=[...$('model-list').querySelectorAll('details[open]')].map(node=>node.closest('[data-model]').dataset.model);
-  $('model-count').textContent=plan.models.length;
+  $('model-count').textContent=`已有模型：${plan.models.length}`;
   const selectedModel=$('add-model-select').value;
   $('add-model-select').innerHTML=plan.models.length?modelOptions(selectedModel):'<option value="">先新增 VLA 模型</option>';
   const query=$('model-search').value.trim().toLowerCase();
   $('model-list').innerHTML=plan.models.filter(m=>`${m.name} ${m.checkpoint||''}`.toLowerCase().includes(query)).map(m=>{
     const count=plan.steps.filter(s=>s.type==='vla'&&s.model===m.id).length;
-    return `<div class="point-row model-row" data-model="${esc(m.id)}"><div><h3>${esc(m.name)}</h3><p>${esc(m.backend)} · ${esc(modeNames[m.action_mode])} · 已引用 ${count} 次</p><p class="model-path">${esc(m.checkpoint|| (m.backend==='mock'?'模拟模型':'尚未填写 checkpoint，请编辑'))}</p><span data-model-state="${esc(m.id)}" class="badge">尚未加载</span></div><div class="toolbar"><button data-model-action="add">添加步骤</button><button data-model-action="edit">编辑 / 改名</button><button data-model-action="load">预加载</button><button data-model-action="unload">卸载</button><details class="point-more"><summary>更多</summary><div class="toolbar"><button data-model-action="copy">复制配置</button><button data-model-action="delete">删除</button></div></details></div></div>`;
+    return `<div class="point-row model-row" data-model="${esc(m.id)}"><div><h3>${esc(m.name)}</h3><p>${esc(m.backend)} · ${esc(modeNames[m.action_mode])} · 已引用 ${count} 次</p><p class="model-path">${esc(m.checkpoint|| (m.backend==='mock'?'模拟模型':'尚未填写 checkpoint，请编辑'))}</p><label class="model-device">推理设备<select data-model-device="${esc(m.id)}">${deviceOptions(m.device||'cuda:0')}</select></label><span data-model-state="${esc(m.id)}" class="badge">尚未加载</span></div><div class="toolbar"><button data-model-action="add">添加步骤</button><button data-model-action="edit">编辑 / 改名</button><button data-model-action="load">预加载</button><button data-model-action="unload">卸载</button><details class="point-more"><summary>更多</summary><div class="toolbar"><button data-model-action="copy">复制配置</button><button data-model-action="delete">删除</button></div></details></div></div>`;
   }).join('')||'<div class="empty">点击「新增模型」，保存 checkpoint 和推理配置后即可反复添加步骤。</div>';
   $('model-list').querySelectorAll('[data-model]').forEach(node=>{if(expanded.includes(node.dataset.model))node.querySelector('details').open=true;});
   updateModelStates(live);
 }
 function updateModelStates(state) {
   const stages={starting:'启动中',loading:'加载中',warming:'预热中',ready:'已就绪',failed:'加载失败',unloaded:'已卸载'};
-  document.querySelectorAll('[data-model-state]').forEach(node=>{
+  document.querySelectorAll('.badge[data-model-state]').forEach(node=>{
     const model=state.models?.find(m=>m.id===node.dataset.modelState);
     const saved=plan?.models.find(m=>m.id===node.dataset.modelState);
     const signature=m=>JSON.stringify(Object.entries(m||{}).filter(([k])=>!['name','notes'].includes(k)).sort(([a],[b])=>a.localeCompare(b)));
@@ -172,13 +197,13 @@ function updateModelStates(state) {
   document.querySelectorAll('[data-model-action="load"], [data-model-action="unload"], [data-model-action="delete"]').forEach(node=>node.disabled=!compatible||!!state.busy);
 }
 function openModel(model=null, addStepAfter=false) {
-  editingModel=model?structuredClone(model):{id:uid(),name:`模型 ${plan.models.length+1}`,backend:'lerobot',checkpoint:'',action_mode:'delta_joint',policy_hz:10,device:'cuda:0',rtc:true,task:'',mount_id:''};
+  editingModel=model?structuredClone(model):{id:uid(),name:uniqueName('模型',plan.models),backend:'lerobot',checkpoint:'',action_mode:'delta_joint',policy_hz:10,device:'cuda:0',rtc:true,task:'',mount_id:''};
   addModelAfterSave=addStepAfter;
   $('model-title').textContent=model?'编辑 VLA 模型':'新增 VLA 模型';
   const count=plan.steps.filter(s=>s.type==='vla'&&s.model===editingModel.id).length;
   $('model-references').textContent=count?`当前流程引用 ${count} 次；保存后所有工作流共同使用新配置。`:'保存即写入共享模型库，所有工作流均可引用。';
   $('model-error').hidden=true;
-  renderModelEditor();$('model-dialog').showModal();
+  renderModelEditor();$('model-dialog').showModal();refreshDevices().catch(error=>toast(error.message,true));
 }
 function readModelEditor() {
   $('model-editor').querySelectorAll('[data-model-field]').forEach(input=>{
@@ -191,9 +216,9 @@ function renderModelEditor() {
     const inference=m.inference_mode||(m.rtc===false?'sync':'rtc');
     const openpi=m.backend==='openpi';
     return `<div class="model-card" data-model="${esc(m.id)}">
-      <div class="form-grid"><label>名称<input data-model-field="name" value="${esc(m.name)}"></label><label>后端<select data-model-field="backend">${options([['lerobot','LeRobot / PyTorch'],['openpi','OpenPI / JAX'],['mock','模拟（仅离线测试）']],m.backend)}</select></label><label>checkpoint 路径<input data-model-field="checkpoint" value="${esc(m.checkpoint||'')}"></label><label>动作模式<select data-model-field="action_mode">${options(Object.entries(modeNames),m.action_mode)}</select></label>${numeric(m,'policy_hz','policy Hz（动作队列取出频率）',10,.001)}</div>
-      <details><summary>设备、RTC 与运控高级参数</summary><div class="form-grid">
-      <label>设备<input data-model-field="device" value="${esc(m.device||'cuda:0')}"></label><label>相机安装版本 mount_id<input data-model-field="mount_id" value="${esc(m.mount_id||'')}"></label>
+      <div class="form-grid"><label>名称（共享模型库内唯一）<input required data-model-field="name" value="${esc(m.name)}"></label><label>后端<select data-model-field="backend">${options([['lerobot','LeRobot / PyTorch'],['openpi','OpenPI / JAX'],['mock','模拟（仅离线测试）']],m.backend)}</select></label><label>checkpoint 路径<input data-model-field="checkpoint" value="${esc(m.checkpoint||'')}"></label><label>动作模式<select data-model-field="action_mode">${options(Object.entries(modeNames),m.action_mode)}</select></label>${numeric(m,'policy_hz','policy Hz（动作队列取出频率）',10,.001)}<label>推理设备<select data-model-field="device">${deviceOptions(m.device||'cuda:0')}</select><small>按物理 GPU 编号选择；同卡可驻留多个模型。</small></label></div>
+      <details><summary>RTC 与运控高级参数</summary><div class="form-grid">
+      <label>相机安装版本 mount_id<input data-model-field="mount_id" value="${esc(m.mount_id||'')}"></label>
       ${numeric(m,'control_hz','control Hz（本模型运控频率）',plan.settings.control_hz,.001)}
       ${numeric(m,'smoothing_time_constant','时间平滑常数 s（0 关闭）',.1)}
       <label>推理方式<select data-model-field="inference_mode">${options([['rtc','异步 RTC'],['sync','同步 chunk']],inference)}</select></label>
@@ -248,7 +273,7 @@ function renderState(state) {
   $('model-status').innerHTML=(state.models||[]).map(m=>{
     const stages=['starting','loading','warming','ready'],index=stages.indexOf(m.stage);
     const label={starting:'启动进程',loading:'加载权重',warming:'预热推理',ready:'已就绪',failed:'失败',unloaded:'已卸载'}[m.stage]||m.stage;
-    return `<div class="model-status-row ${esc(m.stage)}" data-model-state="${esc(m.id)}"><strong>${esc(m.name)}</strong> <span class="badge">${label}</span><div class="stages">${stages.map((_,i)=>`<span class="${i<index||index===3?'done':i===index?'current':''}"></span>`).join('')}</div><small>${esc(m.detail)} · ${m.elapsed}s</small>${m.logs.length?`<details ${openLogs.has(m.id)?'open':''}><summary>查看日志</summary><pre>${esc(m.logs.join('\n'))}</pre></details>`:''}</div>`;
+    return `<div class="model-status-row ${esc(m.stage)}" data-model-state="${esc(m.id)}"><strong>${esc(m.name)}</strong> <span class="badge">${label}</span><p class="muted">实际加载设备：${esc(m.config?.backend==='mock'?'模拟器':m.config?.device||'cuda:0')}${state.pending_unloads?.includes(m.id)?' · 本次执行结束后自动卸载':''}</p><div class="stages">${stages.map((_,i)=>`<span class="${i<index||index===3?'done':i===index?'current':''}"></span>`).join('')}</div><small>${esc(m.detail)} · ${m.elapsed}s</small>${m.logs.length?`<details ${openLogs.has(m.id)?'open':''}><summary>查看日志</summary><pre>${esc(m.logs.join('\n'))}</pre></details>`:''}</div>`;
   }).join('')||'还没有加载模型';
   $('events').innerHTML=(state.events||[]).slice().reverse().map(e=>`<p>${new Date(e.time*1000).toLocaleTimeString()} · ${esc(e.message)}</p>`).join('')||'执行记录将在这里显示';
   const v=state.verification;
@@ -265,15 +290,15 @@ function renderState(state) {
   } else $('verification').textContent='';
 }
 async function save(copy=false) { const result=await api('save',{plan,id:copy?null:savedId});savedId=result.id;plan=result.plan;render();renderSaved(result.workflows);changed();dirty=false;$('dirty').textContent='已保存';toast('工作流已保存'); }
-async function storePoint(point) { const saved=await api('point/save',{point});mergePoint(saved);return saved; }
+async function storePoint(point) { point.name=checkName(point,plan.points,'共享关键点');const saved=await api('point/save',{point});mergePoint(saved);return saved; }
 function mergePoint(point) {const i=plan.points.findIndex(p=>p.id===point.id);if(i<0)plan.points.push(point);else plan.points[i]=point;changed();renderPoints();renderSteps();}
 function openPoint(point=null) {
-  editingPoint=point?structuredClone(point):{id:uid(),name:'新关键点',notes:'',space:'joint',arms:{left:[0,.2,-.2,0,0,-.785,.04],right:[0,.2,-.2,0,0,.785,.04]}};
+  editingPoint=point?structuredClone(point):{id:uid(),name:uniqueName('新关键点',plan.points),notes:'',space:'joint',arms:{left:[0,.2,-.2,0,0,-.785,.04],right:[0,.2,-.2,0,0,.785,.04]}};
   $('point-name').value=editingPoint.name;$('point-notes').value=editingPoint.notes||'';$('point-space').value=editingPoint.space;
   $('point-side').value=Object.keys(editingPoint.arms).length===2?'both':Object.keys(editingPoint.arms)[0];
   const count=plan.steps.filter(s=>s.point===editingPoint.id).length;
   $('point-references').textContent=count?`当前流程引用 ${count} 次；保存后所有工作流共同使用新坐标。`:'保存即写入共享点库，所有工作流均可引用。';
-  renderCoordinates();$('point-coordinates').open=!point;$('point-dialog').showModal();
+  $('point-error').hidden=true;renderCoordinates();$('point-coordinates').open=!point;$('point-dialog').showModal();
 }
 function renderCoordinates() {
   const space=$('point-space').value,side=$('point-side').value;
@@ -333,8 +358,8 @@ async function poll() {
 }
 function triple(id) {const a=$(id).value.split(/[,，\s]+/).filter(Boolean).map(Number);if(a.length!==3||a.some(x=>!Number.isFinite(x)))throw new Error('XYZ 偏移须为 3 个数值');return a.map(v=>v/1000);}
 async function init() {
-  const boot=await api('bootstrap');compatible=boot.api_version===6;$('version-notice').hidden=compatible;plan=boot.plan;libraryRevision=boot.library?.revision??-1;renderSaved(boot.workflows);
-  const draft=localStorage.getItem('workflowDraft');if(draft){try{const parsed=JSON.parse(draft);plan=await api('validate',{plan:parsed.plan});savedId=parsed.savedId;dirty=true;$('dirty').textContent='已恢复本地草稿';}catch{toast('旧草稿无法恢复，已新建工作流',true);}}
+  const boot=await api('bootstrap');compatible=boot.api_version===7;$('version-notice').hidden=compatible;plan=boot.plan;libraryRevision=boot.library?.revision??-1;renderSaved(boot.workflows);
+  const draft=localStorage.getItem('workflowDraft');if(draft){try{const parsed=JSON.parse(draft);const used=[];for(const step of parsed.plan.steps||[]){if(step.type==='vla'){step.name=uniqueName((step.name||'VLA').trim()||'VLA',used);used.push(step);}}plan=await api('validate',{plan:parsed.plan});savedId=parsed.savedId;dirty=true;$('dirty').textContent='已恢复本地草稿';}catch{toast('旧草稿无法恢复，已新建工作流',true);}}
   for(const [role,serial] of Object.entries(boot.serials)) $(`serial-${role}`).value=serial;
   $('calibrations').innerHTML=boot.calibrations.map(p=>`<option value="${esc(p)}"></option>`).join('');if(boot.calibrations.length)$('calibration').value=boot.calibrations.at(-1);
   renderSaved(boot.workflows);render();renderState(boot.state);
@@ -356,35 +381,73 @@ async function init() {
   });
   $('go-flow').onclick=()=>tab('flow');
   $('telemetry').onclick=act(async()=>{const s=await api('telemetry');$('feedback').textContent=['left','right'].map((side,i)=>`${sideName[side]} J1–J6：${s.joints.slice(i*7,i*7+6).map(v=>(v*180/Math.PI).toFixed(1)).join(' / ')}°，夹爪 ${(s.joints[i*7+6]*1000).toFixed(1)} mm`).join('  ｜  ');});
-  $('capture').onclick=act(async()=>{mergePoint(await api('capture',{name:$('capture-name').value||`关键点 ${plan.points.length+1}`,side:$('capture-side').value,space:$('capture-space').value}));$('capture-name').value='';toast('已录制并保存；可继续拖动录下一个点');});
+  $('capture').onclick=act(async()=>{mergePoint(await api('capture',{name:$('capture-name').value.trim()||uniqueName('关键点',plan.points),side:$('capture-side').value,space:$('capture-space').value}));$('capture-name').value='';toast('已录制并保存；可继续拖动录下一个点');});
   $('manual-point').onclick=()=>openPoint();$('point-search').oninput=renderPoints;
   $('point-space').onchange=renderCoordinates;$('point-side').onchange=renderCoordinates;
   $('close-point').onclick=()=>$('point-dialog').close();
-  $('point-form').onsubmit=act(async event=>{event.preventDefault();await storePoint(readPoint());$('point-dialog').close();toast('关键点已保存');});
+  $('point-form').onsubmit=async event=>{event.preventDefault();const button=event.submitter;button.disabled=true;try{await storePoint(readPoint());$('point-dialog').close();toast('关键点已保存');}catch(error){$('point-error').textContent=error.message;$('point-error').hidden=false;}finally{button.disabled=false;}};
   $('update-feedback').onclick=act(async()=>{const p=await api('capture',{persist:false,name:$('point-name').value,space:$('point-space').value,side:$('point-side').value});editingPoint={...editingPoint,space:p.space,arms:p.arms,source:p.source};renderCoordinates();toast('已读取当前坐标，保存后生效');});
-  $('points').onclick=act(async event=>{const button=event.target.closest('[data-point-action]');if(!button)return;const id=button.closest('[data-point]').dataset.point,p=plan.points.find(p=>p.id===id);switch(button.dataset.pointAction){case'add':addStep('point',id);break;case'edit':openPoint(p);break;case'recapture':{const side=Object.keys(p.arms).length===2?'both':Object.keys(p.arms)[0];const sample=await api('capture',{persist:false,name:p.name,side,space:p.space});await storePoint({...p,arms:sample.arms,source:sample.source});toast('已用当前位置重录；名称和步骤引用保留，请核对角度后保存工作流');break;}case'copy':await storePoint({...structuredClone(p),id:uid(),name:`${p.name} 副本`});break;case'delete':await deleteResource('point',p);break;case'test':{const test=structuredClone(plan);test.steps=[{id:uid(),type:'point',point:id,name:`试运行 ${p.name}`,duration:3,blend:false}];test.models=[];await run(0,test);break;}}});
+  $('points').onclick=act(async event=>{const button=event.target.closest('[data-point-action]');if(!button)return;const id=button.closest('[data-point]').dataset.point,p=plan.points.find(p=>p.id===id);switch(button.dataset.pointAction){case'add':addStep('point',id);break;case'edit':openPoint(p);break;case'recapture':{const side=Object.keys(p.arms).length===2?'both':Object.keys(p.arms)[0];const sample=await api('capture',{persist:false,name:p.name,side,space:p.space});await storePoint({...p,arms:sample.arms,source:sample.source});toast('已用当前位置重录；名称和步骤引用保留，请核对角度后保存工作流');break;}case'copy':await storePoint({...structuredClone(p),id:uid(),name:uniqueName(`${p.name} 副本`,plan.points)});break;case'delete':await deleteResource('point',p);break;case'test':{const test=structuredClone(plan);test.steps=[{id:uid(),type:'point',point:id,name:`试运行 ${p.name}`,duration:3,blend:false}];test.models=[];await run(0,test);break;}}});
   $('import-library').onclick=act(async()=>{await refreshLibrary();toast('已刷新共享关键点和模型');});
-  $('hdf-import').onclick=act(async()=>{mergePoint(await api('from-hdf5',{path:$('hdf-path').value,frame:Number($('hdf-frame').value),name:$('capture-name').value||'轨迹点',space:$('capture-space').value,side:$('capture-side').value}));toast('已提取关键点，源文件未修改');});
+  $('hdf-import').onclick=act(async()=>{mergePoint(await api('from-hdf5',{path:$('hdf-path').value,frame:Number($('hdf-frame').value),name:$('capture-name').value.trim()||uniqueName('轨迹点',plan.points),space:$('capture-space').value,side:$('capture-side').value}));toast('已提取关键点，源文件未修改');});
   $('add-point-step').onclick=act(()=>addStep('point',$('add-point-select').value));
   $('add-vla').onclick=act(()=>addStep('vla',$('add-model-select').value));
   $('new-model-step').onclick=()=>openModel(null,true);
   for(const type of ['gripper','wait'])$(`add-${type}`).onclick=act(()=>addStep(type));
-  $('steps').addEventListener('focusin', event=>{
+  const endCaret=event=>{
     const input=event.target;
-    if(!input.matches('input[type="number"][data-field="duration"]'))return;
+    if(!input.matches('input[type="number"][data-field="duration"], input[type="number"][data-field="value"]'))return;
     const value=input.value;
     // Number inputs have no setSelectionRange. Reassign after the initial
     // click places the caret at the end, preserving native numeric controls.
     requestAnimationFrame(()=>{
       if(document.activeElement===input&&input.value===value){input.value='';input.value=value;}
     });
+  };
+  $('steps').addEventListener('focusin',endCaret);
+  $('steps').addEventListener('click',endCaret);
+  let stepActionBusy=false;
+  $('steps').onclick=act(async event=>{
+    const card=event.target.closest('[data-index]');if(!card)return;
+    selected=Number(card.dataset.index);highlight();
+    if(event.target.closest('[data-edit-step-model]')){openModel(plan.models.find(m=>m.id===plan.steps[selected].model));return;}
+    const action=event.target.closest('[data-step-action]')?.dataset.stepAction;
+    if(!action||stepActionBusy)return;
+    stepActionBusy=true;
+    try {
+      const i=selected,step=plan.steps[i];
+      if(action==='delete') {
+        if(step.type==='vla'&&!plan.steps.some(s=>s.id!==step.id&&s.type==='vla'&&s.model===step.model)) {
+          const state=await api('release-model',{id:step.model});renderState(state);
+          toast(state.pending_unloads?.includes(step.model)?'步骤已删除，模型将在本次执行结束后自动卸载':'步骤已删除，模型已卸载；共享配置保留');
+        }
+        const index=plan.steps.findIndex(s=>s.id===step.id);
+        if(index>=0)plan.steps.splice(index,1);
+      }
+      if(action==='copy') {
+        const copy={...structuredClone(step),id:uid()};
+        if(copy.type==='vla')copy.name=uniqueName(copy.name,vlaSteps());
+        plan.steps.splice(i+1,0,copy);
+      }
+      if(action==='up'&&i>0){[plan.steps[i-1],plan.steps[i]]=[plan.steps[i],plan.steps[i-1]];selected--;}
+      if(action==='down'&&i<plan.steps.length-1){[plan.steps[i+1],plan.steps[i]]=[plan.steps[i],plan.steps[i+1]];selected++;}
+      selected=Math.max(0,Math.min(selected,plan.steps.length-1));
+      changed();renderSteps();renderPoints();
+    } finally {stepActionBusy=false;}
   });
-  $('steps').onclick=event=>{const card=event.target.closest('[data-index]');if(!card)return;selected=Number(card.dataset.index);highlight();if(event.target.closest('[data-edit-step-model]')){openModel(plan.models.find(m=>m.id===plan.steps[selected].model));return;}const action=event.target.closest('[data-step-action]')?.dataset.stepAction;if(!action)return;const i=selected;if(action==='delete')plan.steps.splice(i,1);if(action==='copy')plan.steps.splice(i+1,0,{...structuredClone(plan.steps[i]),id:uid()});if(action==='up'&&i>0){[plan.steps[i-1],plan.steps[i]]=[plan.steps[i],plan.steps[i-1]];selected--;}if(action==='down'&&i<plan.steps.length-1){[plan.steps[i+1],plan.steps[i]]=[plan.steps[i],plan.steps[i+1]];selected++;}changed();renderSteps();renderPoints();};
-  $('steps').onchange=event=>{const input=event.target.closest('[data-field]');if(!input)return;const s=plan.steps[Number(input.closest('[data-index]').dataset.index)],key=input.dataset.field;s[key]=input.type==='checkbox'?input.checked:input.type==='number'?Number(input.value)/(key==='width'?1000:1):input.value;changed();if(['until','point','model'].includes(key)){renderSteps();renderPoints();}};
+  $('steps').onchange=act(async event=>{const input=event.target.closest('[data-field]');if(!input)return;const s=plan.steps[Number(input.closest('[data-index]').dataset.index)],key=input.dataset.field;if(key==='name'&&s.type==='vla'){try{input.value=checkName({...s,name:input.value},vlaSteps(),'VLA 步骤');}catch(error){input.value=s.name;throw error;}}s[key]=input.type==='checkbox'?input.checked:input.type==='number'?Number(input.value)/(key==='width'?1000:1):input.value;changed();if(['until','point','model'].includes(key)){renderSteps();renderPoints();}});
   installStepSorting();
   $('settings').onchange=e=>{if(e.target.dataset.setting){plan.settings[e.target.dataset.setting]=e.target.dataset.setting==='joint_command'?e.target.value:Number(e.target.value);changed();}};
   $('add-model').onclick=()=>openModel();
   $('model-search').oninput=renderModels;
+  $('refresh-gpus').onclick=act(refreshDevices);
+  $('model-list').onchange=act(async event=>{
+    const input=event.target.closest('[data-model-device]');if(!input)return;
+    const index=plan.models.findIndex(m=>m.id===input.dataset.modelDevice),old=plan.models[index];
+    try{plan.models[index]=await api('model/save',{model:{...old,device:input.value},settings:plan.settings});changed();renderModels();toast('推理设备已保存；点击预加载或执行时生效');}
+    catch(error){input.value=old.device||'cuda:0';throw error;}
+  });
+  refreshDevices().catch(error=>{$('gpu-status').textContent=error.message;});
   $('restore-loaded').onclick=act(async()=>{
     await refreshLibrary();
     let restored=0;
@@ -406,6 +469,7 @@ async function init() {
     event.preventDefault();readModelEditor();
     const button=event.submitter||$('model-form').querySelector('button[type="submit"]');button.disabled=true;
     try {
+      editingModel.name=checkName(editingModel,plan.models,'VLA 模型');
       const model=await api('model/save',{model:editingModel,settings:plan.settings});
       const index=plan.models.findIndex(m=>m.id===model.id);
       if(index<0)plan.models.push(model);else plan.models[index]=model;
@@ -422,7 +486,7 @@ async function init() {
     switch(button.dataset.modelAction){
       case 'add':addStep('vla',id);break;
       case 'edit':openModel(model);break;
-      case 'copy':openModel({...structuredClone(model),id:uid(),name:`${model.name} 副本`});break;
+      case 'copy':openModel({...structuredClone(model),id:uid(),name:uniqueName(`${model.name} 副本`,plan.models)});break;
       case 'load':await api('preload',{plan,ids:[id]});break;
       case 'unload':await api('unload',{id});break;
       case 'delete':await deleteResource('model',model);break;
@@ -435,8 +499,8 @@ async function init() {
   $('camera-image').onerror=()=>toast('相机帧尚未就绪，请稍后刷新；确认设备已连接且相机可用',true);
   $('freeze').onclick=act(async()=>{clearInterval(previewTimer);frozen=await api('snapshot',{camera:$('camera-role').value});pixel=null;$('pick-marker').hidden=true;$('camera-image').src=frozen.image;$('pixel-info').textContent=frozen.has_depth?'画面已冻结，点击物体表面选择目标。':'画面已冻结，但此相机没有对齐深度。';});
   $('camera-image').onclick=e=>{if(!frozen||!frozen.has_depth){toast('请先冻结具有对齐深度的画面',true);return;}const r=e.target.getBoundingClientRect();pixel=[Math.min(frozen.camera.width-1,Math.floor((e.clientX-r.left)/r.width*frozen.camera.width)),Math.min(frozen.camera.height-1,Math.floor((e.clientY-r.top)/r.height*frozen.camera.height))];$('pixel-info').textContent=`已选择像素 (${pixel.join(', ')})；保存目标点后可在点库中试运行并查看误差。`;$('pick-marker').style.left=`${(e.clientX-r.left)/r.width*100}%`;$('pick-marker').style.top=`${(e.clientY-r.top)/r.height*100}%`;$('pick-marker').hidden=false;};
-  $('save-pick').onclick=act(async()=>{if(!frozen||!pixel)throw new Error('请先冻结并点击目标像素');mergePoint(await api('pick',{snapshot:frozen.id,pixel,calibration:$('calibration').value,side:$('pick-side').value,tcp_offset:triple('tcp-offset'),offset:triple('base-offset'),name:$('pick-name').value}));toast('选点已保存，可在关键点库中试运行');tab('points');});
-  $('example').onclick=act(async()=>{if(dirty&&!confirm('用模拟示例替换当前草稿？'))return;plan=(await api('bootstrap')).plan;plan.name='模拟：基准点 → VLA → 返回基准点';const p={id:uid(),name:'双臂基准点',space:'joint',arms:{left:[0,.2,-.2,0,0,-.785,.04],right:[0,.2,-.2,0,0,.785,.04]},notes:'同一点在第 1、3 步重复引用'};plan.points.push(p);const m={id:uid(),name:'模拟 VLA',backend:'mock',action_mode:'absolute_joint',policy_hz:10,task:'保持位置',rtc:true};plan.models.push(m);plan.steps=[{id:uid(),type:'point',name:'进入基准点',point:p.id,duration:1,blend:true},{id:uid(),type:'vla',name:'交给 VLA',model:m.id,until:'duration',value:2},{id:uid(),type:'point',name:'返回同一基准点',point:p.id,duration:1,blend:false}];savedId=null;changed();render();tab('flow');toast('模拟示例已准备，请连接模拟器后执行');});
+  $('save-pick').onclick=act(async()=>{if(!frozen||!pixel)throw new Error('请先冻结并点击目标像素');mergePoint(await api('pick',{snapshot:frozen.id,pixel,calibration:$('calibration').value,side:$('pick-side').value,tcp_offset:triple('tcp-offset'),offset:triple('base-offset'),name:$('pick-name').value.trim()||uniqueName('相机目标点',plan.points)}));toast('选点已保存，可在关键点库中试运行');tab('points');});
+  $('example').onclick=act(async()=>{if(dirty&&!confirm('用模拟示例替换当前草稿？'))return;plan=(await api('bootstrap')).plan;plan.name='模拟：基准点 → VLA → 返回基准点';const p={id:uid(),name:uniqueName('双臂基准点',plan.points),space:'joint',arms:{left:[0,.2,-.2,0,0,-.785,.04],right:[0,.2,-.2,0,0,.785,.04]},notes:'同一点在第 1、3 步重复引用'};plan.points.push(p);const m={id:uid(),name:uniqueName('模拟 VLA',plan.models),backend:'mock',action_mode:'absolute_joint',policy_hz:10,task:'保持位置',rtc:true};plan.models.push(m);plan.steps=[{id:uid(),type:'point',name:'进入基准点',point:p.id,duration:1,blend:true},{id:uid(),type:'vla',name:'交给 VLA',model:m.id,until:'duration',value:2},{id:uid(),type:'point',name:'返回同一基准点',point:p.id,duration:1,blend:false}];savedId=null;changed();render();tab('flow');toast('模拟示例已准备，请连接模拟器后执行');});
   window.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key==='s'){e.preventDefault();act(()=>save())();}});
   setInterval(poll,700);
 }

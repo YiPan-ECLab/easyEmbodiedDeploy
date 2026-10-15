@@ -619,7 +619,7 @@ class VLASettingsTests(unittest.TestCase):
 
     def test_model_parameters_roundtrip_and_legacy_rtc(self):
         plan=point_plan()
-        model=dict(id='m',backend='mock',action_mode='absolute_joint',policy_hz=12,
+        model=dict(id='m',name='模型',backend='mock',action_mode='absolute_joint',policy_hz=12,
                    control_hz=80,smoothing_time_constant=0,inference_mode='rtc',rtc_mode='trained',
                    rtc_horizon=15,rtc_queue_threshold=25,sample_steps=8,n_action_steps=7,
                    rtc_schedule='linear',rtc_max_guidance_weight=3,rtc_mask_grippers=False)
@@ -628,7 +628,7 @@ class VLASettingsTests(unittest.TestCase):
             store=PlanStore(directory)
             saved=store.load(store.save(plan))['models'][0]
             for key,value in model.items():self.assertEqual(saved[key],value)
-        plan['models']=[dict(id='m',backend='mock',action_mode='absolute_joint',rtc=False)]
+        plan['models']=[dict(id='m',name='模型',backend='mock',action_mode='absolute_joint',rtc=False)]
         self.assertEqual(validate(plan)['models'][0]['inference_mode'],'sync')
 
     def test_time_constant_filter_and_short_rotation(self):

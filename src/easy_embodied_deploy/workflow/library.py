@@ -7,7 +7,7 @@ import threading
 from contextlib import contextmanager
 
 from ..calibration import atomic_json
-from .plan import PlanStore, new_plan, validate
+from .plan import PlanStore, new_plan, validate, validate_names, unique_name, repair_vla_names
 
 
 class SharedPlanStore(PlanStore):
@@ -71,16 +71,32 @@ class SharedPlanStore(PlanStore):
         # Existing shared points take precedence; newest legacy model snapshots
         # seed the model library. Original workflow documents remain recoverable.
         documents = list(self._documents())
+        # Preserve pre-uniqueness libraries before assigning display-name suffixes.
+        # IDs, coordinates, model configurations and step references stay intact.
+        for kind in ('points', 'models'):
+            rows = self._rows(kind)
+            upgraded = []
+            for row in rows:
+                row = copy.deepcopy(row)
+                row['name'] = unique_name((row.get('name') or row['id']).strip(), upgraded)
+                upgraded.append(row)
+            if rows != upgraded:
+                backup = self.directory / 'legacy_snapshots' / ('names_' + self._filename(kind))
+                backup.parent.mkdir(exist_ok=True)
+                if not backup.exists():
+                    atomic_json(backup, rows)
+                self._write(kind, upgraded)
+                self._touch()
         for _, document in documents:
             if document.get('resources') != 'shared':
-                self._resolve(document)
+                self._resolve(document, legacy=True)
         for path, document in documents:
             if document.get('resources') != 'shared':
                 backup = self.directory / 'legacy_snapshots' / path.name
                 backup.parent.mkdir(exist_ok=True)
                 if not backup.exists():
                     atomic_json(backup, document)
-                atomic_json(path, self._reference_document(self._resolve(document)))
+                atomic_json(path, self._reference_document(self._resolve(document, legacy=True)))
 
     @staticmethod
     def _reference_document(plan):
@@ -88,7 +104,7 @@ class SharedPlanStore(PlanStore):
         document.update(points=[], models=[], resources='shared')
         return document
 
-    def _resolve(self, plan):
+    def _resolve(self, plan, legacy=False):
         plan = copy.deepcopy(plan)
         state = self._state()
         changed = False
@@ -99,6 +115,8 @@ class SharedPlanStore(PlanStore):
             for row in plan.get(kind, []):
                 if row['id'] in existing or row['id'] in deleted:
                     continue
+                if legacy:
+                    row['name'] = unique_name((row.get('name') or row['id']).strip(), rows)
                 check = new_plan()
                 check['settings'] = plan.get('settings', {})
                 check[kind] = [row]
@@ -111,6 +129,8 @@ class SharedPlanStore(PlanStore):
             s.get('type') == 'point' and s.get('point') in state['deleted_points'] or
             s.get('type') == 'vla' and s.get('model') in state['deleted_models'])]
         plan.pop('resources', None)
+        if legacy:
+            repair_vla_names(plan)
         plan = validate(plan)
         if changed:
             for kind in ('points', 'models'):
@@ -137,6 +157,7 @@ class SharedPlanStore(PlanStore):
                 rows.append(row)
             else:
                 rows[index] = row
+            validate_names(rows, '共享关键点' if kind == 'points' else 'VLA 模型')
             self._write(kind, rows)
             self._touch(state)
         return row
@@ -168,7 +189,7 @@ class SharedPlanStore(PlanStore):
 
     def load(self, identifier):
         with self.transaction():
-            return self._resolve(json.loads(self.path(identifier).read_text()))
+            return self._resolve(json.loads(self.path(identifier).read_text()), legacy=True)
 
     def listing(self):
         with self.transaction():

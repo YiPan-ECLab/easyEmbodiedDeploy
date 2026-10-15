@@ -14,6 +14,7 @@ from ..calibration import atomic_json
 from ..calibration_math import intrinsics
 from ..pose_actions import (finite, flange_matrix, validate_transform, rpy_matrix,
                             matrix_rpy, rotvec_matrix, matrix_rotvec)
+from .devices import normalize_device
 
 SCHEMA = "easy_embodied_workflow"
 SIDES = ("left", "right")
@@ -31,6 +32,39 @@ def new_plan():
                 settings=dict(joint_command="move_js", control_hz=50, joint_speed=3.0, joint_acceleration=3.0,
                               linear_speed=1.0, angular_speed=.5, gripper_speed=1.0,
                               transition_s=.6, prefetch_s=1.0))
+
+
+def unique_name(name, rows):
+    names = {str(row.get('name') or '').strip() for row in rows}
+    candidate, index = name, 2
+    while candidate in names:
+        candidate = f'{name} {index}'
+        index += 1
+    return candidate
+
+
+def validate_names(rows, label):
+    names = set()
+    for row in rows:
+        name = row.get('name')
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f'请为{label}命名')
+        name = row['name'] = name.strip()
+        if name in names:
+            raise ValueError(f'{label}名称「{name}」已存在，请使用不同名称')
+        names.add(name)
+
+
+def repair_vla_names(plan):
+    """Upgrade old saved cards without changing model references or execution."""
+    used = []
+    models = {row['id']: row.get('name', row['id']) for row in plan.get('models', [])}
+    for step in plan.get('steps', []):
+        if step.get('type') == 'vla':
+            base = (step.get('name') or models.get(step.get('model')) or 'VLA').strip() or 'VLA'
+            step['name'] = unique_name(base, used)
+            used.append(step)
+    return plan
 
 
 def validate(plan):
@@ -57,6 +91,15 @@ def validate(plan):
         if any(not isinstance(i, str) or not i for i in ids) or len(set(ids)) != len(ids):
             raise ValueError(f"{kind} 的标识不能为空或重复")
         tables[kind] = {row["id"]: row for row in rows}
+    validate_names(plan['points'], '共享关键点')
+    validate_names(plan['models'], 'VLA 模型')
+    # Older API callers may omit card labels. Explicit names must be unique.
+    vla_steps = [s for s in plan['steps'] if s.get('type') == 'vla']
+    for step in vla_steps:
+        if 'name' not in step:
+            model = tables['models'].get(step.get('model'), {})
+            step['name'] = unique_name(model.get('name', 'VLA'), vla_steps)
+    validate_names(vla_steps, 'VLA 步骤')
     for point in plan["points"]:
         if not isinstance(point.get("name"), str) or not point["name"].strip():
             raise ValueError("请为关键点命名")
@@ -72,6 +115,7 @@ def validate(plan):
                 if abs(value[4]) > math.pi / 2 or max(abs(value[3]), abs(value[5])) > math.pi:
                     raise ValueError("末端姿态使用主值 RPY 弧度角")
     for model in plan["models"]:
+        model['device'] = normalize_device(model.get('device', 'cuda:0'))
         if model.get("backend") not in ("lerobot", "openpi", "mock"):
             raise ValueError("模型后端须为 LeRobot 或 OpenPI")
         if model.get("action_mode") not in ACTION_MODES:

@@ -84,6 +84,8 @@ class WorkflowController:
         self.active_sides = ("left", "right")
         self.tick_period = .02
         self.operation = None
+        self.pending_unloads = set()
+        self.unload_thread = None
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
@@ -104,7 +106,8 @@ class WorkflowController:
                           teaching_sides=sorted(self.hardware.teaching_sides) if self.hardware else [],
                           emergency=bool(self.hardware and self.hardware.emergency), operation=self.operation,
                           joint_limits=(self.hardware.limits.tolist() if self.hardware and not self.hardware.simulated else None),
-                          busy=self.busy(), verification=self.last_verification, events=list(self.events))
+                          busy=self.busy(), verification=self.last_verification, events=list(self.events),
+                          pending_unloads=sorted(self.pending_unloads))
             if self.plan and 0 <= self.status["step"] < len(self.plan["steps"]):
                 step = self.plan["steps"][self.status["step"]]
                 result.update(step_id=step["id"], step_type=step["type"])
@@ -218,9 +221,36 @@ class WorkflowController:
         selected["models"] = [m for m in plan["models"] if identifiers is None or m["id"] in identifiers]
         selected = validate(selected)
         require_models(selected["models"], identifiers if identifiers is not None else [m['id'] for m in selected['models']])
-        if self.busy():
-            raise ValueError("执行中模型由工作流管理，请停止后更改配置")
+        with self.lock:
+            if self.busy():
+                raise ValueError("执行中模型由工作流管理，请停止后更改配置")
+            self.pending_unloads.difference_update(m['id'] for m in selected['models'])
         self.models.preload(selected["models"])
+
+    def release_model(self, identifier):
+        """A deleted last card releases weights after the current run, if any."""
+        with self.lock:
+            if not self.busy():
+                self.models.close(identifier)
+                return
+            self.pending_unloads.add(identifier)
+            if self.unload_thread is None or not self.unload_thread.is_alive():
+                self.unload_thread = threading.Thread(target=self._release_when_idle, daemon=True)
+                self.unload_thread.start()
+
+    def _release_when_idle(self):
+        while True:
+            with self.lock:
+                if not self.pending_unloads:
+                    return
+                if not self.busy():
+                    # Serialize with start(): never unload a model a new run is using.
+                    for identifier in self.pending_unloads:
+                        self.models.close(identifier)
+                    self.pending_unloads.clear()
+                    return
+                active = self.thread
+            active.join()
 
     def start(self, plan, start_index=0, repetitions=1, home_before=True):
         plan = validate(plan)
@@ -247,6 +277,7 @@ class WorkflowController:
                             bounded_joints(q[:6], self.hardware.limits,
                                            f"关键点 {point['name']} / {side} 原始录制值（请核对或重录）")
             self.plan = plan
+            self.pending_unloads.difference_update(used_models)
             self.operation = "preparing"
             self.stop_event.clear()
             self.paused.clear()

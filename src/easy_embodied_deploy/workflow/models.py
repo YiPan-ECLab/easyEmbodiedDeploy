@@ -13,6 +13,7 @@ from multiprocessing.connection import Client
 import numpy as np
 
 from ..module_http import ROOT
+from .devices import worker_launch
 
 
 def inference_config(config):
@@ -21,7 +22,7 @@ def inference_config(config):
 
 
 class ModelProcess:
-    def __init__(self, config):
+    def __init__(self, config, launch=None):
         self.config = copy.deepcopy(config)
         self.lock = threading.RLock()
         self.rpc_lock = threading.Lock()
@@ -32,17 +33,14 @@ class ModelProcess:
         self.logs = deque(maxlen=30)
         self.auth = secrets.token_bytes(32)
         self.started = time.monotonic()
-        env = os.environ.copy()
+        worker_config, env = launch if launch is not None else worker_launch(config)
         env.update(PYTHONPATH=os.pathsep.join([str(ROOT / "src"), str(ROOT)]),
                    PYTHONUNBUFFERED="1", WORKFLOW_AUTH=self.auth.hex(),
                    XLA_PYTHON_CLIENT_PREALLOCATE="false")
         backend = config["backend"]
         environment = {"mock": "piper-home", "lerobot": "lerobot-pi05", "openpi": "openpi-jax"}[backend]
-        if backend == "openpi":
-            device = config.get("device", "cuda:0")
-            env["CUDA_VISIBLE_DEVICES"] = device.split(":")[-1] if device.startswith("cuda:") else ""
         self.process = subprocess.Popen([str(ROOT / f"thirdParty/.venvs/{environment}/bin/python"),
-            "-m", "easy_embodied_deploy.workflow.model_worker", "--config", json.dumps(config)],
+            "-m", "easy_embodied_deploy.workflow.model_worker", "--config", json.dumps(worker_config)],
             cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             errors="replace", start_new_session=True)
         self.reader = threading.Thread(target=self._read, daemon=True)
@@ -116,10 +114,18 @@ class ModelPool:
 
     def preload(self, configs):
         with self.operations:
+            # Validate devices before closing any previously loaded instance.
+            launches = {}
+            for config in configs:
+                with self.lock:
+                    existing = self.models.get(config['id'])
+                if not (existing and inference_config(existing.config) == inference_config(config)
+                        and existing.stage != 'failed'):
+                    launches[config['id']] = worker_launch(config)
             for config in configs:
                 with self.lock:
                     existing = self.models.get(config["id"])
-                if existing and inference_config(existing.config) == inference_config(config) and existing.stage != "failed":
+                if config['id'] not in launches:
                     with existing.lock:
                         existing.config = copy.deepcopy(config)
                     continue
@@ -127,7 +133,7 @@ class ModelPool:
                     with self.lock:
                         self.models.pop(config["id"], None)
                     existing.close()
-                model = ModelProcess(config)
+                model = ModelProcess(config, launch=launches[config['id']])
                 with self.lock:
                     self.models[config["id"]] = model
 
