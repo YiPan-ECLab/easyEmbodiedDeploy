@@ -84,6 +84,10 @@ MODULES = {
         "openpi-jax",
         "JAX 推理 · 离线测试 · 真机控制",
     ),
+    "workflow": (
+        "自定义工作流", "部署", "Workflow/web_server.py", "piper-home",
+        "关键点复用 · 平滑运动 · 多 VLA 预加载与切换",
+    ),
 }
 
 

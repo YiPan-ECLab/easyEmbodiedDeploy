@@ -56,6 +56,7 @@ function formPayload() {
     input_dirs: inputDirectories(),
     output_root: $("outputRoot").value.trim() || null,
     task: $("task").value.trim(),
+    task_source: $("inheritTask").checked?'hdf5':'override',
     source_fps: $("sourceFps").value ? Number($("sourceFps").value) : null,
     target_fps: Number($("targetFps").value),
     action_mode: checked("actionMode"),
@@ -74,6 +75,8 @@ function shellQuote(value) {
 
 function updateCommand() {
   const value = formPayload();
+  $("task").required=value.task_source==='override';
+  $("task").disabled=ui.locked||value.task_source==='hdf5';
   const cameraPose = value.action_mode.startsWith("camera_delta_");
   const pose = cameraPose || value.action_mode === "absolute_base_pose";
   document.querySelectorAll("[data-camera-pose]").forEach(el => { el.hidden = !cameraPose; });
@@ -93,7 +96,8 @@ function updateCommand() {
     parts.push(`  --calibration-bundle ${shellQuote(value.calibration_bundle)} \\`);
     parts.push(`  --calibration-mount-id ${shellQuote(value.calibration_mount_id)} \\`);
   }
-  parts.push(`  --task ${shellQuote(value.task)} \\`);
+  parts.push(`  --task-source ${value.task_source} \\`);
+  if(value.task)parts.push(`  --task ${shellQuote(value.task)} \\`);
   if (value.source_fps) parts.push(`  --source-fps ${value.source_fps} \\`);
   parts.push(`  --fps ${value.target_fps} --action-mode ${value.action_mode} \\`);
   parts.push(`  --gap-policy ${value.gap_policy}${value.limit ? ` --limit ${value.limit}` : ""}`);
@@ -176,7 +180,7 @@ function renderFileTable() {
     const index = ui.plan.files.indexOf(file);
     const details = [...(file.errors || []), ...(file.timing_ignored ? ["已人工允许时序异常", ...(file.timing_errors || [])] : []), ...(file.warnings || [])];
     return `<tr class="${issue ? "issue" : ""}">
-      <td title="${escapeHtml(file.path || file.name)}">${escapeHtml(file.name)}</td>
+      <td title="${escapeHtml(file.path || file.name)}">${escapeHtml(file.name)}<br><small>${escapeHtml(file.task || '缺少任务指令')}${file.task_source==='override'?'（统一覆盖）':''}</small></td>
       <td>${formatNumber(file.frames)}</td><td>${formatNumber(file.source_task_frames)}</td>
       <td>${formatNumber(file.source_home_frames)}</td><td>${formatNumber(file.trimmed_leading_idle_frames || 0)} / ${formatNumber(file.trimmed_idle_frames)}</td>
       <td>${file.temporal_fusion ? "mixed" : file.measured_fps != null ? Number(file.measured_fps).toFixed(3) : "—"}</td><td>${formatNumber(file.output_frames)}</td>
@@ -385,6 +389,7 @@ async function loadDefaults() {
   $("inputDir").value = ui.defaults.input_dir;
   $("outputRoot").value = ui.defaults.output_root || "";
   $("task").value = ui.defaults.task;
+  $("inheritTask").checked=(ui.defaults.task_source||'hdf5')==='hdf5';
   $("sourceFps").value = ui.defaults.source_fps || "";
   $("targetFps").value = ui.defaults.target_fps;
   $("repoId").value = ui.defaults.repo_id || "";

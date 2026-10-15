@@ -175,6 +175,7 @@ class DataPipelineTests(unittest.TestCase):
         with h5py.File(self.file, "a") as handle:
             demo = handle["data/demo_0"]
             demo["actions"][23, 0] += .01
+            demo["left_actions"][23, 0] += .01
         info = processor.inspect_file(self.file, processor.Settings(str(self.source)))
         self.assertTrue(any("末次任务变化" in warning for warning in info["warnings"]))
         with h5py.File(self.file) as handle:
@@ -272,7 +273,9 @@ class DataPipelineTests(unittest.TestCase):
 
     def test_real_conversion_both_action_modes_and_analysis(self):
         other = self.root / "second"
-        make_episode(other, offset=0.01)
+        other_file=make_episode(other, offset=0.01)
+        with h5py.File(other_file,'r+') as handle:
+            handle['data/demo_0'].attrs['language']='second task / 第二项任务'
         for mode in ("delta_joint", "absolute_joint"):
             target = self.root / mode
             settings = processor.Settings(
@@ -284,11 +287,32 @@ class DataPipelineTests(unittest.TestCase):
             )
             result = processor.run(settings)
             self.assertTrue(result["validation"]["valid"], result["validation"])
+            self.assertEqual(result['plan']['tasks'],['test task','second task / 第二项任务'])
+            self.assertEqual([f['task_source'] for f in result['plan']['files']],['hdf5','hdf5'])
+            from lerobot.datasets import LeRobotDatasetMetadata
+            metadata=LeRobotDatasetMetadata(repo_id='local/test',root=target/'lerobot')
+            self.assertEqual(metadata.info.total_tasks,2)
             report = analyze_lerobot.analyze(str(target), None)
             self.assertEqual(report["status"], "PASS", report["errors"])
             self.assertEqual(report["source_verification"]["max_action_error"], 0)
             self.assertEqual(report["source_verification"]["home_frames_in_output"], 0)
             self.assertEqual(report["summary"]["episodes"], 2)
+
+    def test_task_inheritance_and_explicit_override(self):
+        settings=processor.Settings(str(self.source),task='fallback')
+        self.assertEqual(processor.scan(settings)['files'][0]['task'],'test task')
+        settings.task_source='override'
+        self.assertEqual(processor.scan(settings)['files'][0]['task'],'fallback')
+        with h5py.File(self.file,'r+') as handle:
+            del handle['data/demo_0'].attrs['language']
+        settings.task_source='hdf5'
+        with self.assertRaisesRegex(ValueError,'缺少任务指令'):processor.scan(settings)
+
+    def test_multiple_languages_in_one_directory(self):
+        second=make_episode(self.source,offset=.02)
+        with h5py.File(second,'r+') as handle:handle['data/demo_0'].attrs['language']='another task'
+        plan=processor.scan(processor.Settings(str(self.source)))
+        self.assertEqual(plan['tasks'],['test task','another task'])
 
     def test_gap_analysis_and_official_editor_keep_valid_episode(self):
         make_episode(self.source, gap=True)

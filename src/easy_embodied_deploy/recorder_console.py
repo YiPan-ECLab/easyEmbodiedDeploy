@@ -17,6 +17,7 @@ from urllib.request import urlopen
 from urllib.error import URLError
 
 from .http import LocalHandlerMixin, read_json
+from . import recording_start
 
 ROOT = Path(__file__).resolve().parents[2]
 STATIC = ROOT / "web/recorder"
@@ -41,6 +42,7 @@ def defaults():
         "max_task_gap_s": record.MAX_TASK_GAP_S,
         "start_joint_delta_rad": record.START_JOINT_DELTA_RAD,
         "start_gripper_delta_m": record.START_GRIPPER_DELTA_M,
+        "start_point": recording_start.load(),
     }
 
 
@@ -56,6 +58,9 @@ def command_for(raw):
     path = (path if path.is_absolute() else ROOT / path).resolve()
     command = [str(PYTHON), "-u", str(SCRIPT), "--web-control", "--output", str(path)]
     config["output"] = str(path)
+    config["start_point"] = recording_start.normalize(config["start_point"])
+    if config["start_point"]["mode"] == "custom":
+        command += ["--start-point-json", json.dumps(config["start_point"], ensure_ascii=False)]
     for key in (
         "hz",
         "max_task_gap_s",
@@ -141,6 +146,22 @@ class RecorderSession:
             threading.Thread(
                 target=self._read, args=(self.process,), daemon=True
             ).start()
+
+    def start_point_action(self, action, payload):
+        with self.lock:
+            if self.closed or self.maintenance or (self.process and self.process.poll() is None):
+                raise RuntimeError("请先结束采集会话，再设置下一次会话的起点")
+            self.maintenance = True
+        try:
+            if action == "save":
+                return recording_start.save(payload.get("start_point"))
+            if action == "capture":
+                defaults()  # Locate the recorder module without opening devices.
+                return {"arms": recording_start.capture(payload.get("side", "both"))}
+            raise ValueError("未知起点操作")
+        finally:
+            with self.lock:
+                self.maintenance = False
 
     def camera_frame(self, camera, session_id):
         if camera not in ("agentview", "left_eye_in_hand", "right_eye_in_hand"):
@@ -346,7 +367,10 @@ class Handler(LocalHandlerMixin, BaseHTTPRequestHandler):
     def do_GET(self):
         route = urlsplit(self.path).path
         if route == "/api/bootstrap":
-            self.send({"defaults": defaults(), "status": self.server.session.status()})
+            self.send({"defaults": defaults(), "status": self.server.session.status(),
+                       "start_points": recording_start.workflow_points()})
+        elif route == "/api/start-points":
+            self.send({"points": recording_start.workflow_points()})
         elif route == "/api/status":
             self.send(self.server.session.status())
         elif route == "/api/camera-frame":
@@ -377,6 +401,9 @@ class Handler(LocalHandlerMixin, BaseHTTPRequestHandler):
             route = urlsplit(self.path).path
             if route == "/api/start":
                 self.server.session.start(body)
+            elif route in ("/api/start-point/save", "/api/start-point/capture"):
+                self.send(self.server.session.start_point_action(route.rsplit("/", 1)[-1], body))
+                return
             elif route == "/api/input":
                 self.server.session.input(body)
             elif route == "/api/stop":

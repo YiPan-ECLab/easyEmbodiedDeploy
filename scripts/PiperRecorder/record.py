@@ -2,6 +2,7 @@
 """Record dual-Piper demonstrations with pyAgxArm, without normalization."""
 
 import argparse
+import json
 import math
 import select
 import sys
@@ -246,7 +247,7 @@ def record_episode(
         return True
 
     clear_pending_input()
-    print("录制中；请在 J6 预定位后开始操作，按回车停止...")
+    print("起点准备完成；请开始操作，按回车停止...")
     terminal_bell()
     if operator:
         operator.phase("waiting_motion", accepts=("finish",))
@@ -269,7 +270,7 @@ def record_episode(
                 flush=True,
             )
 
-    print("\n四台机械臂回 ZERO，四个夹爪闭合到 0 m，并继续录制...")
+    print("\n四台机械臂与夹爪返回采集起点，并继续录制...")
     if operator:
         operator.phase("homing_review", frames=len(episode))
     robot.home(
@@ -315,6 +316,7 @@ def run(
     start_joint_delta_rad: float = START_JOINT_DELTA_RAD,
     start_gripper_delta_m: float = START_GRIPPER_DELTA_M,
     operator=None,
+    start_point=None,
 ) -> None:
     _validate_options(
         record_hz, max_task_gap_s, start_joint_delta_rad, start_gripper_delta_m
@@ -364,6 +366,7 @@ def run(
                 print(f"相机预览不可用（不影响采集）：{exc}")
         robot = DualPiper(
             PIPERS,
+            start_point=start_point,
             firmware=FIRMWARE,
             home_speed=HOME_SPEED,
             home_timeout_s=HOME_TIMEOUT_S,
@@ -380,7 +383,7 @@ def run(
         )
         resources.callback(robot.close)
         robot.connect()
-        print("四台机械臂回 ZERO，四个夹爪闭合到 0 m...")
+        print("四台机械臂与夹爪返回采集起点...")
         if operator:
             operator.phase("homing")
         robot.home()
@@ -405,7 +408,7 @@ def run(
                 )
             except Exception as exc:  # noqa: BLE001 - keep the recording session alive
                 print(f"本次录制失败: {type(exc).__name__}: {exc}", file=sys.stderr)
-                print("机械臂重新回 ZERO 后继续下一条...")
+                print("机械臂重新返回采集起点后继续下一条...")
                 if operator:
                     operator.phase("homing", error=f"{type(exc).__name__}: {exc}")
                 robot.home()
@@ -444,6 +447,7 @@ def run(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--web-control", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--start-point-json", default=None, help="采集起点 JSON；省略时保留原零位/J6 预摆流程")
     parser.add_argument("--output", type=Path, default=OUTPUT_DIR, help="HDF5 输出目录")
     parser.add_argument(
         "--check", action="store_true", help="只检查依赖和 pyAgxArm API，不连接硬件"
@@ -482,6 +486,7 @@ def main() -> int:
                 start_joint_delta_rad=args.start_joint_delta_rad,
                 start_gripper_delta_m=args.start_gripper_delta_m,
                 operator=operator,
+                start_point=json.loads(args.start_point_json) if args.start_point_json else None,
             )
     except KeyboardInterrupt:
         print("\n已停止")

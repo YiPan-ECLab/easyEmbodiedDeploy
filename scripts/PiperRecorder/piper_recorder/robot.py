@@ -104,6 +104,7 @@ class PiperPair:
         gripper_max_width: float,
         gripper_home_timeout_s: float,
         gripper_home_tolerance_m: float,
+        start_target=None,
     ):
         self.side = side
         self.leader_name = leader_name
@@ -122,6 +123,14 @@ class PiperPair:
         self.gripper_home_timeout_s = gripper_home_timeout_s
         self.gripper_home_tolerance_m = gripper_home_tolerance_m
         self.target = (*ZERO_JOINTS[:5], math.radians(joint6_deg))
+        self.custom_start = start_target is not None
+        self._home_track_leader = not self.custom_start
+        self.home_joints = tuple(start_target[:6]) if self.custom_start else ZERO_JOINTS
+        self.home_width = float(start_target[6]) if self.custom_start else 0.0
+        if self.custom_start:
+            for i, (value, (lo, hi)) in enumerate(zip(self.home_joints, JOINT_LIMITS_RAD)):
+                if not math.isfinite(value) or not lo <= value <= hi:
+                    raise ValueError(f"{side} 起点 J{i+1}={math.degrees(value):.3f}° 超出可下发范围，请核对起点")
         self.leader: Any = None
         self.follower: Any = None
         self.leader_gripper: Any = None
@@ -153,8 +162,12 @@ class PiperPair:
     def connect(self) -> None:
         self.follower, self.follower_gripper = self._create_arm(self.follower_name)
         self.leader, self.leader_gripper = self._create_arm(self.leader_name)
-        self._wait_follower_feedback(timeout=3.0)
+        # Another application may have left this physical follower in leader
+        # mode. Restore its role before waiting for follower-only feedback.
+        # Do not enable motors or send motion targets during this handshake.
+        switched_at = time.time()
         self.follower.set_follower_mode()
+        self._wait_follower_feedback(timeout=3.0, after=switched_at)
         self.leader.set_leader_mode()
         self.leader.restore_leader_drag_mode()
         pendant = self.leader_gripper.get_gripper_teaching_pendant_param(
@@ -172,19 +185,18 @@ class PiperPair:
     ) -> None:
         deadline = time.monotonic() + timeout
         for now in ticks(50):
-            joints = self.follower.get_joint_angles()
-            fresh = joints is not None and (
-                after is None
-                or joints.timestamp > after
+            messages = (
+                self.follower.get_joint_angles(),
+                self.follower.get_flange_pose(),
+                self.follower_gripper.get_gripper_status(),
             )
-            if (
-                fresh
-                and self.follower.get_flange_pose() is not None
-                and self.follower_gripper.get_gripper_status() is not None
-            ):
+            if all(message is not None and (after is None or message.timestamp > after)
+                   for message in messages):
                 return
             if now >= deadline:
-                raise RuntimeError(f"{self.follower_name} 没有完整反馈")
+                missing = [name for name, message in zip(("关节", "法兰", "夹爪"), messages)
+                           if message is None or (after is not None and message.timestamp <= after)]
+                raise RuntimeError(f"{self.follower_name} 没有完整反馈（已请求从臂模式，缺少新鲜的{'、'.join(missing)}反馈）")
 
     @staticmethod
     def _enable_failure_details(arm) -> str:
@@ -522,12 +534,15 @@ class PiperPair:
         )
 
     def prepare_home(self) -> None:
+        # Keep the original leader-driven return after a normal recording.
+        # A newly hand-positioned follower may be far from its leader instead.
+        self._home_track_leader = not self.custom_start or bool(self._thread and self._thread.is_alive())
         self.stop_following()
         with self._lock:
-            self._command = ArmCommand(ZERO_JOINTS, 0.0, time.monotonic())
+            self._command = ArmCommand(self.home_joints, self.home_width, time.monotonic())
 
     def _home_gripper(self, gripper: Any, name: str) -> None:
-        """Close a gripper to 0 m and require fresh feedback at zero."""
+        """Move a gripper to the saved start width with fresh settled feedback."""
         previous = gripper.get_gripper_status()
         previous_timestamp = (
             0.0 if previous is None else previous.timestamp
@@ -535,7 +550,7 @@ class PiperPair:
         deadline = time.monotonic() + self.gripper_home_timeout_s
         settled = 0
         for now in ticks(20):
-            gripper.move_gripper_m(0.0, force=self.gripper_force)
+            gripper.move_gripper_m(self.home_width, force=self.gripper_force)
             status = gripper.get_gripper_status()
             if status is not None and status.msg.mode != "width":
                 raise RuntimeError(f"{name} 夹爪不是 width 模式")
@@ -543,16 +558,16 @@ class PiperPair:
             value = None if status is None else _normalize_gripper_width(
                 status.msg.value, self.gripper_max_width, name
             )
-            at_zero = fresh and value is not None and value <= self.gripper_home_tolerance_m
+            at_zero = fresh and value is not None and abs(value-self.home_width) <= self.gripper_home_tolerance_m
             settled = settled + 1 if at_zero else 0
             if settled >= 3:
-                print(f"{name}: 夹爪 ZERO 完成 (0 m)")
+                print(f"{name}: 夹爪归位完成 ({self.home_width:g} m)")
                 return
             if now >= deadline:
                 raise RuntimeError(f"{name} 夹爪回零超时，当前宽度={value!r} m")
 
     def home_synchronized(self, start_barrier: threading.Barrier) -> None:
-        """Home a pair while the follower tracks the leader's smooth trajectory."""
+        """Reuse the synchronized return, aligning separately after manual setup."""
         try:
             # This mode transition runs while HOME frames are already being
             # sampled. The barrier below still prevents either pair from
@@ -578,7 +593,7 @@ class PiperPair:
                 # Let move_j generate one smooth physical trajectory on the
                 # leader. Tracking its measured position keeps the follower
                 # from starting or finishing ahead of the leader.
-                self.leader.move_j(list(ZERO_JOINTS))
+                self.leader.move_j(list(self.home_joints))
                 leader_joints = self._clamp_joints(
                     _message_values(
                         self.leader.get_joint_angles(),
@@ -586,7 +601,13 @@ class PiperPair:
                         f"{self.leader_name} 关节",
                     )
                 )
-                self.follower.move_js(list(leader_joints))
+                if not self._home_track_leader:
+                    # At setup the follower may have been hand-positioned while
+                    # the leader is elsewhere. Both use firmware-planned paths;
+                    # never jump the follower to the leader's initial position.
+                    self.follower.move_j(list(self.home_joints))
+                else:
+                    self.follower.move_js(list(leader_joints))
                 follower_joints = _message_values(
                     self.follower.get_joint_angles(),
                     6,
@@ -598,7 +619,7 @@ class PiperPair:
                     self._check_status(self.follower, self.follower_name)
                     next_check = now + self.status_period_s
                 ready = all(
-                    max(map(abs, joints)) <= self.home_tolerance
+                    max(abs(a-b) for a, b in zip(joints, self.home_joints)) <= self.home_tolerance
                     for joints in (leader_joints, follower_joints)
                 )
                 settled = settled + 1 if ready else 0
@@ -611,8 +632,8 @@ class PiperPair:
 
             # Leave the follower in the regular position-speed mode expected
             # by the next J6 preposition operation.
-            self.follower.move_j(list(ZERO_JOINTS))
-            print(f"{self.leader_name}, {self.follower_name}: 同步 ZERO 完成")
+            self.follower.move_j(list(self.home_joints))
+            print(f"{self.leader_name}, {self.follower_name}: 同步归位完成")
             with ThreadPoolExecutor(max_workers=2) as pool:
                 futures = (
                     pool.submit(
@@ -634,8 +655,12 @@ class PiperPair:
             start_barrier.abort()
             raise
         finally:
-            self._restore_teaching()
-        print(f"{self.side}: 主从臂和两个夹爪回零完成")
+            # A custom start must remain the idle pose, including its gripper
+            # opening. Drag mode can let the teaching gripper spring closed.
+            # start_following restores drag immediately before recording.
+            if not self.custom_start:
+                self._restore_teaching()
+        print(f"{self.side}: 主从臂和两个夹爪归位完成")
 
     def stop_following(self) -> None:
         self._stop.set()
@@ -653,7 +678,7 @@ class PiperPair:
             error = exc
         finally:
             try:
-                if self._leader_is_follower:
+                if self._leader_is_follower and not self.custom_start:
                     self._restore_teaching()
             except Exception as exc:  # noqa: BLE001 - preserve shutdown errors
                 if error is None:
@@ -669,8 +694,12 @@ class PiperPair:
 
 
 class DualPiper:
-    def __init__(self, pipers: dict[str, dict], **motion):
-        self.pairs = {side: PiperPair(side, **pipers[side], **motion) for side in SIDES}
+    def __init__(self, pipers: dict[str, dict], start_point=None, **motion):
+        from easy_embodied_deploy.recording_start import normalize
+        self.start_point = normalize(start_point)
+        self.pairs = {side: PiperPair(side, **pipers[side], **motion,
+                      start_target=self.start_point["arms"][side] if self.start_point["mode"] == "custom" else None)
+                      for side in SIDES}
         self._sample_pool = ThreadPoolExecutor(max_workers=len(SIDES), thread_name_prefix="piper-sample")
 
     def _run_parallel(self, operation: Callable[[PiperPair], None]) -> None:
@@ -699,8 +728,12 @@ class DualPiper:
         self._run_parallel(PiperPair.connect)
 
     def preposition_and_start(self) -> None:
-        print("四臂执行 J6 预定位...")
-        self._run_parallel(PiperPair.preposition)
+        if self.start_point["mode"] == "custom":
+            print("四臂回到自定义起点，跳过 J6 预摆...")
+            self.home()
+        else:
+            print("四臂执行 J6 预定位...")
+            self._run_parallel(PiperPair.preposition)
         self._run_parallel(PiperPair.start_following)
 
     def sample(self) -> dict[str, ArmSample]:

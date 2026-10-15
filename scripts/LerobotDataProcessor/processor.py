@@ -27,6 +27,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from easy_embodied_deploy.statistics import statistics_close
 from easy_embodied_deploy.action_contract import ACTION_MODES, POSE_MODES, action_axes, read_pose_contract
 from easy_embodied_deploy.trajectory_files import revision, hold_trajectories
+from easy_embodied_deploy.task_metadata import validate_tasks
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 AXES = [f"{side}_{axis}" for side in ("left", "right")
         for axis in ("j1", "j2", "j3", "j4", "j5", "j6", "gripper")]
@@ -103,7 +104,7 @@ def portable_path(path: Path) -> str:
 class Settings:
     input_dir: str
     output_root: str | None = None
-    task: str = "Remove the shipping label and place it on the package on the table"
+    task: str = ""
     target_fps: int = 10
     source_fps: int | None = None
     action_mode: str = "delta_joint"
@@ -114,6 +115,7 @@ class Settings:
     calibration_bundle: str | None = None
     calibration_mount_id: str = ""
     timing_overrides: dict[str, str] | None = None
+    task_source: str = "hdf5"
 
 
 def canonical_action_mode(value: str) -> str:
@@ -122,6 +124,10 @@ def canonical_action_mode(value: str) -> str:
 
 
 def canonical_settings(settings: Settings) -> Settings:
+    if settings.task_source not in ("hdf5", "override"):
+        raise ValueError("任务指令来源须为 hdf5 或 override")
+    if not isinstance(settings.task, str):
+        raise ValueError("任务指令须为文本")
     if settings.timing_overrides is not None and (
         not isinstance(settings.timing_overrides, dict)
         or any(not isinstance(k, str) or not isinstance(v, str) for k, v in settings.timing_overrides.items())
@@ -295,6 +301,11 @@ def inspect_file(path: Path, settings: Settings) -> dict:
     approved = (settings.timing_overrides or {}).get(str(path.resolve())) == source_revision
     with h5py.File(path, "r") as f:
         demo = f["data/demo_0"]
+        recorded_task = _text_attr(demo.attrs.get("language", "")).strip()
+        task = settings.task.strip() if settings.task_source == "override" else recorded_task
+        task_source = settings.task_source
+        if not task:
+            raise ValueError(f"{path.name}: 缺少任务指令 language；可关闭继承并填写统一指令")
         actions, states = demo["actions"], demo["states"]
         n = len(actions)
         if n < 2 or actions.shape != (n, 14) or states.shape != (n, 14):
@@ -408,6 +419,7 @@ def inspect_file(path: Path, settings: Settings) -> dict:
                 f"最大间隔 {max_gap:.3f}s，跨异常间隔动作 {max_gap_action:.4f} rad L2"
             )
         info = dict(name=path.name, path=str(path.resolve()), revision=source_revision,
+                    task=task, task_source=task_source,
                     errors=[], timing_errors=timing_errors, timing_ignored=bool(approved and timing_errors),
                     frames=n, source_fps="mixed" if fused else source_fps, temporal_fusion=fused,
                     measured_fps=round(measured, 4), stride=stride,
@@ -443,8 +455,8 @@ def scan(settings: Settings, *, collect_errors: bool = False) -> dict:
         raise ValueError(f"动作模式必须为 {' 或 '.join(ACTION_MODES)}")
     if settings.gap_policy not in GAP_POLICIES:
         raise ValueError(f"时间空档策略必须为 {' 或 '.join(GAP_POLICIES)}")
-    if not settings.task.strip():
-        raise ValueError("请填写任务描述")
+    if settings.task_source == "override" and not settings.task.strip():
+        raise ValueError("统一覆盖时必须填写任务指令")
     if settings.action_mode in POSE_MODES:
         from easy_embodied_deploy.pose_actions import load_calibration
         if settings.gap_policy != "reject":
@@ -496,6 +508,7 @@ def scan(settings: Settings, *, collect_errors: bool = False) -> dict:
     return dict(input_dir=portable_path(sources[0]), input_dirs=[portable_path(path) for path in sources],
                 target_fps=settings.target_fps, sampling_fps="mixed" if frequency_label == "mixed" else settings.target_fps, action_mode=settings.action_mode,
                 output_root=portable_path(out), files=files,
+                tasks=list(dict.fromkeys(x["task"] for x in files if x.get("task"))),
                 errors=[f"{x['name']}: {error}" for x in files for error in x.get("errors", [])],
                 invalid_files=sum(bool(x.get("errors")) for x in files),
                 episodes=len(files), input_frames=sum(x["frames"] for x in files),
@@ -577,6 +590,9 @@ def validate_lerobot_bundle(bundle_root: str | Path, *, expected: dict | None = 
             with contextlib.suppress(Exception):
                 report = json.loads(report_path.read_text(encoding="utf-8"))
                 expected = dict(report.get("settings", {}))
+                files = report.get("plan", {}).get("files", [])
+                if files:
+                    expected["episode_tasks"] = [f.get("task", expected.get("task") or None) for f in files]
     info_path, stats_path = root / "meta/info.json", root / "meta/stats.json"
     errors: list[str] = []
     warnings: list[str] = []
@@ -594,8 +610,6 @@ def validate_lerobot_bundle(bundle_root: str | Path, *, expected: dict | None = 
             raise ValueError("info 中 fps/episode/frame 总数必须为正数")
         if info.get("robot_type") != "piper_dual":
             errors.append("robot_type 必须为 piper_dual")
-        if int(info.get("total_tasks", 1)) != 1:
-            errors.append("当前处理器只支持单任务数据集")
         features = info.get("features", {})
         pose_contract = read_pose_contract(root)
         action_mode = canonical_action_mode(str((expected or {}).get("action_mode", "")))
@@ -662,8 +676,10 @@ def validate_lerobot_bundle(bundle_root: str | Path, *, expected: dict | None = 
             errors.append("episode_index 不是连续的 0..total_episodes-1")
         if rows and np.any(np.diff(episode) < 0):
             errors.append("parquet 中 episode_index 顺序倒退")
-        if not np.array_equal(np.unique(task_index), np.asarray([0], dtype=np.int64)):
-            errors.append("单任务数据集的 task_index 必须全部为 0")
+        task_errors, task_mapping = validate_tasks(root, info, task_index, episode,
+                                                   (expected or {}).get("episode_tasks"))
+        errors.extend(task_errors)
+        metrics["tasks"] = task_mapping
         if not np.isfinite(timestamp).all():
             errors.append("timestamp 含 NaN/Inf")
         for ep in range(total_episodes):
@@ -872,7 +888,7 @@ def _run(settings: Settings, progress: Callable[[dict], None] | None = None,
                                 f"observation.images.{camera}": images[camera][local_indices[block_offset]]
                                 for camera in CAMERAS
                             },
-                            "task": settings.task,
+                            "task": info["task"],
                         })
                         if i % 20 == 0 or i == n - 1:
                             emit("writing", episode=index, episodes=count, frame=i + 1, frames=n,
@@ -903,6 +919,7 @@ def _run(settings: Settings, progress: Callable[[dict], None] | None = None,
         validation = validate_lerobot_bundle(
             output / "lerobot",
             expected={"action_mode": settings.action_mode,
+                      "episode_tasks": [f["task"] for f in plan["files"]],
                       "total_frames": plan["output_frames"], "episodes": plan["episodes"]},
         )
         manifest["validation"] = validation

@@ -1,6 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const icons = {
+  workflow: '⇢',
   files: '▱',
   calibration: '⊹',
   recorder: '◎',

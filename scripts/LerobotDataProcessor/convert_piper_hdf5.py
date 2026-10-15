@@ -11,7 +11,7 @@ from processor import ACTION_MODES, GAP_POLICIES, Settings, run, scan, validate_
 DEFAULT_INPUT_DIR = "datasets/hdf5/撕下快递单并贴到桌子上的快递上"
 DEFAULT_OUTPUT_ROOT = None  # Auto: datasets/lerobot/<task>_<fps>hz_<mode>
 DEFAULT_REPO_ID = None     # Local identifier; does not upload anything
-TASK_DESCRIPTION = "Remove the shipping label and place it on the package on the table"
+TASK_DESCRIPTION = ""  # Default: preserve each HDF5 demo's language attribute.
 DEFAULT_SOURCE_FPS = None  # Infer from each HDF5's timestamps
 DEFAULT_FPS = 10           # Must divide every detected source FPS
 DEFAULT_ACTION_MODE = "delta_joint"  # or "absolute_joint" (all 14 action dimensions)
@@ -36,6 +36,8 @@ def main() -> None:
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT, help="New output bundle directory")
     parser.add_argument("--repo-id", default=DEFAULT_REPO_ID)
     parser.add_argument("--task", default=TASK_DESCRIPTION)
+    parser.add_argument("--task-source", choices=("hdf5", "override"), default="hdf5",
+                        help="hdf5: 逐条继承 language；override: 统一使用 --task")
     parser.add_argument("--source-fps", type=int, default=DEFAULT_SOURCE_FPS)
     parser.add_argument("--fps", type=int, default=DEFAULT_FPS)
     parser.add_argument("--action-mode", choices=(*ACTION_MODES, "absolute"), default=DEFAULT_ACTION_MODE,
@@ -60,7 +62,7 @@ def main() -> None:
         raise SystemExit(0 if result["valid"] else 1)
     input_dirs = args.input_dirs or [DEFAULT_INPUT_DIR]
     settings = Settings(input_dir=input_dirs[0], input_dirs=input_dirs, output_root=args.output_root,
-                        task=args.task, target_fps=args.fps, source_fps=args.source_fps,
+                        task=args.task, task_source=args.task_source, target_fps=args.fps, source_fps=args.source_fps,
                         action_mode=args.action_mode, repo_id=args.repo_id, limit=args.limit,
                         gap_policy=args.gap_policy, calibration_bundle=args.calibration_bundle,
                         calibration_mount_id=args.calibration_mount_id,

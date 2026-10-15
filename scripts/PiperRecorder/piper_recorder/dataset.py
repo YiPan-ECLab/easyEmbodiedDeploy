@@ -12,7 +12,6 @@ import numpy as np
 from .camera import CAMERA_NAMES, CameraFrame
 from .robot import (
     GRIPPER_LIMITS_M,
-    HARDWARE_TOLERANCE_M,
     JOINT_LIMITS_RAD,
     SIDES,
     ArmSample,
@@ -26,8 +25,9 @@ ACTION_LAYOUT = (
     "right_j5_rad,right_j6_rad,right_gripper_m"
 )
 _JOINT_LIMITS_ARRAY = np.asarray(JOINT_LIMITS_RAD, dtype=np.float64)
-JOINT_BOUNDARY_TOLERANCE_RAD = np.deg2rad(1.0)
-GRIPPER_BOUNDARY_TOLERANCE_M = HARDWARE_TOLERANCE_M
+# Recording tolerances only; accepted overshoot is clipped to nominal limits.
+JOINT_BOUNDARY_TOLERANCE_RAD = np.deg2rad(5.0)
+GRIPPER_BOUNDARY_TOLERANCE_M = 0.005
 
 
 @dataclass

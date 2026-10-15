@@ -22,6 +22,7 @@ SUITES = [
     ("openpi-jax", "tests", "test_pose_training_jax.py"),
     ("lerobot-pi05", "tests", "test_pose_pipeline.py"),
     ("piper-home", "tests", "test_pose_hardware.py"),
+    ("piper-home", "tests", "test_workflow.py"),
 ]
 
 

@@ -85,7 +85,8 @@ def settings_from(payload: dict) -> Settings:
     return Settings(
         input_dir=input_dirs[0], input_dirs=input_dirs,
         output_root=payload.get("output_root") or DEFAULT_OUTPUT_ROOT,
-        task=str(payload.get("task") or TASK_DESCRIPTION),
+        task=str(payload.get("task") or ""),
+        task_source=str(payload.get("task_source") or "hdf5"),
         target_fps=integer("target_fps", DEFAULT_FPS),
         source_fps=integer("source_fps", DEFAULT_SOURCE_FPS),
         action_mode=str(payload.get("action_mode") or DEFAULT_ACTION_MODE),
@@ -204,6 +205,7 @@ class Handler(LocalHandlerMixin, BaseHTTPRequestHandler):
                     "output_root": DEFAULT_OUTPUT_ROOT,
                     "repo_id": DEFAULT_REPO_ID,
                     "task": TASK_DESCRIPTION,
+                    "task_source": "hdf5",
                     "source_fps": DEFAULT_SOURCE_FPS,
                     "target_fps": DEFAULT_FPS,
                     "action_mode": DEFAULT_ACTION_MODE,

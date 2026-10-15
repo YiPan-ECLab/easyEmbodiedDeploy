@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from easy_embodied_deploy.statistics import statistics_close
+from easy_embodied_deploy.task_metadata import validate_tasks
 from easy_embodied_deploy.action_contract import ACTION_MODES, POSE_MODES, action_axes, read_pose_contract
 from easy_embodied_deploy.pose_dataset import PoseDataset, compute_chunk_statistics, training_stats
 from easy_embodied_deploy.pose_conversion import read_raw_poses, validate_pose_bundle
@@ -173,8 +174,6 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
     total_tasks = int(info.get("total_tasks", 0))
     if fps <= 0 or total_frames <= 0 or total_episodes <= 0:
         errors.append("fps、total_frames 和 total_episodes 必须为正数")
-    if total_tasks != 1:
-        errors.append("当前单任务转换结果的 total_tasks 必须为 1")
     if info.get("codebase_version") != "v3.0":
         errors.append("codebase_version 不是 v3.0")
     if info.get("robot_type") != "piper_dual":
@@ -242,8 +241,6 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
         errors.append("全局 index 不连续")
     if not np.array_equal(np.unique(episode), np.arange(total_episodes)):
         errors.append("episode_index 不连续")
-    if not np.array_equal(np.unique(task_index), np.asarray([0])):
-        errors.append("单任务数据的 task_index 必须全部为 0")
 
     statistics = {}
     for key, values in (("action", actions), ("observation.state", states)):
@@ -277,21 +274,9 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
             errors.append("位姿统计包含填充帧或缺少未来目标")
         statistics["pose_chunk"] = {**verification["metrics"], "valid_targets": recomputed["count"][0]}
 
-    task_path = root / "meta/tasks.parquet"
-    if not task_path.is_file():
-        errors.append("缺少 meta/tasks.parquet")
-    else:
-        tasks = pq.read_table(task_path).to_pydict()
-        task_texts = tasks.get("task", [])
-        valid_task_text = (
-            len(task_texts) == 1
-            and isinstance(task_texts[0], str)
-            and bool(task_texts[0].strip())
-        )
-        if tasks.get("task_index") != [0] or not valid_task_text:
-            errors.append("tasks.parquet 必须包含唯一的非空 task_index=0")
-        elif settings.get("task") and task_texts[0] != settings["task"]:
-            errors.append("tasks.parquet 的任务文本与 processing.json 不一致")
+    expected_tasks = [f.get("task", settings.get("task") or None) for f in plan.get("files", [])] or None
+    task_errors, _ = validate_tasks(root, info, task_index, episode, expected_tasks)
+    errors.extend(task_errors)
 
     episode_meta_files = sorted(root.glob("meta/episodes/chunk-*/file-*.parquet"))
     if not episode_meta_files:

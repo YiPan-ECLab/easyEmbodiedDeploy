@@ -7,6 +7,21 @@ let state = null,
   configured = false,
   zeroInspection = null;
 const zeroConfirmation = '我已确认J2位于物理零位';
+let startPoint={mode:'zero',name:'默认零位',arms:{left:Array(7).fill(0),right:Array(7).fill(0)}},startPoints=[];
+function renderStartPoint(){
+  $('start-point-mode').value=startPoint.mode;
+  $('start-point-name').value=startPoint.name;
+  $('start-point-custom').hidden=startPoint.mode!=='custom';
+  $('start-point-summary').textContent=startPoint.mode==='custom'?`采集起点 · ${startPoint.name}`:'采集起点 · 默认零位';
+  $('start-point-values').textContent=['left','right'].map(side=>{
+    const q=startPoint.arms[side];
+    return `${side==='left'?'左主臂 + 左从臂':'右主臂 + 右从臂'}\n${q.slice(0,6).map((v,i)=>`J${i+1} ${(v*180/Math.PI).toFixed(3)}°`).join(' / ')}\n夹爪 ${(q[6]*1000).toFixed(3)} mm`;
+  }).join('\n\n');
+}
+function renderStartSources(){
+  const select=$('start-point-source');select.replaceChildren();
+  startPoints.forEach((p,i)=>select.add(new Option(p.name,String(i))));
+}
 const phases = {
   idle: ['准备就绪', '从连接设备开始', '连接并回零后，可输入指令开始采集。', 'home'],
   initializing: ['正在连接', '正在初始化设备', '正在连接三台相机与四台机械臂，请等待。', 'home'],
@@ -44,6 +59,7 @@ function config() {
   const values = Object.fromEntries(new FormData($('config')));
   for (const key of Object.keys(values))
     if (key !== 'output') values[key] = Number(values[key]);
+  values.start_point=structuredClone(startPoint);
   return values;
 }
 
@@ -76,7 +92,14 @@ function renderZeroInspection() {
 
 function render() {
   if (!state) return;
-  const phase = phases[state.phase] || phases.idle;
+  const phase = [...(phases[state.phase] || phases.idle)];
+  const custom=(state.running?state.config?.start_point:startPoint)?.mode==='custom';
+  if(custom){
+    for(let i=0;i<3;i++)phase[i]=phase[i].replaceAll('回零','返回起点');
+    if(state.phase==='preposition')phase[2]='四台机械臂与夹爪返回自定义起点，对齐后启动跟随，不执行 J6 预摆。';
+    if(state.phase==='instruction')phase[2]='四臂保持在起点。填写任务指令并踩踏板后，主臂才进入拖动跟随。';
+    if(state.phase==='review')phase[2]='四臂已返回并保持起点。踩踏板保存，或点击“丢弃本条”。';
+  }
   const can = online && !sending && !state.pending && !state.stopping;
   const action = state.accepts?.[0];
   $('phase-tag').textContent = state.stopping ? '正在结束会话' : phase[0];
@@ -87,6 +110,7 @@ function render() {
   document.querySelectorAll('[data-step]').forEach(el => el.classList.toggle('active', el.dataset.step === phase[3]));
   $('config-fields').disabled = state.running || state.maintenance;
   $('start').disabled = state.running || state.maintenance || sending || !online;
+  $('start').textContent=custom?'连接设备并返回起点':'连接设备并回零';
   $('check').disabled = state.running || state.maintenance || sending || !online;
   $('stop').disabled = !state.running || state.stopping || sending || !online;
   $('instruction').disabled = state.phase !== 'instruction' || !can;
@@ -98,7 +122,7 @@ function render() {
   });
   $('zero-confirm').disabled = state.running || state.maintenance || sending || !zeroInspection?.eligible;
   $('zero-repair').disabled = state.running || state.maintenance || sending || !online || !zeroInspection?.eligible || !$('zero-confirm').checked;
-  $('pedal-label').textContent = state.pending ? '操作已发送，请等待' : state.phase === 'instruction' ? '开始本条采集' : state.phase === 'review' ? '保存这一条' : action === 'finish' ? '结束采集并回零' : '请等待当前阶段完成';
+  $('pedal-label').textContent = state.pending ? '操作已发送，请等待' : state.phase === 'instruction' ? '开始本条采集' : state.phase === 'review' ? '保存这一条' : action === 'finish' ? (custom?'结束采集并返回起点':'结束采集并回零') : '请等待当前阶段完成';
   $('connection').textContent = online ? '控制台已连接' : '连接中断，正在重连';
   $('saved-count').textContent = `${state.saved.length} 条`;
   $('saved').replaceChildren();
@@ -301,12 +325,36 @@ function focus() {
 }
 window.addEventListener('focus', focus);
 window.addEventListener('blur', focus);
+$('start-point-mode').onchange=()=>{
+  startPoint.mode=$('start-point-mode').value;
+  if(startPoint.mode==='zero')startPoint={mode:'zero',name:'默认零位',arms:{left:Array(7).fill(0),right:Array(7).fill(0)}};
+  else if(startPoint.name==='默认零位')startPoint.name='自定义起点';
+  renderStartPoint();render();
+};
+$('start-point-name').onchange=()=>{startPoint.name=$('start-point-name').value;};
+$('start-point-refresh').onclick=()=>perform(async()=>{startPoints=(await api('start-points')).points;renderStartSources();});
+$('start-point-import').onclick=()=>perform(async()=>{
+  const point=startPoints[Number($('start-point-source').value)];if(!point)throw new Error('没有可导入的关节记录');
+  startPoint={mode:'custom',name:point.name,arms:{...startPoint.arms,...structuredClone(point.arms)}};
+  renderStartPoint();$('start-point-message').textContent='已导入，核对左右侧角度后点击保存起点。';
+});
+for(const side of ['left','right'])$('start-point-'+side).onclick=()=>perform(async()=>{
+  const result=await api('start-point/capture',{side});
+  startPoint={mode:'custom',name:startPoint.mode==='custom'?startPoint.name:'手动录制起点',arms:{...startPoint.arms,...result.arms}};
+  renderStartPoint();$('start-point-message').textContent='已读取，核对角度后点击保存起点；采集前退出机身示教。';
+});
+$('start-point-save').onclick=()=>perform(async()=>{
+  startPoint=await api('start-point/save',{start_point:startPoint});renderStartPoint();
+  $('start-point-message').textContent=startPoint.mode==='custom'?'起点已保存；每次开始和结束采集，四臂与夹爪都会返回此处。':'已恢复默认零位；保留开始采集前的 J6 ±45° 预摆。';
+});
 async function poll() {
   try {
     if (!configured) {
       const data = await api('bootstrap');
       state = data.status;
       const values = state.running ? state.config : data.defaults;
+      startPoint=values.start_point||startPoint;startPoints=data.start_points||[];
+      renderStartPoint();renderStartSources();
       for (const [key, value] of Object.entries(values))
         if ($('config').elements[key]) $('config').elements[key].value = value;
       configured = true;

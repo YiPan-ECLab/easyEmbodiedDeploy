@@ -16,6 +16,45 @@ from piper_recorder.robot import ArmSample, ArmCommand
 
 
 class RecordingTests(unittest.TestCase):
+    def test_recording_accepts_five_degree_and_five_mm_boundary_overshoot(self):
+        from piper_recorder.dataset import _clip_side_values
+        from piper_recorder.robot import JOINT_LIMITS_RAD
+
+        lower = np.array([pair[0] for pair in JOINT_LIMITS_RAD] + [0.0])
+        upper = np.array([pair[1] for pair in JOINT_LIMITS_RAD] + [0.1])
+        allowance = np.array([np.deg2rad(5.0)] * 6 + [0.005])
+        for label, values, expected in (
+            ("lower", lower - allowance, lower),
+            ("upper", upper + allowance, upper),
+        ):
+            with self.subTest(boundary=label):
+                clipped, count = _clip_side_values(values[None, :], "left state")
+                np.testing.assert_array_equal(clipped[0], expected)
+                self.assertEqual(count, 7)
+
+        # Regression: this actual J6 feedback previously rejected the episode.
+        values = ((lower + upper) / 2)[None, :]
+        values[0, 5] = np.deg2rad(-122.185)
+        clipped, count = _clip_side_values(values, "left state")
+        self.assertEqual(clipped[0, 5], lower[5])
+        self.assertEqual(count, 1)
+        self.assertEqual(values[0, 5], np.deg2rad(-122.185))
+
+    def test_recording_rejects_values_beyond_new_boundary_allowance(self):
+        from piper_recorder.dataset import _clip_side_values
+        from piper_recorder.robot import JOINT_LIMITS_RAD
+
+        lower = np.array([pair[0] for pair in JOINT_LIMITS_RAD] + [0.0])
+        upper = np.array([pair[1] for pair in JOINT_LIMITS_RAD] + [0.1])
+        excess = np.array([np.deg2rad(5.001)] * 6 + [0.005001])
+        for axis in range(7):
+            for boundary, direction in ((lower, -1), (upper, 1)):
+                with self.subTest(axis=axis, direction=direction):
+                    values = ((lower + upper) / 2)[None, :]
+                    values[0, axis] = boundary[axis] + direction * excess[axis]
+                    with self.assertRaisesRegex(ValueError, "超出允许截断范围"):
+                        _clip_side_values(values, "right action")
+
     def operator(self):
         operator = WebOperator.__new__(WebOperator)
         operator.messages = queue.Queue()
