@@ -332,7 +332,7 @@ $('open').onclick = () => run(async () => {
   status('相机已打开。只读位姿连接不会操作机械臂。');
 });
 $('close').onclick = () => run(async () => {
-  await api('close');
+  await api('close', {});
   rig = {
     open: false
   };

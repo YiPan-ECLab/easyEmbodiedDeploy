@@ -93,6 +93,18 @@ async def main():
                 await page.wait_for_function("document.getElementById('sample-count').textContent==='20 个样本'")
                 await page.locator('#open').click()
                 await page.wait_for_function("document.getElementById('rig-status').textContent.includes('已打开')")
+                async with page.expect_response(lambda response: response.url.endswith('/api/close')) as closed:
+                    await page.locator('#close').click()
+                response = await closed.value
+                assert response.request.method == 'POST'
+                assert response.status == 200
+                await page.wait_for_function("document.getElementById('rig-status').textContent==='相机未打开'")
+                assert not server.rig.opened
+                assert await page.locator('#close').is_disabled()
+                assert await page.locator('#preview').is_hidden()
+                await page.locator('#open').click()
+                await page.wait_for_function("document.getElementById('rig-status').textContent.includes('已打开')")
+                assert server.rig.opened
                 await page.locator('#preview-live').uncheck()
                 await page.locator('#sample-purpose').select_option('validation')
                 await page.locator('#still').check()
