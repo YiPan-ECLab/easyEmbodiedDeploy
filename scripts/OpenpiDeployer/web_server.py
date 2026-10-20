@@ -49,7 +49,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "calibration_mount_id": "",
     "pose_start_margin_deg": 2.0,
     "inference_mode": "rtc",
-    "rtc_mode": "guided",
+    "rtc_mode": "trained",
     "rtc_horizon": 20,
     "rtc_queue_threshold": 40,
     "rtc_schedule": "exp",
@@ -61,8 +61,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "bridge_endpoint": DEFAULT_ENDPOINT,
     "task": "Remove the shipping label and place it on the package on the table",
     "device": "cuda:1",
-    "policy_hz": 20.0,
-    "control_hz": 30.0,
+    "policy_hz": 30.0,
+    "control_hz": 150.0,
     "smoothing_time_constant": 0.1,
     # The web console always starts in continuous mode. Set a positive value
     # in the max_steps field when a bounded run is needed.

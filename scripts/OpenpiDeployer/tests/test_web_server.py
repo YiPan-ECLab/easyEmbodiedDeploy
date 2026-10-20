@@ -27,7 +27,7 @@ class WebConsoleConfigurationTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.normal = self._checkpoint("normal", action_mode="delta_joint", rtc_max_delay=0)
         self.trained = self._checkpoint("trained", action_mode="delta_joint", rtc_max_delay=5)
-        self.defaults = {**DEFAULT_CONFIG, "checkpoint": str(self.normal), "action_mode": "delta_joint"}
+        self.defaults = {**DEFAULT_CONFIG, "checkpoint": str(self.normal), "action_mode": "delta_joint", "rtc_mode": "guided"}
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -51,13 +51,16 @@ class WebConsoleConfigurationTest(unittest.TestCase):
         return checkpoint
 
     def test_verified_defaults_build_isolated_openpi_and_current_bridge_commands(self) -> None:
-        config = normalize_config(self.defaults)
+        config = normalize_config({**DEFAULT_CONFIG, "checkpoint": str(self.trained), "action_mode": "delta_joint"})
         bridge, _ = bridge_command(config["bridge_endpoint"])
         deployer, _ = deployment_command(config)
         self.assertIn("thirdParty/.venvs/piper-home/bin/python", bridge[0])
         self.assertIn("scripts/LerobotDeployer/hardware_bridge.py", bridge[1])
         self.assertIn("thirdParty/.venvs/openpi-jax/bin/python", deployer[0])
         self.assertIn("scripts/OpenpiDeployer/OpenpiDeployer.py", deployer[1])
+        self.assertEqual(deployer[deployer.index("--policy-hz") + 1], "30.0")
+        self.assertEqual(deployer[deployer.index("--control-hz") + 1], "150.0")
+        self.assertEqual(deployer[deployer.index("--rtc-mode") + 1], "trained")
         self.assertEqual(deployer[deployer.index("--device") + 1], "cuda:1")
         self.assertEqual(deployer[deployer.index("--sample-steps") + 1], "10")
         self.assertIn("--rtc-mask-grippers", deployer)

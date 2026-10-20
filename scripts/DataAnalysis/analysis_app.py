@@ -225,6 +225,7 @@ def _physical_gap_episodes(report: dict) -> set[int]:
 
 def _update_processing_manifest(bundle: Path, deleted: set[int]) -> None:
     """Keep the converter manifest aligned with the reindexed dataset."""
+    from easy_embodied_deploy.pose_cleaning import episode_sources
     manifest_path = bundle / "processing.json"
     if not manifest_path.is_file():
         return
@@ -233,9 +234,20 @@ def _update_processing_manifest(bundle: Path, deleted: set[int]) -> None:
     if not isinstance(plan, dict) or not isinstance(plan.get("files"), list):
         return
     files = plan["files"]
-    kept = [item for index, item in enumerate(files) if index not in deleted]
+    original_episodes = episode_sources(files)
+    kept = []
+    episode_offset = 0
+    for item in files:
+        segments = episode_sources([item])
+        remaining = [segment for index, segment in enumerate(segments, episode_offset) if index not in deleted]
+        episode_offset += len(segments)
+        if remaining:
+            if item.get("pose_cleaning"):
+                item = {**item, "retained_clean_segments": [segment["clean_segment_number"] for segment in remaining],
+                        "output_frames": sum(segment["output_frames"] for segment in remaining)}
+            kept.append(item)
     plan["files"] = kept
-    plan["episodes"] = len(kept)
+    plan["episodes"] = len(episode_sources(kept))
     plan["input_frames"] = int(sum(int(item.get("frames", 0)) for item in kept))
     plan["output_frames"] = int(sum(int(item.get("output_frames", 0)) for item in kept))
     plan["gaps"] = int(sum(int(item.get("gaps", 0)) for item in kept))
@@ -245,7 +257,7 @@ def _update_processing_manifest(bundle: Path, deleted: set[int]) -> None:
     ]
     manifest["deleted_episodes"] = sorted(deleted)
     manifest["episode_index_mapping"] = {
-        str(old): new for new, old in enumerate(index for index in range(len(files)) if index not in deleted)
+        str(old): new for new, old in enumerate(index for index in range(len(original_episodes)) if index not in deleted)
     }
     temporary = manifest_path.with_name(f".{manifest_path.name}.tmp")
     temporary.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")

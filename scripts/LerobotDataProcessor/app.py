@@ -96,6 +96,8 @@ def settings_from(payload: dict) -> Settings:
         calibration_bundle=payload.get("calibration_bundle") or None,
         calibration_mount_id=str(payload.get("calibration_mount_id") or "").strip(),
         timing_overrides=payload.get("timing_overrides") or {},
+        pose_singularity_filter=payload.get("pose_singularity_filter", False),
+        pose_singularity_threshold=payload.get("pose_singularity_threshold", .01),
     )
 
 
@@ -212,6 +214,8 @@ class Handler(LocalHandlerMixin, BaseHTTPRequestHandler):
                     "gap_policy": DEFAULT_GAP_POLICY,
                     "limit": DEFAULT_LIMIT,
                     "action_modes": list(ACTION_MODES),
+                    "pose_singularity_filter": False,
+                    "pose_singularity_threshold": .01,
                     "gap_policies": list(GAP_POLICIES),
                 }
             )

@@ -28,6 +28,7 @@ class WebConsoleConfigurationTest(unittest.TestCase):
         config = {
             "type": "pi05",
             "chunk_size": 50,
+            "rtc_training_max_delay": 5,
             "input_features": {
                 "observation.state": {"type": "STATE", "shape": [14]},
                 **{
@@ -62,8 +63,9 @@ class WebConsoleConfigurationTest(unittest.TestCase):
         self.assertEqual(bridge.count("--endpoint"), 1)
         self.assertNotIn("--control-hz", bridge)
         self.assertNotIn("--smoothing-time-constant", bridge)
-        self.assertEqual(deployer[deployer.index("--policy-hz") + 1], "10.0")
-        self.assertEqual(deployer[deployer.index("--control-hz") + 1], "30.0")
+        self.assertEqual(deployer[deployer.index("--policy-hz") + 1], "30.0")
+        self.assertEqual(deployer[deployer.index("--control-hz") + 1], "150.0")
+        self.assertEqual(deployer[deployer.index("--rtc-mode") + 1], "trained")
         self.assertEqual(deployer[deployer.index("--device") + 1], "cuda:0")
         self.assertEqual(deployer[deployer.index("--max-steps") + 1], "0")
         self.assertEqual(

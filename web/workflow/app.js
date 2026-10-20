@@ -5,6 +5,7 @@ const uid = () => crypto.randomUUID().replaceAll('-', '');
 let plan, savedId = null, selected = 0, live = {}, editingPoint = null, frozen = null, pixel = null, dirty = false, toastTimer, previewTimer;
 let compatible = false, actionError = "", libraryRevision = -1, polling = false;
 let editingModel=null, addModelAfterSave=false, gpus=[];
+let armDiagnosis=null, shownRecovery=null;
 const sideName = {left:'左从臂',right:'右从臂'};
 const modeNames = {absolute_joint:'绝对关节角',delta_joint:'增量关节角',absolute_base_pose:'绝对末端位姿',camera_delta_wrist:'腕部相机增量位姿',camera_delta_global:'全局相机增量位姿'};
 async function api(path, body) {
@@ -14,6 +15,19 @@ async function api(path, body) {
   return result;
 }
 function toast(message, error=false) { $('toast').textContent=message; $('toast').classList.toggle('error',error); $('toast').hidden=false; clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('toast').hidden=true,6000); }
+function renderArmDiagnosis(diagnosis) {
+  armDiagnosis=diagnosis;
+  $('arm-support-row').hidden=diagnosis.arm_status!==1;
+  $('arm-diagnosis').innerHTML=`<p>${esc(diagnosis.summary)}</p><table><thead><tr><th>关节</th><th>当前角度</th><th>恢复目标</th><th>驱动状态</th></tr></thead><tbody>${diagnosis.drivers.map((d,i)=>`<tr><td>J${d.joint}</td><td>${diagnosis.joints_deg[i].toFixed(2)}°</td><td>${diagnosis.target_deg[i].toFixed(2)}°</td><td>0x${d.code.toString(16).toUpperCase().padStart(2,'0')} · ${esc(d.faults.length?d.faults.join('、'):d.enabled?'已使能':'失能')}</td></tr>`).join('')}</tbody></table>${diagnosis.reasons.length?`<p class="error">${diagnosis.reasons.map(esc).join('；')}</p>`:''}`;
+  $('arm-restore').disabled=!diagnosis.eligible||!!live.busy||(diagnosis.arm_status===1&&!$('arm-support').checked);
+}
+async function diagnoseArm() {
+  armDiagnosis=null;$('arm-restore').disabled=true;
+  $('arm-support').checked=false;$('arm-support-row').hidden=true;
+  $('arm-diagnosis').textContent='正在读取控制器与六轴驱动反馈…';
+  try {renderArmDiagnosis(await api('arm/diagnose',{side:$('arm-side').value}));}
+  catch(error){$('arm-diagnosis').textContent=error.message;throw error;}
+}
 const act = fn => async event => {
   const button=event?.currentTarget?.tagName==='BUTTON'?event.currentTarget:null;
   if(button)button.disabled=true;
@@ -250,13 +264,20 @@ function renderState(state) {
   if(state.connected)$('connection-mode').value=state.simulated?'simulation':'physical';
   for(const id of ['left-channel','right-channel'])$(id).disabled=state.connected;
   $('disconnect').disabled=!state.connected||state.busy;
+  const maintenance=compatible&&state.connected&&!state.simulated&&!state.busy;
+  $('arm-diagnose').disabled=!maintenance;
+  $('arm-refresh').disabled=!maintenance;$('arm-side').disabled=!maintenance;
+  $('arm-restore').disabled=!maintenance||!armDiagnosis?.eligible||(armDiagnosis?.arm_status===1&&!$('arm-support').checked);
+  if(state.recovery_result&&JSON.stringify(state.recovery_result)!==shownRecovery&&$('arm-dialog').open&&state.recovery_result.side===$('arm-side').value){
+    shownRecovery=JSON.stringify(state.recovery_result);renderArmDiagnosis({...state.recovery_result.after,summary:state.recovery_result.detail});
+  }
   for(const id of ['capture','teach','home','recover','telemetry','update-feedback'])$(id).disabled=!available;
   $('capture-side').disabled=!!state.teaching||!!state.busy;
   for(const id of ['run','run-from'])$(id).disabled=!available||!plan?.steps.length;
-  $('pause').disabled=!state.busy||state.state==='paused'||['home','preparing'].includes(state.operation);
+  $('pause').disabled=!state.busy||state.state==='paused'||['home','preparing','recovery'].includes(state.operation);
   $('pause').hidden=state.state==='paused';$('resume').hidden=state.state!=='paused';
   $('resume').disabled=state.state!=='paused';
-  $('next').hidden=!state.busy||['home','preparing'].includes(state.operation)||!['vla','wait'].includes(state.step_type);
+  $('next').hidden=!state.busy||['home','preparing','recovery'].includes(state.operation)||!['vla','wait'].includes(state.step_type);
   $('stop').disabled=!state.busy;$('emergency').disabled=!state.connected;
   $('preload').disabled=!compatible||state.busy;$('unload').disabled=!compatible||state.busy;
   $('inline-error').textContent=actionError||state.error||'';$('inline-error').hidden=!$('inline-error').textContent;
@@ -358,7 +379,7 @@ async function poll() {
 }
 function triple(id) {const a=$(id).value.split(/[,，\s]+/).filter(Boolean).map(Number);if(a.length!==3||a.some(x=>!Number.isFinite(x)))throw new Error('XYZ 偏移须为 3 个数值');return a.map(v=>v/1000);}
 async function init() {
-  const boot=await api('bootstrap');compatible=boot.api_version===7;$('version-notice').hidden=compatible;plan=boot.plan;libraryRevision=boot.library?.revision??-1;renderSaved(boot.workflows);
+  const boot=await api('bootstrap');compatible=boot.api_version===8;$('version-notice').hidden=compatible;plan=boot.plan;libraryRevision=boot.library?.revision??-1;renderSaved(boot.workflows);
   const draft=localStorage.getItem('workflowDraft');if(draft){try{const parsed=JSON.parse(draft);const used=[];for(const step of parsed.plan.steps||[]){if(step.type==='vla'){step.name=uniqueName((step.name||'VLA').trim()||'VLA',used);used.push(step);}}plan=await api('validate',{plan:parsed.plan});savedId=parsed.savedId;dirty=true;$('dirty').textContent='已恢复本地草稿';}catch{toast('旧草稿无法恢复，已新建工作流',true);}}
   for(const [role,serial] of Object.entries(boot.serials)) $(`serial-${role}`).value=serial;
   $('calibrations').innerHTML=boot.calibrations.map(p=>`<option value="${esc(p)}"></option>`).join('');if(boot.calibrations.length)$('calibration').value=boot.calibrations.at(-1);
@@ -379,6 +400,12 @@ async function init() {
   $('recover').onclick=act(async()=>{
     renderState(await api('recover',{}));
   });
+  $('arm-diagnose').onclick=act(async()=>{shownRecovery=JSON.stringify(live.recovery_result);$('arm-dialog').showModal();await diagnoseArm();});
+  $('arm-refresh').onclick=act(diagnoseArm);
+  $('arm-side').onchange=act(diagnoseArm);
+  $('arm-support').onchange=()=>renderState(live);
+  $('arm-close').onclick=()=>$('arm-dialog').close();
+  $('arm-restore').onclick=act(async()=>{armDiagnosis=null;renderState(await api('arm/restore',{side:$('arm-side').value,support_confirmed:$('arm-support').checked}));$('arm-diagnosis').textContent='恢复中，请观察所选从臂；可关闭此窗口后点击停止或急停。';});
   $('go-flow').onclick=()=>tab('flow');
   $('telemetry').onclick=act(async()=>{const s=await api('telemetry');$('feedback').textContent=['left','right'].map((side,i)=>`${sideName[side]} J1–J6：${s.joints.slice(i*7,i*7+6).map(v=>(v*180/Math.PI).toFixed(1)).join(' / ')}°，夹爪 ${(s.joints[i*7+6]*1000).toFixed(1)} mm`).join('  ｜  ');});
   $('capture').onclick=act(async()=>{mergePoint(await api('capture',{name:$('capture-name').value.trim()||uniqueName('关键点',plan.points),side:$('capture-side').value,space:$('capture-space').value}));$('capture-name').value='';toast('已录制并保存；可继续拖动录下一个点');});

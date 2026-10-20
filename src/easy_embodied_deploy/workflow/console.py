@@ -50,7 +50,7 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
             if parsed.path == "/api/bootstrap":
                 calibrations = [str(p) for p in (ROOT / "datasets/calibration").glob("*/calibration_bundle.json")]
                 resources = self.server.store.snapshot()
-                self.send(dict(api_version=7, plan=self.server.store.resolve(new_plan()), workflows=self.server.store.listing(),
+                self.send(dict(api_version=8, plan=self.server.store.resolve(new_plan()), workflows=self.server.store.listing(),
                                library=resources, points=resources['points'], models=resources['models'],
                                calibrations=calibrations, serials=DEFAULT_SERIALS, state=controller.snapshot()))
             elif parsed.path == "/api/library":
@@ -128,6 +128,12 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
                     self.send(controller.snapshot())
                 elif route == "/api/recover":
                     controller.recover()
+                    self.send(controller.snapshot())
+                elif route == "/api/arm/diagnose":
+                    self.send(controller.diagnose_arm(body.get('side', 'right')))
+                elif route == "/api/arm/restore":
+                    controller.restore_arm(body.get('side', 'right'),
+                        support_confirmed=boolean(body.get('support_confirmed', False), '已托稳从臂'))
                     self.send(controller.snapshot())
                 elif route == "/api/capture":
                     point = controller.capture(body.get("name", "录制点"), body.get("side", "both"), body.get("space", "joint"))

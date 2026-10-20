@@ -422,10 +422,8 @@ async function safeStop() {
 async function bootstrap() {
   try {
     const payload = await request("api/bootstrap");
-    // Continuous execution is the only Web-console preset. Keep this
-    // explicit so a long-running server process with an older in-memory
-    // default cannot restore a bounded run after a page refresh.
-    app.defaults = { ...payload.defaults, max_steps: 0 };
+    // Mirror web presets so refreshing also works with an older server process.
+    app.defaults = { ...payload.defaults, max_steps: 0, policy_hz: 30, control_hz: 150, rtc_mode: "trained" };
     app.checkpoints = payload.checkpoints || [];
     populateOptions();
     const device = populateDevices(payload.status.gpu || [], app.defaults.device);

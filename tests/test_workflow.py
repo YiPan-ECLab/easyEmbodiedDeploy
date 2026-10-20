@@ -149,6 +149,7 @@ class HardwareAdapterTests(unittest.TestCase):
         rig = PiperHardware.__new__(PiperHardware)
         rig.lock = __import__('threading').RLock()
         rig.resources = ExitStack(); rig.teaching = rig.emergency = False
+        rig.closed = False
         rig.teaching_sides, rig.armed_sides = set(), set()
         rig.channels = dict(left='piper-lo', right='piper-ro')
         rig.arms = {s: Arm(s) for s in ('left', 'right')}

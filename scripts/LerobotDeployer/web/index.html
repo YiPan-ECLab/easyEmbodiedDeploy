@@ -134,7 +134,7 @@
                 <span>RTC 模式</span>
                 <select id="rtc_mode" name="rtc_mode">
                   <option value="guided">Guided</option>
-                  <option value="trained">Trained</option>
+                  <option value="trained" selected>Trained</option>
                 </select>
               </label>
               <label class="field rtc-field">
@@ -151,12 +151,12 @@
               <div class="section-title"><span>03</span><h3>动作与底层控制</h3></div>
               <label class="field featured-field">
                 <span>Policy Hz <b title="从模型 action queue 取得新动作的频率">?</b></span>
-                <div class="number-control"><input id="policy_hz" name="policy_hz" type="number" min="0.001" max="200" step="1"><i>Hz</i></div>
+                <div class="number-control"><input id="policy_hz" name="policy_hz" type="number" value="30" min="0.001" max="200" step="1"><i>Hz</i></div>
                 <small>新模型动作消费频率</small>
               </label>
               <label class="field featured-field">
                 <span>Control Hz <b title="向每个 follower 发送 move_js 目标的频率">?</b></span>
-                <div class="number-control"><input id="control_hz" name="control_hz" type="number" min="1" max="200" step="1"><i>Hz</i></div>
+                <div class="number-control"><input id="control_hz" name="control_hz" type="number" value="150" min="1" max="200" step="1"><i>Hz</i></div>
                 <small><span data-motion-label>move_js</span> 实际发送频率</small>
               </label>
               <label class="field featured-field">

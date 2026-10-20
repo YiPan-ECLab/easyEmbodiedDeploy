@@ -25,6 +25,7 @@ from easy_embodied_deploy.pose_dataset import PoseDataset, compute_chunk_statist
 from easy_embodied_deploy.pose_conversion import read_raw_poses, validate_pose_bundle
 from easy_embodied_deploy.joint_diagnostics import joint_label_metrics
 from easy_embodied_deploy.pose_quality import analyze_poses, PoseThresholds
+from easy_embodied_deploy.pose_cleaning import clean_pose_indices, episode_sources
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 AXES = [
     f"{side}_{axis}"
@@ -274,7 +275,7 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
             errors.append("位姿统计包含填充帧或缺少未来目标")
         statistics["pose_chunk"] = {**verification["metrics"], "valid_targets": recomputed["count"][0]}
 
-    expected_tasks = [f.get("task", settings.get("task") or None) for f in plan.get("files", [])] or None
+    expected_tasks = [f.get("task", settings.get("task") or None) for f in episode_sources(plan.get("files", []))] or None
     task_errors, _ = validate_tasks(root, info, task_index, episode, expected_tasks)
     errors.extend(task_errors)
 
@@ -351,7 +352,7 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
     source_metrics = None
     source_raw = settings.get("input_dirs") or settings.get("input_dir") or plan.get("input_dirs") or plan.get("input_dir")
     if source_raw:
-        plan_files = plan.get("files", [])
+        plan_files = episode_sources(plan.get("files", []))
         source_files, source_dirs = source_paths(source_raw, plan_files, source_override)
         if len(source_files) != total_episodes:
             errors.append(f"源 HDF5 数量 {len(source_files)} 与 episode 数 {total_episodes} 不一致")
@@ -376,6 +377,13 @@ def _analyze(raw: str, source_override: str | None, pose_thresholds=None) -> dic
                         continue
                     stride = 1 if fused else source_fps // fps
                     selected, idle = source_indices(demo, stride, pose=pose_data is not None)
+                    if "clean_segment" in file_plan:
+                        _, cleaning = clean_pose_indices(np.asarray(demo["states"]), selected,
+                            file_plan["pose_cleaning"]["threshold"])
+                        if cleaning["selection_spans"] != file_plan["pose_cleaning"]["selection_spans"]:
+                            errors.append(f"episode {ep}: 奇异清洗分段与源数据重算不一致")
+                        first, stop = file_plan["clean_segment"]
+                        selected = selected[first:stop]
                     trimmed_idle += idle
                     raw_actions = np.asarray(demo["actions"][selected], dtype=np.float32)
                     if len(raw_actions) > 1:

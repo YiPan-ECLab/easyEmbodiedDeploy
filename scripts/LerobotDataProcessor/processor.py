@@ -28,6 +28,7 @@ from easy_embodied_deploy.statistics import statistics_close
 from easy_embodied_deploy.action_contract import ACTION_MODES, POSE_MODES, action_axes, read_pose_contract
 from easy_embodied_deploy.trajectory_files import revision, hold_trajectories
 from easy_embodied_deploy.task_metadata import validate_tasks
+from easy_embodied_deploy.pose_cleaning import clean_pose_indices, episode_sources, DEFAULT_SINGULARITY_RATIO
 CAMERAS = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 AXES = [f"{side}_{axis}" for side in ("left", "right")
         for axis in ("j1", "j2", "j3", "j4", "j5", "j6", "gripper")]
@@ -116,6 +117,8 @@ class Settings:
     calibration_mount_id: str = ""
     timing_overrides: dict[str, str] | None = None
     task_source: str = "hdf5"
+    pose_singularity_filter: bool = False
+    pose_singularity_threshold: float = DEFAULT_SINGULARITY_RATIO
 
 
 def canonical_action_mode(value: str) -> str:
@@ -124,6 +127,12 @@ def canonical_action_mode(value: str) -> str:
 
 
 def canonical_settings(settings: Settings) -> Settings:
+    if not isinstance(settings.pose_singularity_filter, bool):
+        raise ValueError("位姿奇异清洗开关必须为布尔值")
+    cleaning_enabled = settings.pose_singularity_filter and settings.action_mode in POSE_MODES
+    threshold = settings.pose_singularity_threshold if cleaning_enabled else DEFAULT_SINGULARITY_RATIO
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not np.isfinite(threshold) or not 0 < threshold < 1:
+        raise ValueError("奇异比值阈值须在 0 与 1 之间")
     if settings.task_source not in ("hdf5", "override"):
         raise ValueError("任务指令来源须为 hdf5 或 override")
     if not isinstance(settings.task, str):
@@ -152,6 +161,8 @@ def canonical_settings(settings: Settings) -> Settings:
         input_dir=dirs[0],
         input_dirs=dirs,
         action_mode=canonical_action_mode(settings.action_mode),
+        pose_singularity_filter=cleaning_enabled,
+        pose_singularity_threshold=threshold,
     )
 
 
@@ -418,6 +429,12 @@ def inspect_file(path: Path, settings: Settings) -> dict:
                 f"task 段 {gap_count} 个采样间隔异常将被映射到固定 {settings.target_fps} Hz；"
                 f"最大间隔 {max_gap:.3f}s，跨异常间隔动作 {max_gap_action:.4f} rad L2"
             )
+        cleaning = None
+        if settings.pose_singularity_filter:
+            _, cleaning = clean_pose_indices(arrays["states"], selected, settings.pose_singularity_threshold)
+            output_frames = cleaning["output_frames"]
+            warnings.append(f"位姿奇异清洗：过滤 {cleaning['removed_singular_frames']} / {sampled_frames} 个采样帧，"
+                            f"孤立帧 {cleaning['isolated_frames']}，生成 {cleaning['output_episodes']} 条 episode；不跨删除区间拼接")
         info = dict(name=path.name, path=str(path.resolve()), revision=source_revision,
                     task=task, task_source=task_source,
                     errors=[], timing_errors=timing_errors, timing_ignored=bool(approved and timing_errors),
@@ -432,6 +449,8 @@ def inspect_file(path: Path, settings: Settings) -> dict:
                     camera_shapes=shapes, max_camera_skew_s=max_camera_skew,
                     gaps=gap_count, max_gap_s=round(max_gap, 6),
                     max_gap_action_joint_l2=round(max_gap_action, 6), warnings=warnings)
+        if cleaning is not None:
+            info["pose_cleaning"] = cleaning
         if revision(path) != source_revision:
             raise ValueError("检查期间文件已变化，请重新检查")
         if timing_errors and not approved:
@@ -500,7 +519,8 @@ def scan(settings: Settings, *, collect_errors: bool = False) -> dict:
                 item["can_ignore_timing"] = False
     source_label = sources[0].name if len(sources) == 1 else f"{sources[0].name}_merged"
     frequency_label = "mixed" if any(item.get("temporal_fusion") or item.get("timing_ignored") for item in files) else f"{settings.target_fps}hz"
-    default_out = Path("datasets/lerobot") / f"{source_label}_{frequency_label}_{settings.action_mode}"
+    suffix = "_cleaned" if settings.pose_singularity_filter else ""
+    default_out = Path("datasets/lerobot") / f"{source_label}_{frequency_label}_{settings.action_mode}{suffix}"
     out = resolve_path(settings.output_root or default_out)
     if any(out == source or out in source.parents or source in out.parents for source in sources):
         raise ValueError("输出目录必须与输入目录分开，不能互相包含")
@@ -511,7 +531,11 @@ def scan(settings: Settings, *, collect_errors: bool = False) -> dict:
                 tasks=list(dict.fromkeys(x["task"] for x in files if x.get("task"))),
                 errors=[f"{x['name']}: {error}" for x in files for error in x.get("errors", [])],
                 invalid_files=sum(bool(x.get("errors")) for x in files),
-                episodes=len(files), input_frames=sum(x["frames"] for x in files),
+                episodes=len(episode_sources(files)), input_frames=sum(x["frames"] for x in files),
+                pose_cleaning=({"enabled": True, "threshold": settings.pose_singularity_threshold,
+                    **{key: sum(x.get("pose_cleaning", {}).get(key, 0) for x in files)
+                       for key in ("candidate_frames", "removed_singular_frames", "isolated_frames", "retained_source_frames")}}
+                    if settings.pose_singularity_filter else None),
                 output_frames=sum(x["output_frames"] for x in files),
                 gaps=sum(x["gaps"] for x in files),
                 warnings=warnings,
@@ -798,6 +822,8 @@ def _run(settings: Settings, progress: Callable[[dict], None] | None = None,
     checkpoint()
     plan = prepared_plan if prepared_plan is not None else scan(settings)
     output = resolve_path(plan["output_root"])
+    if plan["episodes"] == 0 or plan["output_frames"] == 0:
+        raise ValueError("清洗后没有至少两帧的可用片段，请降低奇异阈值或关闭清洗")
     if output.exists():
         raise FileExistsError(f"输出目录已存在，请换一个新目录：{output}")
     # Never overwrite existing output, including an empty directory.
@@ -832,7 +858,7 @@ def _run(settings: Settings, progress: Callable[[dict], None] | None = None,
                                            settings.action_mode, settings.calibration_mount_id)
             sampling_fps = plan["sampling_fps"]
             pose_contract = new_contract(settings.action_mode, sampling_fps, calibration, settings.calibration_mount_id)
-        for index, info in enumerate(plan["files"]):
+        for index, info in enumerate(episode_sources(plan["files"])):
             checkpoint()
             source_dir = resolve_path(info.get("source_dir") or plan["input_dir"])
             with h5py.File(source_dir / info["name"], "r") as f:
@@ -841,6 +867,9 @@ def _run(settings: Settings, progress: Callable[[dict], None] | None = None,
                 # A bounded contiguous read block is held while frames are sent
                 # to LeRobot's asynchronous image writer.
                 selected, _, _ = _task_sample_indices(demo, info["stride"], pose=settings.action_mode in POSE_MODES)
+                if "clean_segment" in info:
+                    first, stop = info["clean_segment"]
+                    selected = selected[first:stop]
                 raw_actions = np.asarray(demo["actions"][selected], dtype=np.float32)
                 if pose_contract is not None:
                     from easy_embodied_deploy.pose_conversion import convert_episode
@@ -919,7 +948,7 @@ def _run(settings: Settings, progress: Callable[[dict], None] | None = None,
         validation = validate_lerobot_bundle(
             output / "lerobot",
             expected={"action_mode": settings.action_mode,
-                      "episode_tasks": [f["task"] for f in plan["files"]],
+                      "episode_tasks": [f["task"] for f in episode_sources(plan["files"])],
                       "total_frames": plan["output_frames"], "episodes": plan["episodes"]},
         )
         manifest["validation"] = validation

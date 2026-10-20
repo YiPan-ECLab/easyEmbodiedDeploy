@@ -86,6 +86,7 @@ class WorkflowController:
         self.operation = None
         self.pending_unloads = set()
         self.unload_thread = None
+        self.recovery_result = None
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
@@ -107,6 +108,7 @@ class WorkflowController:
                           emergency=bool(self.hardware and self.hardware.emergency), operation=self.operation,
                           joint_limits=(self.hardware.limits.tolist() if self.hardware and not self.hardware.simulated else None),
                           busy=self.busy(), verification=self.last_verification, events=list(self.events),
+                          recovery_result=self.recovery_result,
                           pending_unloads=sorted(self.pending_unloads))
             if self.plan and 0 <= self.status["step"] < len(self.plan["steps"]):
                 step = self.plan["steps"][self.status["step"]]
@@ -139,7 +141,7 @@ class WorkflowController:
                     self.hardware = None
             self.operation = None
             self.last_verification = None
-            self.update(state="idle", step=-1, progress=0, error=None, detail="已断开设备")
+            self.update(state="idle", step=-1, progress=0, error=None, detail="已断开从臂和相机，设备资源已释放")
 
     def teach(self, enabled, side="both"):
         with self.lock:
@@ -187,6 +189,46 @@ class WorkflowController:
                         detail="双从臂平滑回零中；可随时停止或急停")
             self.thread = threading.Thread(target=self._home, args=(close_grippers,), daemon=True)
             self.thread.start()
+
+    def diagnose_arm(self, side):
+        with self.lock:
+            if self.busy() or not self.hardware:
+                raise ValueError("请先连接从臂并停止执行；连接本身不会使能或回零")
+            if self.hardware.simulated:
+                raise ValueError("从臂诊断用于真实硬件，请切换到真实从臂")
+            return self.hardware.diagnose(side)
+
+    def restore_arm(self, side, *, support_confirmed=False):
+        with self.lock:
+            diagnosis = self.diagnose_arm(side)
+            if not diagnosis['eligible']:
+                raise ValueError('不能自动恢复：'+'；'.join(diagnosis['reasons']))
+            if diagnosis['arm_status'] == 1 and not support_confirmed:
+                raise ValueError('急停复位会短暂失能，请先托稳从臂并勾选确认')
+            self.operation = 'recovery'
+            self.recovery_result = None
+            self.stop_event.clear()
+            self.paused.clear()
+            self.update(state='running', step=-1, progress=0, error=None,
+                        detail=f'{side} 从臂恢复中：低速保持/修正限位，不重新标零')
+            self.thread = threading.Thread(target=self._restore_arm, args=(side, support_confirmed), daemon=True)
+            self.thread.start()
+
+    def _restore_arm(self, side, support_confirmed):
+        try:
+            result = self.hardware.restore(side, self._check, support_confirmed=support_confirmed)
+            self._check()
+            self.recovery_result = result
+            self.last_verification = None
+            self.update(state='idle', progress=1, detail=result['detail'], error=None)
+            self.event(f'{side} 从臂恢复成功；未重新标零')
+        except InterruptedError:
+            if self.status['state'] != 'emergency':
+                self.update(state='stopped', detail='已中止从臂恢复，未发送回零指令')
+        except Exception as exc:
+            if self.status['state'] != 'emergency':
+                self.update(state='failed', error=str(exc), detail=f'从臂恢复失败：{exc}')
+            self.event(f'{side} 从臂恢复失败：{exc}')
 
     def _home(self, close_grippers):
         try:

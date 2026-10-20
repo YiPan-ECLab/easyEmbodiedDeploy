@@ -60,6 +60,8 @@ function formPayload() {
     source_fps: $("sourceFps").value ? Number($("sourceFps").value) : null,
     target_fps: Number($("targetFps").value),
     action_mode: checked("actionMode"),
+    pose_singularity_filter: !checked("actionMode").endsWith("_joint") && $("poseSingularityFilter").checked,
+    pose_singularity_threshold: Number($("poseSingularityThreshold").value),
     calibration_bundle: $("calibrationBundle").value.trim(),
     calibration_mount_id: $("calibrationMountId").value.trim(),
     gap_policy: checked("gapPolicy"),
@@ -80,6 +82,8 @@ function updateCommand() {
   const cameraPose = value.action_mode.startsWith("camera_delta_");
   const pose = cameraPose || value.action_mode === "absolute_base_pose";
   document.querySelectorAll("[data-camera-pose]").forEach(el => { el.hidden = !cameraPose; });
+  document.querySelectorAll("[data-pose-cleaning]").forEach(el => { el.hidden = !pose; });
+  $("poseSingularityThreshold").disabled = ui.locked || !value.pose_singularity_filter;
   const compact = document.querySelector('input[name="gapPolicy"][value="compact"]');
   compact.disabled = ui.locked || pose;
   if (pose) { document.querySelector('input[name="gapPolicy"][value="reject"]').checked = true; value.gap_policy = "reject"; }
@@ -100,6 +104,7 @@ function updateCommand() {
   if(value.task)parts.push(`  --task ${shellQuote(value.task)} \\`);
   if (value.source_fps) parts.push(`  --source-fps ${value.source_fps} \\`);
   parts.push(`  --fps ${value.target_fps} --action-mode ${value.action_mode} \\`);
+  if (value.pose_singularity_filter) parts.push(`  --pose-singularity-filter --pose-singularity-threshold ${value.pose_singularity_threshold} \\`);
   parts.push(`  --gap-policy ${value.gap_policy}${value.limit ? ` --limit ${value.limit}` : ""}`);
   for (const [path, revision] of Object.entries(value.timing_overrides)) {
     parts[parts.length - 1] += " \\";
@@ -142,6 +147,7 @@ function invalidatePlan() {
   ui.timingOverrides = {};
   $("inspectButton").disabled = false;
   ui.plan = null;
+  $("cleaningSummary").classList.add("hidden");
   $("metricQuality").textContent = "需重新检查";
   $("metricQualityMeta").textContent = "配置已修改";
   $("stepInspect").className = "";
@@ -164,6 +170,9 @@ function renderPlan(plan) {
   const warnings = $("warningBox");
   warnings.classList.toggle("hidden", !plan.warnings.length && !plan.errors?.length);
   warnings.textContent = [...(plan.errors || []), ...plan.warnings].join("\n");
+  const cleaning = plan.pose_cleaning;
+  $("cleaningSummary").classList.toggle("hidden", !cleaning);
+  $("cleaningSummary").textContent = cleaning ? `位姿清洗 · 候选 ${formatNumber(cleaning.candidate_frames)} 帧 · 奇异过滤 ${formatNumber(cleaning.removed_singular_frames)} 帧 · 孤立帧 ${formatNumber(cleaning.isolated_frames)} · 保留 ${formatNumber(cleaning.retained_source_frames)} 个源帧 → ${formatNumber(plan.episodes)} 条 episode / ${formatNumber(plan.output_frames)} 条训练样本（每段末帧仅作为最后动作的目标）` : "";
   renderFileTable();
 }
 
@@ -243,7 +252,8 @@ async function inspectInput(showMessage = true) {
     });
     if (token !== ui.inspectionToken) throw new Error("配置已变化，请重新检查");
     renderPlan(plan);
-    $("runNote").textContent = plan.invalid_files ? `有 ${plan.invalid_files} 条轨迹未通过，请查看下方具体问题。` : plan.warnings.length
+    $("runNote").textContent = plan.invalid_files ? `有 ${plan.invalid_files} 条轨迹未通过，请查看下方具体问题。` : !plan.output_frames
+      ? "清洗后没有可用片段，请降低阈值或关闭清洗后重新检查。" : plan.warnings.length
       ? `检查完成，发现 ${plan.warnings.length} 条警告。`
       : "检查通过，可以开始转换。";
     if (showMessage) toast(`检查完成：${plan.episodes} 条，${plan.invalid_files || 0} 条未通过`, !!plan.invalid_files);
@@ -349,6 +359,7 @@ async function startConversion() {
     // notices such as preserving an intentionally fused sequence.
     const plan = await inspectInput(false);
     if (plan.invalid_files) throw new Error("请先处理下方轨迹错误，或人工确认允许对应的时序异常");
+    if (!plan.output_frames) throw new Error("清洗后没有可用片段，请降低阈值或关闭清洗");
     const response = await request("api/start", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(formPayload()),
@@ -394,6 +405,8 @@ async function loadDefaults() {
   $("targetFps").value = ui.defaults.target_fps;
   $("repoId").value = ui.defaults.repo_id || "";
   $("limit").value = ui.defaults.limit;
+  $("poseSingularityFilter").checked = ui.defaults.pose_singularity_filter || false;
+  $("poseSingularityThreshold").value = ui.defaults.pose_singularity_threshold ?? .01;
   document.querySelector(`input[name="actionMode"][value="${ui.defaults.action_mode}"]`).checked = true;
   document.querySelector(`input[name="gapPolicy"][value="${ui.defaults.gap_policy}"]`).checked = true;
   updateCommand();

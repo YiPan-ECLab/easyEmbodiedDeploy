@@ -138,10 +138,23 @@ class DepthCamera:
     """Orbbec SDK software D2C, with RGB and depth from the same frameset."""
 
     def __init__(self, role, serial, context):
-        from pyorbbecsdk import (Pipeline, Config, OBSensorType, OBFormat,
-                                OBFrameAggregateOutputMode, AlignFilter, OBStreamType)
+        from piper_recorder.camera_errors import camera_start_error
         self.stop_event, self.lock = threading.Event(), threading.Lock()
         self.latest, self.error = None, None
+        self.pipeline = self.thread = self.align = None
+        try:
+            self._open(role, serial, context)
+        except Exception as exc:
+            failure = camera_start_error(role, serial, exc)
+            try:
+                self.close()
+            except Exception as cleanup:
+                failure = RuntimeError(f'{failure}；启动失败后的相机清理异常：{cleanup}')
+            raise failure from exc
+
+    def _open(self, role, serial, context):
+        from pyorbbecsdk import (Pipeline, Config, OBSensorType, OBFormat,
+                                OBFrameAggregateOutputMode, AlignFilter, OBStreamType)
         device = context.query_devices().get_device_by_serial_number(serial)
         if device is None:
             raise ValueError(f"未找到相机 {role} / {serial}")
@@ -180,7 +193,8 @@ class DepthCamera:
                 with self.lock:
                     self.latest = (rgb, z, time.monotonic())
         except Exception as exc:
-            self.error = exc
+            if not self.stop_event.is_set():
+                self.error = exc
 
     def read(self):
         with self.lock:
@@ -192,8 +206,21 @@ class DepthCamera:
 
     def close(self):
         self.stop_event.set()
-        self.thread.join(2)
-        self.pipeline.stop()
+        error = None
+        if self.pipeline is not None:
+            try:
+                self.pipeline.stop()
+            except Exception as exc:
+                error = exc
+        if self.thread is not None:
+            self.thread.join(2)
+            if self.thread.is_alive():
+                raise RuntimeError('深度相机采集线程未退出，设备尚未完全释放')
+        # Release SDK handles explicitly, not when cyclic GC eventually runs.
+        self.thread = self.pipeline = self.align = None
+        self.latest = self.error = None
+        if error is not None:
+            raise RuntimeError(f'深度相机停止流失败：{error}') from error
 
 
 class PiperHardware:
@@ -203,6 +230,7 @@ class PiperHardware:
         self.lock = threading.RLock()
         self.resources = ExitStack()
         self.arms, self.grippers, self.cameras = {}, {}, {}
+        self.closed = False
         self.teaching = self.emergency = False
         self.teaching_sides, self.armed_sides = set(), set()
         try:
@@ -230,6 +258,8 @@ class PiperHardware:
             self.serials = {**DEFAULT_SERIALS, **config.get("serials", {})}
             self.depth_roles = set(config.get("depth_roles", ["agentview"]))
             self.context = None
+            # Runs after camera.close callbacks, before arm disconnect/lease release.
+            self.resources.callback(self._clear_camera_references)
             # Opening is read-only: no home, enable or motion command.
         except BaseException:
             self.resources.close()
@@ -424,6 +454,29 @@ class PiperHardware:
                         raise RuntimeError("恢复从臂模式后仍无反馈，请检查 CAN/设备状态；未释放电机或发送运动目标")
                     time.sleep(.02)
 
+    def diagnose(self, side):
+        from .recovery import inspect_arm
+        if side not in ("left", "right"):
+            raise ValueError("请选择左从臂或右从臂")
+        with self.lock:
+            return dict(inspect_arm(self.arms[side], self.limits), side=side,
+                        channel=self.channels[side])
+
+    def restore(self, side, check=lambda: None, *, support_confirmed=False):
+        from .recovery import restore_arm
+        if side not in ("left", "right"):
+            raise ValueError("请选择左从臂或右从臂")
+        with self.lock:
+            if self.teaching:
+                raise ValueError("请先结束网页录点和机身示教")
+            result = restore_arm(self.arms[side], self.limits, check, support_confirmed=support_confirmed)
+            self.armed_sides.add(side)
+            statuses = [arm.get_arm_status() for arm in self.arms.values()]
+            if all(message is not None and -.02 <= time.time()-message.timestamp <= .5
+                   and int(message.msg.arm_status) == 0 for message in statuses):
+                self.emergency = False
+            return dict(result, side=side, channel=self.channels[side])
+
     def send(self, space, target, active_sides=("left", "right"), *, joint_command="move_js"):
         if joint_command not in ("move_js", "move_j"):
             raise ValueError("关节下发接口须为 move_js 或 move_j")
@@ -540,6 +593,9 @@ class PiperHardware:
 
     def close(self):
         with self.lock:
+            if self.closed:
+                return
+            self.closed = True
             try:
                 if self.teaching and not self.emergency:
                     self.teach(False)
@@ -547,8 +603,14 @@ class PiperHardware:
             finally:
                 self.resources.close()
 
+    def _clear_camera_references(self):
+        self.cameras.clear()
+        self.context = None
+
     def camera(self, role):
         with self.lock:
+            if self.closed:
+                raise RuntimeError('工作流设备已断开，请重新连接后预览相机')
             if role not in self.serials:
                 raise ValueError("相机不存在")
             if role not in self.cameras:

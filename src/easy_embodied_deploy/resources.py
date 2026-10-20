@@ -18,7 +18,8 @@ def hardware_lease(name="piper"):
             fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError(
-                "Piper 设备已被另一采集或部署进程占用，请先在对应页面停止"
+                "Piper 设备已被采集、标定、工作流或部署进程占用；"
+                "请先在占用页面断开设备或停止硬件服务。工作流执行结束/停止不等于断开设备"
             ) from exc
         try:
             yield

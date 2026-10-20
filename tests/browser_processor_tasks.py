@@ -53,6 +53,20 @@ async def main():
                 assert await page.evaluate('ui.plan.errors') == []
                 assert await page.evaluate('ui.plan.files.map(file => file.task)') == ['统一指令'] * 2
                 assert '--task-source override' in await page.locator('#commandPreview').inner_text()
+                await page.locator('input[name="actionMode"][value="absolute_base_pose"]').check()
+                assert await page.locator('[data-pose-cleaning]').is_visible()
+                assert not await page.locator('#poseSingularityFilter').is_checked()
+                await page.locator('#poseSingularityFilter').check()
+                assert await page.locator('#poseSingularityThreshold').is_enabled()
+                await page.locator('#inspectButton').click()
+                await page.wait_for_function('ui.plan?.pose_cleaning?.enabled === true')
+                assert await page.evaluate('ui.plan.episodes') == 0
+                assert '奇异过滤' in await page.locator('#cleaningSummary').inner_text()
+                assert '--pose-singularity-filter' in await page.locator('#commandPreview').inner_text()
+                await page.locator('input[name="actionMode"][value="absolute_joint"]').check()
+                assert not await page.locator('[data-pose-cleaning]').is_visible()
+                assert not await page.locator('#cleaningSummary').is_visible()
+                assert '--pose-singularity-filter' not in await page.locator('#commandPreview').inner_text()
                 assert not errors, errors
                 await browser.close()
             print('Processor UI: per-HDF5 task inheritance, multi-directory inspection, explicit override PASS')

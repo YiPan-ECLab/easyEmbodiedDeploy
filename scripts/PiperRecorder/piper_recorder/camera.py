@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from .camera_errors import camera_start_error
+
 CAMERA_NAMES = ("agentview", "left_eye_in_hand", "right_eye_in_hand")
 FRAME_WAIT_TIMEOUT_MS = 100
 
@@ -71,6 +73,17 @@ class OrbbecCamera:
         self._thread: threading.Thread | None = None
 
     def start(self, device) -> None:
+        try:
+            self._start(device)
+        except Exception as exc:
+            failure = camera_start_error(self.name, self.serial, exc)
+            try:
+                self.close()
+            except Exception as cleanup:
+                failure = RuntimeError(f'{failure}；启动失败后的相机清理异常：{cleanup}')
+            raise failure from exc
+
+    def _start(self, device) -> None:
         from pyorbbecsdk import Config, OBFormat, OBSensorType, Pipeline
 
         if device is None:
@@ -79,6 +92,7 @@ class OrbbecCamera:
         self._error = None
         self._latest = None
         pipeline = Pipeline(device)
+        self._pipeline = pipeline
         sensor_type = OBSensorType.COLOR_SENSOR
         # Stereo models expose separate LEFT/RIGHT_COLOR_SENSOR streams. A
         # regular RGB camera falls back to COLOR_SENSOR when those are absent.
@@ -175,16 +189,22 @@ class OrbbecCamera:
 
     def close(self) -> None:
         self._stop.set()
+        error = None
         # Stop the pipeline first so wait_for_frames() wakes promptly.
         if self._pipeline is not None:
             try:
                 self._pipeline.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                error = exc
         if self._thread is not None:
             self._thread.join(timeout=1.0)
+            if self._thread.is_alive():
+                raise RuntimeError(f'相机 {self.name} 采集线程未退出，设备尚未完全释放')
         self._thread = None
         self._pipeline = None
+        self._latest = self._error = None
+        if error is not None:
+            raise RuntimeError(f'相机 {self.name} 停止流失败：{error}') from error
 
 
 def open_cameras(

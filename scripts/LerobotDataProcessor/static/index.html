@@ -55,6 +55,12 @@
                 <label><input type="radio" name="actionMode" value="camera_delta_wrist"><b>Wrist Delta</b><small>各自腕部相机下的位姿变化</small></label>
                 <label><input type="radio" name="actionMode" value="camera_delta_global"><b>Global Delta</b><small>全局相机下的双臂位姿变化</small></label>
               </div><small>位姿模式：state 仍为 14 维关节反馈；action 为 xyz + 三维旋转向量 + 绝对夹爪，每臂 7 维。</small></div>
+              <div class="field wide pose-cleaning" data-pose-cleaning hidden>
+                <label class="cleaning-toggle"><input id="poseSingularityFilter" type="checkbox">过滤奇异附近的位姿帧（可选）</label>
+                <small>任一臂接近奇异即过滤双臂这一帧；保留片段分别导出为独立 episode，chunk 不跨被删区间。不会覆盖源数据，也不按采样频率筛帧。</small>
+                <label class="cleaning-threshold">奇异比值阈值 <input id="poseSingularityThreshold" type="number" value="0.01" min="0.000001" max="0.999999" step="any"></label>
+                <small>默认 0.01；数值越大过滤越多。按 Piper 运动学计算，检查输入后显示过滤数量。清洗不保证模型预测远离奇异。</small>
+              </div>
               <label class="field wide" data-camera-pose hidden><span>标定包路径</span><input id="calibrationBundle" placeholder="outputs/calibration/…/calibration_bundle.json" spellcheck="false"></label>
               <label class="field wide" data-camera-pose hidden><span>采集时相机安装版本</span><input id="calibrationMountId" placeholder="与标定包的 mount_id 一致" spellcheck="false"><small>仅 camera delta 需要标定。每段 50 步共用观测时刻锚点，禁止压缩时间空档。</small></label>
               <div class="field wide"><span>时间空档策略</span><div class="segmented compact" id="gapPolicy">
@@ -104,6 +110,7 @@
         <p class="audit-help">逐条检查结构、数值与时序；文件错误不会中断后续检查。可单独允许物理时序异常，其他错误仍须处理。图像像素与视频完整性由实际转换和输出验收检查。</p>
         <div id="deleteResult" class="warning-box hidden" role="status"></div>
         <div id="warningBox" class="warning-box hidden"></div>
+        <div id="cleaningSummary" class="warning-box hidden" role="status"></div>
         <div class="table-wrap"><table><thead><tr><th>文件</th><th>源帧</th><th>Task</th><th>Home</th><th>裁首 / 裁尾</th><th>实测 FPS</th><th>输出</th><th>最大相机偏差</th><th>时序异常</th><th>具体问题</th><th>操作</th></tr></thead><tbody id="fileTable"></tbody></table></div>
       </section>
 

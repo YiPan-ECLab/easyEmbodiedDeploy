@@ -59,6 +59,18 @@ thirdParty/.venvs/lerobot-pi05/bin/python \
 支持 `absolute_base_pose`、`camera_delta_wrist`、`camera_delta_global`；state 保持左右关节 / 夹爪 14 维，位姿 action 是双臂 xyz / 三维 rotvec / 绝对夹爪 14 维。
 详见 [完整位姿链路](../../docs/POSE_ACTION_DATAFLOW.md)、[标定操作与训练顺序](../../docs/CAMERA_CALIBRATION.md) 和 [相对关节问题排查](../../docs/JOINT_ACTION_AUDIT.md)。位姿数据必须保留 `meta/pose*` 附属文件，并通过本项目训练入口读取。camera delta 部署需确认相机安装版本；绝对 base 位姿不需要标定。
 
+## 可选：位姿奇异附近帧清洗
+
+选择任一种位姿 action → 勾选 **过滤奇异附近帧** → **检查输入** 查看删除数量和分段数量 → 指定新目录转换。默认关闭，关节动作模式不启用。
+
+使用 pyAgxArm 的 Piper 几何参数，根据实际关节反馈计算两臂雅可比矩阵。平移行除以 0.3 m 后，最小/最大奇异值比低于阈值即过滤；默认阈值 **0.01**，越大过滤越多。这是可调的几何筛选标准，不是厂商给定的安全界限，也不是关节角度阈值。
+
+任一侧命中时同步删除该时刻的图像、state 和位姿；每个保留的连续片段独立生成 episode，chunk 不跨删除区间。仅剩一帧的片段不能构造未来动作，会单独计数后丢弃。每段末帧仅作最后动作的目标，故训练样本数 = 保留源帧数 − 输出 episode 数。降采样跳过的原始帧若命中，也会切开前后片段。预检和 `processing.json` 保留逐文件计数及分段索引，数据分析会从 HDF5 重新核对。
+
+此功能不修改原 HDF5、不平滑或改写位姿、不按速度或采样间隔删帧，支持 `mixed`。静止臂若处于奇异附近也会触发筛选，检查删除比例后再决定是否启用。它不能保证训练后的模型不再预测奇异附近目标；delta pose 同样存在运动学奇异问题。
+
+CLI 在原转换命令后增加 `--pose-singularity-filter --pose-singularity-threshold 0.01`；先加 `--inspect` 可只预览。
+
 ## 单臂轨迹与转换边界
 
 允许只操作左臂、只操作右臂、只操作夹爪，以及另一侧先静止后参与任务。

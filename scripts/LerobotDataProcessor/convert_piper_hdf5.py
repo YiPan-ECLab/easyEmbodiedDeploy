@@ -46,6 +46,9 @@ def main() -> None:
                         help="compact 压缩时间空档，reject 遇到空档直接失败")
     parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--calibration-bundle", help="camera delta 使用的标定包 JSON")
+    parser.add_argument("--pose-singularity-filter", action="store_true", help="位姿模式过滤奇异附近帧，并切成独立 episode")
+    parser.add_argument("--pose-singularity-threshold", type=float, default=.01,
+                        help="归一化雅可比最小/最大奇异值比阈值，越大过滤越多（默认 0.01）")
     parser.add_argument("--calibration-mount-id", default="", help="确认源数据采集时的相机安装版本")
     parser.add_argument("--inspect", action="store_true", help="Check input and preview output counts only")
     parser.add_argument("--validate-output", metavar="PATH",
@@ -66,6 +69,8 @@ def main() -> None:
                         action_mode=args.action_mode, repo_id=args.repo_id, limit=args.limit,
                         gap_policy=args.gap_policy, calibration_bundle=args.calibration_bundle,
                         calibration_mount_id=args.calibration_mount_id,
+                        pose_singularity_filter=args.pose_singularity_filter,
+                        pose_singularity_threshold=args.pose_singularity_threshold,
                         timing_overrides={str(Path(path).expanduser().resolve()): rev for path, rev in args.allow_timing})
     if args.inspect:
         import json
