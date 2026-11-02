@@ -21,7 +21,10 @@ SIDES = ("left", "right")
 
 
 def number(value, label, low=0, high=float("inf")):
-    value = float(value)
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} 须为有效数字") from None
     if not math.isfinite(value) or not low <= value <= high:
         raise ValueError(f"{label} 必须在 {low:g}–{high:g} 之间")
     return value
@@ -29,6 +32,7 @@ def number(value, label, low=0, high=float("inf")):
 
 def new_plan():
     return dict(schema=SCHEMA, version=1, name="我的工作流", points=[], models=[], steps=[],
+                mode="sequential", continuous_vla=dict(model="", task="", takeovers=[], switches=[]),
                 settings=dict(joint_command="move_js", control_hz=50, joint_speed=3.0, joint_acceleration=3.0,
                               linear_speed=1.0, angular_speed=.5, gripper_speed=1.0,
                               transition_s=.6, prefetch_s=1.0))
@@ -82,6 +86,10 @@ def validate(plan):
         settings[key] = number(value, key, .001)
     number(settings["control_hz"], "控制频率", 10, 100)
     plan["settings"] = settings
+    plan.setdefault('mode', 'sequential')
+    plan.setdefault('continuous_vla', dict(model='', task='', takeovers=[], switches=[]))
+    if plan['mode'] not in ('sequential', 'continuous_vla'):
+        raise ValueError('执行模式无效')
     tables = {}
     for kind in ("points", "models", "steps"):
         rows = plan.get(kind, [])
@@ -169,7 +177,117 @@ def validate(plan):
             step["duration"] = number(step.get("duration", 1), "夹爪时长", .05)
         else:
             raise ValueError(f"未知步骤：{kind}")
+    if plan['mode'] == 'continuous_vla':
+        continuous = plan['continuous_vla']
+        if not isinstance(continuous, dict) or continuous.get('model') not in tables['models']:
+            raise ValueError('请选择持续运行的 VLA 模型')
+        if not isinstance(continuous.get('task', ''), str):
+            raise ValueError('持续 VLA 任务指令须为文本')
+        if continuous.get('side', 'both') not in (*SIDES, 'both'):
+            raise ValueError('持续 VLA 控制侧别无效')
+        events = continuous.setdefault('takeovers', [])
+        if not isinstance(events, list):
+            raise ValueError('定时接管须为列表')
+        identifiers, times = set(), set()
+        for event in events:
+            if not isinstance(event, dict) or not isinstance(event.get('id'), str) or not event['id'] or event['id'] in identifiers:
+                raise ValueError('定时接管标识不能为空或重复')
+            identifiers.add(event['id'])
+            event['at_s'] = number(event.get('at_s', 5), '接管时间/秒', 0)
+            trigger = event.setdefault('trigger', dict(type='time'))
+            # User replaced the J5/J6 AND rule with the signed J4+J6 sum.
+            # Upgrade old saved plans and browser drafts without carrying a
+            # J5 angle, direction or threshold into the new controller.
+            if isinstance(trigger, dict) and trigger.get('type') == 'right_joints':
+                trigger = event['trigger'] = {k: v for k, v in trigger.items()
+                    if k in ('end_s', 'hold_s', 'reference', 'j6_reference_deg')}
+                trigger.update(type='right_joint_sum', sum_deg=30, j4_reference_deg=0)
+            if not isinstance(trigger, dict) or trigger.get('type') not in ('time', 'right_joint_sum', 'right_j6_pose', 'right_joint_sum_pose'):
+                raise ValueError('接管触发方式须为定时或右臂关节条件')
+            if trigger['type'] == 'time':
+                if event['at_s'] in times:
+                    raise ValueError('同一时间的关键点请放在同一个接管动作段中')
+                times.add(event['at_s'])
+            else:
+                trigger['end_s'] = number(trigger.get('end_s', float('nan')), '触发区间结束/秒', 0)
+                if trigger['end_s'] <= event['at_s']:
+                    raise ValueError('触发区间结束时间必须晚于开始时间')
+                trigger['hold_s'] = number(trigger.get('hold_s', .2), '关节条件持续时间/秒', .05, 5)
+                if trigger['end_s']-event['at_s'] < trigger['hold_s']:
+                    raise ValueError('触发时间区间不能短于条件持续时间')
+                if trigger['type'] == 'right_joint_sum_pose':
+                    high_z_defined = 'high_z_mm' in trigger
+                    high_z = trigger.get('high_z_mm')
+                    trigger = event['trigger'] = dict(type='right_joint_sum_pose',
+                        end_s=trigger['end_s'], hold_s=trigger['hold_s'],
+                        sum_deg=number(trigger.get('sum_deg', 30), 'J4＋J6 实际角度合计下限/度', -220, 220),
+                        z_mm=number(trigger.get('z_mm', 250), '右臂基座系法兰 Z 下限/mm', -700, 750))
+                    if high_z is not None:
+                        high_z = number(high_z, '独立触发法兰 Z 下限/mm', -700, 750)
+                        if high_z <= trigger['z_mm']:
+                            raise ValueError('独立触发高度必须高于角度联合条件的高度下限')
+                        trigger['high_z_mm'] = high_z
+                    elif high_z_defined:
+                        trigger['high_z_mm'] = None
+                elif trigger['type'] == 'right_j6_pose':
+                    # Absolute signed joint feedback and base-frame flange Z.
+                    trigger = event['trigger'] = dict(type='right_j6_pose',
+                        end_s=trigger['end_s'], hold_s=trigger['hold_s'],
+                        j6_deg=number(trigger.get('j6_deg', -10), 'J6 实际角度下限/度', -120, 120),
+                        z_mm=number(trigger.get('z_mm', 500), '右臂基座系法兰 Z 下限/mm', -700, 750))
+                else:
+                    trigger.setdefault('reference', 'window')
+                    if trigger['reference'] not in ('window', 'manual'):
+                        raise ValueError('关节触发基准须为窗口首次反馈或指定角度')
+                    trigger['sum_deg'] = number(trigger.get('sum_deg', 30), 'J4＋J6 合计转角阈值/度', .1, 720)
+                    for joint in ('j4', 'j6'):
+                        if trigger['reference'] == 'manual':
+                            trigger[f'{joint}_reference_deg'] = number(trigger.get(f'{joint}_reference_deg', 0), f'{joint} 基准/度', -180, 180)
+                    for key in ('j5_deg', 'j5_direction', 'j5_reference_deg', 'j4_deg', 'j4_direction', 'j6_deg', 'j6_direction'):
+                        trigger.pop(key, None)
+            rows = event.get('steps')
+            if not isinstance(rows, list) or not rows:
+                raise ValueError('每个接管动作段至少添加一个关键点')
+            ids = set()
+            for row in rows:
+                if not isinstance(row, dict) or row.get('type') != 'point' or row.get('point') not in tables['points']:
+                    raise ValueError('定时接管只支持引用已有关键点')
+                if not isinstance(row.get('id'), str) or not row['id'] or row['id'] in ids:
+                    raise ValueError('接管关键点标识不能为空或重复')
+                ids.add(row['id'])
+                row['duration'] = number(row.get('duration', 1), '接管运动时长', .05)
+        events.sort(key=lambda event: event['at_s'])
+        switches = continuous.setdefault('switches', [])
+        if not isinstance(switches, list):
+            raise ValueError('VLA 切换时间表须为列表')
+        switch_ids, switch_times = set(), set()
+        for switch in switches:
+            if not isinstance(switch, dict) or not isinstance(switch.get('id'), str) or not switch['id'] or switch['id'] in switch_ids:
+                raise ValueError('VLA 切换标识不能为空或重复')
+            switch_ids.add(switch['id'])
+            switch['at_s'] = number(switch.get('at_s', 5), 'VLA 切换时间/秒', 0)
+            if switch['at_s'] in switch_times:
+                raise ValueError('同一时间只能切换到一个 VLA 模型')
+            switch_times.add(switch['at_s'])
+            if switch.get('model') not in tables['models']:
+                raise ValueError('VLA 切换引用的模型不存在')
+            if not isinstance(switch.get('task', ''), str):
+                raise ValueError('VLA 切换任务指令须为文本')
+        switches.sort(key=lambda switch: switch['at_s'])
     return plan
+
+
+def execution_steps(plan):
+    if plan.get('mode') == 'continuous_vla':
+        return [step for event in plan['continuous_vla']['takeovers'] for step in event['steps']]
+    return plan['steps']
+
+
+def used_model_ids(plan, steps=None):
+    if plan.get('mode') == 'continuous_vla':
+        config = plan['continuous_vla']
+        return {config['model']} | {switch['model'] for switch in config.get('switches', [])}
+    return {step['model'] for step in (plan['steps'] if steps is None else steps) if step['type'] == 'vla'}
 
 
 def require_models(models, identifiers):

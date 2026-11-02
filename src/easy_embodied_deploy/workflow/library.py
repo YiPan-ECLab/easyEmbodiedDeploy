@@ -7,7 +7,8 @@ import threading
 from contextlib import contextmanager
 
 from ..calibration import atomic_json
-from .plan import PlanStore, new_plan, validate, validate_names, unique_name, repair_vla_names
+from .plan import (PlanStore, new_plan, validate, validate_names, unique_name,
+                   repair_vla_names, execution_steps)
 
 
 class SharedPlanStore(PlanStore):
@@ -128,6 +129,7 @@ class SharedPlanStore(PlanStore):
         plan['steps'] = [s for s in plan['steps'] if not (
             s.get('type') == 'point' and s.get('point') in state['deleted_points'] or
             s.get('type') == 'vla' and s.get('model') in state['deleted_models'])]
+        self._prune_schedule(plan, state)
         plan.pop('resources', None)
         if legacy:
             repair_vla_names(plan)
@@ -173,10 +175,25 @@ class SharedPlanStore(PlanStore):
             self._touch(state)
             self._write(kind, [row for row in self._rows(kind) if row['id'] != identifier])
             for path, document in self._documents():
+                before = copy.deepcopy(document)
                 steps = [s for s in document['steps'] if not (s['type'] == step_type and s.get(field) == identifier)]
-                if len(steps) != len(document['steps']):
-                    document['steps'] = steps
+                document['steps'] = steps
+                self._prune_schedule(document, state)
+                if document != before:
                     atomic_json(path, self._reference_document(document))
+
+    @staticmethod
+    def _prune_schedule(plan, state):
+        config = plan.get('continuous_vla')
+        if not isinstance(config, dict):
+            return
+        for event in config.get('takeovers', []):
+            event['steps'] = [s for s in event['steps'] if s.get('point') not in state['deleted_points']]
+        config['takeovers'] = [e for e in config.get('takeovers', []) if e['steps']]
+        config['switches'] = [s for s in config.get('switches', []) if s['model'] not in state['deleted_models']]
+        if config.get('model') in state['deleted_models']:
+            config['model'] = ''
+            plan['mode'] = 'sequential'
 
     def save(self, plan, identifier=None):
         import uuid
@@ -193,5 +210,5 @@ class SharedPlanStore(PlanStore):
 
     def listing(self):
         with self.transaction():
-            return [dict(id=path.stem, name=plan['name'], steps=len(plan['steps']))
+            return [dict(id=path.stem, name=plan['name'], steps=len(execution_steps(plan)))
                     for path, plan in self._documents()]

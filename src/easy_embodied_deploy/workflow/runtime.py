@@ -1,6 +1,7 @@
 """Single motion owner, cancellable workflow runner and asynchronous VLA queues."""
 
 import copy
+import json
 import threading
 import time
 from collections import deque
@@ -14,7 +15,12 @@ from ..target_runtime import validate_live_cameras
 from .hardware import (MockHardware, PiperHardware, selected_sides,
                        bounded_joints, HOLD_FEEDBACK_TOLERANCE)
 from .models import ModelPool
-from .plan import new_plan, validate, interpolate, tangent, require_models
+from .plan import (new_plan, validate, interpolate, tangent, require_models,
+                   execution_steps, used_model_ids)
+from .continuous import ContinuousPolicy
+from .rtc_timing import RTCTiming, failure_message
+from .triggers import TakeoverSchedule
+from .recording import MotionRecording
 
 
 def vector(snapshot, space):
@@ -87,6 +93,16 @@ class WorkflowController:
         self.pending_unloads = set()
         self.unload_thread = None
         self.recovery_result = None
+        self.continuous_policy = None
+        self.takeover_schedule = None
+        self.continuous_elapsed = 0
+        self.continuous_last_tick = None
+        self.continuous_next_switch = 0
+        self.continuous_completed_chunks = self.continuous_completed_actions = 0
+        self.rtc_diagnostics = deque(maxlen=1000)
+        self.rtc_log_path = None
+        self.motion_recording = None
+        self.motion_recording_error = None
 
     def busy(self):
         return self.thread is not None and self.thread.is_alive()
@@ -98,6 +114,8 @@ class WorkflowController:
     def event(self, message):
         with self.lock:
             self.events.append(dict(time=time.time(), message=message))
+            if self.motion_recording and self.motion_recording.snapshot()['running']:
+                self.motion_recording.emit('message', dict(message=message))
 
     def snapshot(self):
         with self.lock:
@@ -110,7 +128,11 @@ class WorkflowController:
                           busy=self.busy(), verification=self.last_verification, events=list(self.events),
                           recovery_result=self.recovery_result,
                           pending_unloads=sorted(self.pending_unloads))
-            if self.plan and 0 <= self.status["step"] < len(self.plan["steps"]):
+            result['rtc_diagnostics'] = dict(recent=list(self.rtc_diagnostics)[-20:], log_path=self.rtc_log_path)
+            result['motion_recording_error'] = self.motion_recording_error
+            result['motion_recording'] = self.motion_recording.snapshot() if self.motion_recording else None
+            result['takeover_conditions'] = self.takeover_schedule.snapshot() if self.takeover_schedule else []
+            if self.plan and self.plan.get('mode') != 'continuous_vla' and 0 <= self.status["step"] < len(self.plan["steps"]):
                 step = self.plan["steps"][self.status["step"]]
                 result.update(step_id=step["id"], step_type=step["type"])
         result["models"] = self.models.snapshot()
@@ -301,12 +323,15 @@ class WorkflowController:
                 raise ValueError("请先连接设备，且不能同时执行两个工作流")
             if self.hardware.emergency:
                 raise ValueError("急停后请在设备侧检查并复位，再重新连接")
-            if not plan["steps"] or not 0 <= int(start_index) < len(plan["steps"]):
+            continuous = plan.get('mode') == 'continuous_vla'
+            if continuous and (int(start_index) != 0 or int(repetitions) != 1):
+                raise ValueError('持续 VLA 模式从计时起点执行一次，直到点击停止')
+            if not continuous and (not plan["steps"] or not 0 <= int(start_index) < len(plan["steps"])):
                 raise ValueError("请添加步骤并选择有效的起始步骤")
             if not 1 <= int(repetitions) <= 10000:
                 raise ValueError("重复次数须为 1–10000")
-            run_steps = plan["steps"][int(start_index):] if int(repetitions) == 1 else plan["steps"]
-            used_models = {s["model"] for s in run_steps if s["type"] == "vla"}
+            run_steps = execution_steps(plan) if continuous else plan["steps"][int(start_index):] if int(repetitions) == 1 else plan["steps"]
+            used_models = used_model_ids(plan, run_steps)
             require_models(plan["models"], used_models)
             if not self.hardware.simulated:
                 used_points = {s["point"] for s in run_steps if s["type"] == "point"}
@@ -328,7 +353,16 @@ class WorkflowController:
             self.command = self.space = None
             self.active_model = self.policy_anchor = None
             self.last_verification = None
+            self.continuous_elapsed = 0
+            self.takeover_schedule = None
+            self.continuous_last_tick = None
+            self.continuous_next_switch = 0
+            self.continuous_completed_chunks = self.continuous_completed_actions = 0
+            self.rtc_diagnostics.clear()
+            self.rtc_log_path = None
             self.update(state="running", error=None, progress=0, step=-1, actions=0, queue=0,
+                        controller_owner=None, takeover_id=None, schedule_elapsed=0, inference_chunks=0,
+                        active_vla_id=None, active_vla_name=None,
                         detail="准备执行；未回零时先平滑回零" if home_before else "从当前位置准备试运行")
             self.thread = threading.Thread(target=self._run, args=(int(start_index), int(repetitions), home_before), daemon=True)
             self.thread.start()
@@ -337,6 +371,8 @@ class WorkflowController:
         if self.busy() and self.operation in ("home", "preparing"):
             raise ValueError("回零期间请使用停止；再次回零会从当前位置开始")
         if self.busy():
+            if self.takeover_schedule:
+                self.takeover_schedule.interrupt()
             self.paused.set()
             self.update(state="paused", detail="已请求暂停，保持当前位置")
 
@@ -345,6 +381,8 @@ class WorkflowController:
 
     def next(self):
         with self.lock:
+            if self.plan and self.plan.get('mode') == 'continuous_vla':
+                raise ValueError('持续 VLA 按时间表切换；请使用暂停或停止')
             index = self.status["step"]
             if not self.busy() or self.operation != "workflow" or self.plan["steps"][index]["type"] not in ("vla", "wait"):
                 raise ValueError("只有 VLA 和等待步骤支持手动下一步")
@@ -372,11 +410,14 @@ class WorkflowController:
             return False
         self.hardware.stop()
         self._cancel_inferences()
+        if self.continuous_policy:
+            self.continuous_policy.reset()
         while self.paused.is_set():
             self._check()
             self.stop_event.wait(.02)
         self._check()
         self.command = None
+        self.continuous_last_tick = time.monotonic() if self.continuous_last_tick is not None else None
         self.prefills.clear()
         self.update(state="running", detail="继续执行")
         return True
@@ -399,7 +440,53 @@ class WorkflowController:
         self.space, self.command = space, np.asarray(value).copy()
 
     def _sleep(self, started):
+        self._continuous_tick()
         self.stop_event.wait(max(0, self.tick_period - (time.monotonic() - started)))
+
+    def _continuous_tick(self):
+        if self.continuous_policy is None or self.paused.is_set():
+            return
+        self._check()
+        now = time.monotonic()
+        if self.continuous_last_tick is not None:
+            self.continuous_elapsed += now-self.continuous_last_tick
+            self.continuous_last_tick = now
+            self._continuous_switches()
+        self.continuous_policy.tick()
+        self.update(schedule_elapsed=self.continuous_elapsed,
+                    inference_chunks=self.continuous_completed_chunks+self.continuous_policy.chunks,
+                    actions=self.continuous_completed_actions+self.continuous_policy.actions,
+                    queue=len(self.continuous_policy.queue))
+
+    def _continuous_switches(self):
+        config = self.plan['continuous_vla']
+        switches = config.get('switches', [])
+        while self.continuous_next_switch < len(switches) and switches[self.continuous_next_switch]['at_s'] <= self.continuous_elapsed:
+            switch = switches[self.continuous_next_switch]
+            previous = self.continuous_policy
+            self.continuous_completed_chunks += previous.chunks
+            self.continuous_completed_actions += previous.actions
+            previous.reset()
+            if previous.pending is not None:
+                previous.pending.cancel()
+            selected = dict(model=switch['model'], task=switch.get('task', ''), side=config.get('side', 'both'))
+            policy = self.continuous_policy = ContinuousPolicy(self, selected)
+            # Keep producing proposals while braking or while points own the
+            # arm, but do not consume them as if they had reached hardware.
+            policy.suppressed = True
+            self.active_model = self.policy_anchor = None
+            self.continuous_next_switch += 1
+            name = policy.model.config.get('name', switch['model'])
+            self.update(active_vla_id=switch['model'], active_vla_name=name)
+            self.event(f"定时 VLA 切换：{name}（设定 {switch['at_s']:g} 秒）")
+
+    def _brake_continuous(self, velocity, space):
+        accel = np.minimum(self.plan['settings']['joint_acceleration'], speed_limits(self.plan['settings'], space)*3)
+        for _ in range(int(np.ceil(float(np.max(np.abs(velocity)/accel))/self.tick_period))+1):
+            self._check()
+            tick = time.monotonic()
+            self._track(self.command.copy(), velocity, space)
+            self._sleep(tick)
 
     def _wait_manual_exit(self):
         while True:
@@ -410,12 +497,36 @@ class WorkflowController:
             self.update(detail=f"等待 {'、'.join(sides)} 从臂退出机身示教：请操作机身按钮；退出后自动继续，可点击停止取消")
             self.stop_event.wait(.1)
 
+    def _recording_context(self):
+        with self.lock:
+            return dict(state=self.status.get('state'), operation=self.operation,
+                        controller_owner=self.status.get('controller_owner'),
+                        active_vla_id=self.status.get('active_vla_id'), step=self.status.get('step'),
+                        schedule_elapsed=self.continuous_elapsed,
+                        paused=self.paused.is_set())
+
+    def _record_condition(self, payload):
+        if self.motion_recording:
+            self.motion_recording.emit('condition', payload)
+
     def _run(self, start_index, repetitions, home_before):
         try:
+            from ..module_http import ROOT
+            self.motion_recording_error = None
+            try:
+                self.motion_recording = MotionRecording(ROOT/'logs/workflow-runs', self.plan,
+                    self.hardware.motion_feedback, self._recording_context, self.hardware.simulated)
+                self.motion_recording.emit('run_start', dict(start_index=start_index, repetitions=repetitions,
+                                                           home_before=home_before))
+            except Exception as exc:
+                self.motion_recording = None
+                self.motion_recording_error = str(exc)
+                self.event(f'无法启动运行记录：{exc}')
+
             self.tick_period = 1 / self.plan["settings"]["control_hz"]
             # Loading continues independently while fixed motions execute.
             selected_steps = self.plan["steps"][start_index:] if repetitions == 1 else self.plan["steps"]
-            used = {s["model"] for s in selected_steps if s["type"] == "vla"}
+            used = used_model_ids(self.plan, selected_steps)
             self.models.preload([m for m in self.plan["models"] if m["id"] in used])
             self._wait_manual_exit()
             if self.hardware.teaching:
@@ -441,13 +552,18 @@ class WorkflowController:
             self._check()
             points = {p["id"]: p for p in self.plan["points"]}
             active = set()
-            for step in selected_steps:
+            for step in execution_steps(self.plan) if self.plan.get('mode') == 'continuous_vla' else selected_steps:
                 if step["type"] == "point":
                     active.update(points[step["point"]]["arms"])
                 elif step["type"] in ("vla", "gripper"):
                     active.update(selected_sides(step.get("side", "both")))
+            if self.plan.get('mode') == 'continuous_vla':
+                active.update(selected_sides(self.plan['continuous_vla'].get('side', 'both')))
             if active:
                 self.hardware.prepare(tuple(sorted(active)), check=self._check)
+            if self.plan.get('mode') == 'continuous_vla':
+                self._run_continuous()
+                return
             for repeat in range(repetitions):
                 self.update(repetition=repeat+1, repetitions=repetitions)
                 index = start_index if repeat == 0 else 0
@@ -492,9 +608,17 @@ class WorkflowController:
                 self.update(state="failed", error=str(exc), detail=f"执行中止：{exc}")
             self.event(f"执行失败：{exc}")
         finally:
+            self.continuous_policy = None
+            self.continuous_last_tick = None
+            self.update(controller_owner=None, takeover_id=None, active_vla_id=None, active_vla_name=None)
             self._cancel_inferences()
             self.active_model = self.policy_anchor = None
             self._hold_after_run()
+            self._save_rtc_diagnostics()
+            if self.motion_recording:
+                self.motion_recording.finish(dict(state=self.status.get('state'), error=self.status.get('error'),
+                    schedule_elapsed=self.continuous_elapsed,
+                    conditions=self.takeover_schedule.snapshot() if self.takeover_schedule else []))
 
     def _prepare_cameras(self):
         deadline = time.monotonic()+15
@@ -515,9 +639,9 @@ class WorkflowController:
             end[offset:offset+7] = q
         return end
 
-    def _points(self, index):
+    def _points(self, index, steps=None):
         table = {p["id"]: p for p in self.plan["points"]}
-        steps = self.plan["steps"]
+        steps = self.plan["steps"] if steps is None else steps
         space = table[steps[index]["point"]]["space"]
         knots = [self._seed(space)]
         durations, end_index = [], index
@@ -591,6 +715,7 @@ class WorkflowController:
             if self._pause():
                 deadline = time.monotonic()+8
             self._send(space, target)
+            self._continuous_tick()
             self.stop_event.wait(self.tick_period)
 
     def _observation(self, model):
@@ -607,6 +732,7 @@ class WorkflowController:
         return obs
 
     def _submit(self, index, prefix=None, prefix_start=1):
+        requested_at = time.monotonic()
         step = self.plan["steps"][index]
         model = self.models.get(step["model"])
         if model.stage == "failed":
@@ -615,12 +741,48 @@ class WorkflowController:
             return None
         obs = self._observation(model)
         task = step.get("task") or model.config.get("task", "")
-        future = self.executor.submit(model.infer, obs, task, prefix, prefix_start,
-                                      cancel_event=self.inference_cancel)
+        return self._submit_model(model, task, prefix, prefix_start, obs, requested_at)
+
+    def _submit_model(self, model, task, prefix=None, prefix_start=1, obs=None, requested_at=None):
+        timing = dict(requested_at=time.monotonic() if requested_at is None else requested_at)
+        obs = self._observation(model) if obs is None else obs
+        timing['dispatched_at'] = time.monotonic()
+        cancel = self.inference_cancel
+        def infer():
+            try:
+                return model.infer(obs, task, prefix, prefix_start, cancel_event=cancel)
+            finally:
+                timing['finished_at'] = time.monotonic()
+        future = self.executor.submit(infer)
+        future._workflow_timing = timing
         with self.lock:
             self.inferences.add(future)
         future.add_done_callback(self._inference_done)
         return future
+
+    def _record_rtc(self, report, consecutive):
+        report = dict(report, consecutive_discards=consecutive,
+                      controller_owner=self.status.get('controller_owner') or 'sequential')
+        with self.lock:
+            self.rtc_diagnostics.append(report)
+        if report['discarded']:
+            self.event(f"RTC 结果丢弃并重试：已用 {report['consumed_frames']} / 预留 {report['reserved_frames']} 帧，"
+                       f"请求 {report['request_ms']:.1f} ms，连续 {consecutive} 次")
+
+    def _save_rtc_diagnostics(self):
+        if not self.rtc_diagnostics:
+            return
+        try:
+            from ..module_http import ROOT
+            folder = ROOT / 'logs'
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f'workflow-rtc-{time.time_ns()}.json'
+            path.write_text(json.dumps(dict(mode=self.plan.get('mode', 'sequential'),
+                                            state=self.status['state'], error=self.status.get('error'),
+                                            samples=list(self.rtc_diagnostics)), ensure_ascii=False, indent=2))
+            self.rtc_log_path = str(path)
+        except OSError as exc:
+            self.event(f'RTC 诊断日志保存失败：{exc}')
 
     def _inference_done(self, future):
         with self.lock:
@@ -639,6 +801,8 @@ class WorkflowController:
             future.cancel()
 
     def _prefetch_next(self, index, remaining):
+        if self.continuous_policy is not None:
+            return
         future_index = index+1
         if remaining > self.plan["settings"]["prefetch_s"] or future_index >= len(self.plan["steps"]):
             return
@@ -648,6 +812,97 @@ class WorkflowController:
         future = self._submit(future_index)
         if future is not None:
             self.prefills[future_index] = future
+
+    def _run_continuous(self):
+        config = self.plan['continuous_vla']
+        policy = self.continuous_policy = ContinuousPolicy(self, config)
+        model = policy.model
+        space = 'pose' if model.config['action_mode'] in POSE_MODES else 'joint'
+        self.active_sides = selected_sides(config.get('side', 'both'))
+        start = self._seed(space)
+        filtered, velocity = start.copy(), np.zeros(14)
+        blend_time = 0
+        events = config['takeovers']
+        schedule = self.takeover_schedule = TakeoverSchedule(events, observe=self._record_condition)
+        self.tick_period = 1/float(model.config['control_hz'])
+        self.update(controller_owner='vla', active_vla_id=config['model'],
+                    active_vla_name=model.config.get('name', config['model']),
+                    detail='持续 VLA：等待模型就绪及首个动作')
+        while True:
+            self._check()
+            if self._pause():
+                start = self._seed(space)
+                filtered, velocity, blend_time = start.copy(), np.zeros(14), 0
+                self.active_model = self.policy_anchor = None
+            t = time.monotonic()
+            self._continuous_tick()
+            if self.continuous_last_tick is None and policy.desired is not None:
+                self.continuous_last_tick = t
+                self.event('持续 VLA 首个动作已就绪，定时接管从 0 秒开始计时')
+                self._continuous_tick()
+            if policy is not self.continuous_policy:
+                self._brake_continuous(velocity, space)
+                policy = self.continuous_policy
+                policy.suppress(False)
+                model = policy.model
+                space = 'pose' if model.config['action_mode'] in POSE_MODES else 'joint'
+                self.tick_period = 1/float(model.config['control_hz'])
+                self.active_sides = selected_sides(policy.config.get('side', 'both'))
+                start = self._seed(space)
+                filtered, velocity, blend_time = start.copy(), np.zeros(14), 0
+                self.update(detail=f"切换至 {model.config.get('name', model.config['id'])}；等待新观测动作")
+            event = None
+            if self.continuous_last_tick is not None:
+                event = schedule.poll(self.continuous_elapsed,
+                    lambda: self.hardware.point_values('joint', ('right',))['right'])
+                for message in schedule.messages:
+                    self.event(message)
+                schedule.messages.clear()
+            if event is not None:
+                policy.suppress(True)
+                self.active_model = self.policy_anchor = None
+                self.update(controller_owner='points', takeover_id=event['id'], progress=0,
+                            detail=f"关键点接管：{event.get('name') or event['id']}；VLA 持续推理")
+                label = '关节条件关键点接管' if event['trigger']['type'] != 'time' else '定时关键点接管'
+                self.event(f"{label}：{event.get('name') or event['id']}")
+                # Brake using the current motion-space controller before the
+                # point group starts. Inference continues through both phases.
+                self._brake_continuous(velocity, space)
+                self.tick_period = 1/self.plan['settings']['control_hz']
+                i = 0
+                while i < len(event['steps']):
+                    i = self._points(i, event['steps'])
+                policy = self.continuous_policy
+                model = policy.model
+                space = 'pose' if model.config['action_mode'] in POSE_MODES else 'joint'
+                policy.suppress(False)
+                self.tick_period = 1/float(model.config['control_hz'])
+                self.active_sides = selected_sides(policy.config.get('side', 'both'))
+                start = self._seed(space)
+                filtered, velocity, blend_time = start.copy(), np.zeros(14), 0
+                self.update(controller_owner='vla', takeover_id=None, step=-1,
+                            detail='关键点已到位；等待新观测动作后交还 VLA')
+                self.event('关键点已到位；丢弃旧动作，自动交还持续 VLA')
+                continue
+            if policy.desired is not None:
+                self.active_model = policy.config['model']
+                desired = policy.desired.copy()
+                for side, offset in (('left', 0), ('right', 7)):
+                    if side not in self.active_sides:
+                        desired[offset:offset+7] = start[offset:offset+7]
+                desired[[6, 13]] = np.clip(desired[[6, 13]], 0, .1)
+                self.policy_anchor = desired.copy()
+                blended = interpolate(start, desired, min(1, blend_time/self.plan['settings']['transition_s']), space)
+                filtered = smooth_target(filtered, blended, self.tick_period,
+                                         float(model.config.get('smoothing_time_constant', .1)), space)
+                self._track(filtered, velocity, space)
+                blend_time += self.tick_period
+                finished = all(s['state'] in ('triggered', 'expired') for s in schedule.states.values())
+                detail = ('持续 VLA：等待模型返回，保持当前目标' if policy.waiting_for_inference else
+                          '持续 VLA 控制中；全部接管动作处理完毕，仍持续运行' if finished else
+                          '持续 VLA 控制中，等待时间或关节条件接管')
+                self.update(detail=detail, progress=0)
+            self._sleep(t)
 
     def _vla(self, index):
         old_period = self.tick_period
@@ -663,6 +918,7 @@ class WorkflowController:
         model = self.models.get(step["model"])
         settings = self.plan["settings"]
         hz = float(model.config.get("policy_hz", 10))
+        timing = RTCTiming(model, hz, self.tick_period)
         rtc = model.config.get("inference_mode", "rtc" if model.config.get("rtc", True) else "sync") == "rtc"
         threshold = int(model.config.get("rtc_queue_threshold",40)) if rtc else 0
         tau = float(model.config.get("smoothing_time_constant", .1))
@@ -703,29 +959,29 @@ class WorkflowController:
                 chunk = pending.result()
                 # Prefix was anchored when the request was submitted. Remove only
                 # actions actually consumed since then, never wall-clock guesses.
-                elapsed_frames = int(np.ceil((time.monotonic()-submitted_at)*hz))
-                if rtc and model.config.get("rtc_mode") == "trained" and pending_prefix and elapsed_frames > conditioned_delay:
+                report = timing.complete(pending, pending_consumed, conditioned_delay,
+                                         pending_prefix, submitted_at)
+                if rtc and report['discarded']:
                     discarded += 1
-                    if discarded >= 5:
-                        raise RuntimeError("trained RTC 连续 5 次推理延迟超过前缀覆盖范围，请检查模型推理耗时与 policy Hz")
                 else:
                     discarded = 0
                     if not rtc:
                         chunk = chunk[:model.inference.get("action_steps",50)]
                     queue = deque(chunk[min(pending_consumed, len(chunk)):])
+                self._record_rtc(report, discarded)
+                if discarded >= 5:
+                    raise RuntimeError(failure_message(report, discarded))
                 pending, pending_consumed = None, 0
             if pending is None and len(queue) <= threshold:
                 prefix = np.array(queue) if rtc and queue else None
-                conditioned_delay = max(1, int(np.ceil(max(model.latencies, default=0)*hz))) if prefix is not None else 0
-                if prefix is not None:
-                    conditioned_delay = min(conditioned_delay, len(prefix), int(model.config.get("rtc_horizon",20)))
-                    if model.config.get("rtc_mode") == "trained":
-                        conditioned_delay = min(conditioned_delay, model.inference.get("training_max_delay",0))
+                conditioned_delay = timing.reserve(len(prefix)) if prefix is not None else 0
                 submitted_at = time.monotonic()
                 pending = self._submit(index, prefix, conditioned_delay)
                 pending_prefix = prefix is not None
                 pending_consumed = 0
-            if time.monotonic() >= next_policy and queue:
+            can_consume = (not rtc or pending is None or
+                           timing.can_consume(pending_consumed, conditioned_delay, pending_prefix))
+            if can_consume and time.monotonic() >= next_policy and queue:
                 desired = queue.popleft()
                 for side, offset in (("left", 0), ("right", 7)):
                     if side not in self.active_sides:
@@ -749,7 +1005,9 @@ class WorkflowController:
                 self._track(filtered, velocity, space)
                 blend_time += self.tick_period
                 elapsed += dt
-                self.update(detail=f"VLA：{model.config.get('name', step['model'])}", actions=actions,
+                detail = (f"VLA：{model.config.get('name', step['model'])}" if can_consume else
+                          'VLA：等待模型返回，保持当前目标')
+                self.update(detail=detail, actions=actions,
                             queue=len(queue), progress=(min(1, (elapsed if until == "duration" else actions)/value) if until != "manual" else 0))
                 remaining = value-elapsed if until == "duration" else ((value-actions)/hz if until == "actions" else float("inf"))
                 self._prefetch_next(index, remaining)

@@ -1,0 +1,20 @@
+{
+  "schema": "easy_embodied_workflow",
+  "version": 1,
+  "name": "workflow1",
+  "points": [],
+  "models": [],
+  "steps": [],
+  "settings": {
+    "joint_command": "move_js",
+    "control_hz": 50.0,
+    "joint_speed": 3.0,
+    "joint_acceleration": 3.0,
+    "linear_speed": 1.0,
+    "angular_speed": 0.5,
+    "gripper_speed": 1.0,
+    "transition_s": 0.6,
+    "prefetch_s": 1.0
+  },
+  "resources": "shared"
+}

@@ -24,6 +24,11 @@ SUITES = [
     ("piper-home", "tests", "test_pose_hardware.py"),
     ("piper-home", "tests", "test_workflow.py"),
     ("piper-home", "tests", "test_workflow_library.py"),
+    ("piper-home", "tests", "test_workflow_continuous.py"),
+    ("piper-home", "tests", "test_workflow_switches.py"),
+    ("piper-home", "tests", "test_workflow_rtc_timing.py"),
+    ("piper-home", "tests", "test_workflow_triggers.py"),
+    ("piper-home", "tests", "test_workflow_recording.py"),
 ]
 
 

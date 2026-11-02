@@ -1,0 +1,87 @@
+{
+  "schema": "easy_embodied_workflow",
+  "version": 1,
+  "name": "workflow_test",
+  "points": [],
+  "models": [],
+  "steps": [
+    {
+      "id": "0f6ba1c8b41e4edda859badad7d62a49",
+      "type": "point",
+      "name": "右1",
+      "point": "0c61df782e354735a039829e9a87a08d",
+      "duration": 0.5,
+      "blend": true
+    },
+    {
+      "id": "c21703ecdd5d44268afad7e11fce7f6e",
+      "type": "point",
+      "name": "右2",
+      "point": "0ac3e6bcbdfb4e4dac9225972d09f79a",
+      "duration": 0.5,
+      "blend": true
+    },
+    {
+      "id": "281b89b1678744a78c30d30156cb1c9a",
+      "type": "point",
+      "name": "右2.5",
+      "point": "d026f8f174a34d1aa247c5f1c588181e",
+      "duration": 0.5,
+      "blend": true
+    },
+    {
+      "id": "c45ffad8810a4fabba4794b73196ffd2",
+      "type": "point",
+      "name": "右3",
+      "point": "ccdeb2a626bd4185a94dd254d8cd499e",
+      "duration": 0.5,
+      "blend": true
+    },
+    {
+      "id": "1ee3d21aac804d26b85a17361d1b02f6",
+      "type": "vla",
+      "name": "base_model",
+      "model": "e1d3796c9e694c0eb93ceff220540dce",
+      "until": "duration",
+      "value": 5.0,
+      "task": ""
+    },
+    {
+      "id": "7d9c447a76d242a885287cefbcd325ec",
+      "type": "point",
+      "name": "零点",
+      "point": "30d1e26115c348b3b23f238f6fa2d717",
+      "duration": 0.5,
+      "blend": true
+    },
+    {
+      "id": "8c959bd3457b482ba0b140d43d0b590d",
+      "type": "vla",
+      "name": "base_model 2",
+      "model": "206ff830fa6b47baaa466778c116951c",
+      "until": "duration",
+      "value": 5.0,
+      "task": ""
+    },
+    {
+      "id": "e396e9d570f34a4c86c64681c1944c87",
+      "type": "point",
+      "name": "右1",
+      "point": "30d1e26115c348b3b23f238f6fa2d717",
+      "duration": 0.5,
+      "blend": true
+    }
+  ],
+  "settings": {
+    "joint_command": "move_js",
+    "control_hz": 100.0,
+    "joint_speed": 5.0,
+    "joint_acceleration": 5.0,
+    "linear_speed": 3.0,
+    "angular_speed": 3.0,
+    "gripper_speed": 3.0,
+    "transition_s": 0.6,
+    "prefetch_s": 1.0
+  },
+  "resources": "shared"
+}

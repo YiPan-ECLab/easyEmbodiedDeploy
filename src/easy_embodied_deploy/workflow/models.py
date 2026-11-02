@@ -68,7 +68,10 @@ class ModelProcess:
             return dict(id=self.config["id"], name=self.config.get("name", self.config["id"]),
                         config=copy.deepcopy(self.config),
                         stage=self.stage, detail=self.detail, elapsed=round(time.monotonic()-self.started, 1),
-                        pid=self.process.pid, logs=list(self.logs))
+                        pid=self.process.pid, logs=list(self.logs), inference=copy.deepcopy(self.inference),
+                        rpc_latency_ms=dict(latest=round(self.latencies[-1]*1000, 3) if self.latencies else None,
+                                            peak=round(max(self.latencies)*1000, 3) if self.latencies else None,
+                                            samples=len(self.latencies)))
 
     def infer(self, observation, task, prefix=None, prefix_start=1, cancel_event=None):
         with self.rpc_lock:
@@ -90,7 +93,8 @@ class ModelProcess:
             targets = np.asarray(reply["targets"], dtype=float)
             if targets.ndim != 2 or targets.shape[1] != 14 or not len(targets) or not np.isfinite(targets).all():
                 raise ValueError("模型返回无效动作 chunk")
-            self.latencies.append(time.monotonic()-started)
+            with self.lock:
+                self.latencies.append(time.monotonic()-started)
             return targets
 
     def close(self):

@@ -1,4 +1,5 @@
 'use strict';
+let motionRecordingAvailable=false;
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const uid = () => crypto.randomUUID().replaceAll('-', '');
@@ -87,7 +88,7 @@ function renderPoints() {
   const search=$('point-search').value.trim().toLowerCase();
   const points=plan.points.filter(p=>`${p.name} ${p.notes||''}`.toLowerCase().includes(search));
   $('points').innerHTML=points.length?points.map(p=>{
-    const count=plan.steps.filter(s=>s.type==='point'&&s.point===p.id).length;
+    const count=allStepReferences().filter(s=>s.type==='point'&&s.point===p.id).length;
     return `<div class="point-row" data-point="${esc(p.id)}"><div><h3>${esc(p.name)}</h3><p>${Object.keys(p.arms).map(s=>sideName[s]).join(' + ')} · ${p.space==='joint'?'关节角':'末端位姿'} · 已引用 ${count} 次</p>${pointCoordinates(p)}<p class="muted">${esc(p.notes||'可反复添加到步骤中')}</p></div><div class="toolbar"><button data-point-action="add">添加步骤</button><button data-point-action="test">试运行</button><button data-point-action="edit">编辑 / 改名</button><button data-point-action="recapture">用当前位置重录</button><details class="point-more"><summary>更多</summary><div class="toolbar"><button data-point-action="copy">复制</button><button data-point-action="delete">删除</button></div></details></div></div>`;
   }).join(''):'<div class="empty">先录制一个基准点，或从共享点库导入。</div>';
   $('points').querySelectorAll('[data-point]').forEach(node=>{if(expanded.includes(node.dataset.point))node.querySelector('details').open=true;});
@@ -103,7 +104,7 @@ function renderSteps() {
     if(s.type==='gripper') fields=`<label>机械臂<select data-field="side">${options([['both','双臂'],['left','左臂'],['right','右臂']],s.side)}</select></label><label>夹爪宽度（mm）<input data-field="width" type="number" min="0" max="100" value="${s.width*1000}"></label><label>时长（秒）<input data-field="duration" type="number" min=".05" step=".1" value="${s.duration}"></label>`;
     return `<article class="step ${i===selected?'selected':''}" draggable="true" data-index="${i}"><div class="step-head"><span class="step-number">⠿ ${String(i+1).padStart(2,'0')}</span><input class="step-name" data-field="name" aria-label="步骤名称" value="${esc(s.name)}"><button data-step-action="up" title="上移">↑</button><button data-step-action="down" title="下移">↓</button><button data-step-action="copy">复制</button><button data-step-action="delete">删除</button></div><div class="form-grid">${fields}</div></article>`;
   }).join(''):'<div class="empty">添加关键点、VLA、夹爪或等待步骤，组成你的执行流。</div>';
-  renderModels();highlight();renderState(live);
+  renderModels();renderContinuous();highlight();renderState(live);
 }
 function addStep(type, reference) {
   if(type==='point'&&!reference) throw new Error('请先录制或选择一个关键点');
@@ -250,11 +251,15 @@ function renderSettings() {
 }
 function highlight() {document.querySelectorAll('.step').forEach(el=>{el.classList.toggle('selected',Number(el.dataset.index)===selected);el.classList.toggle('running',live.busy&&plan.steps[Number(el.dataset.index)]?.id===live.step_id);});}
 function renderState(state) {
+  const record=state.motion_recording,recordDetail=$('motion-recording-detail');
+  if(recordDetail)recordDetail.textContent=!motionRecordingAvailable?'重启自定义工作流模块后启用自动运行记录。':state.motion_recording_error?'记录启动失败：'+state.motion_recording_error:record?`${record.running?'正在记录':'记录已保存'} · ${record.samples||0} 条采样 · ${record.feedback_errors||0} 条反馈缺口${record.dropped_events?' · 丢失事件 '+record.dropped_events:''}${record.error?' · '+record.error:''} · ${record.path}`:'新运行会自动记录关节角度、法兰位置与触发判断；历史运行不会被单点试运行覆盖。';
+
+  renderTakeoverConditions(state);
   const limitsChanged=JSON.stringify(live.joint_limits)!==JSON.stringify(state.joint_limits);
   live=state;highlight();updateModelStates(state);if(limitsChanged&&plan)renderPoints();
   const labels={idle:'待机',running:'执行中',paused:'暂停',completed:'已完成',stopped:'已停止',failed:'执行失败',emergency:'急停'};
   $('run-state').textContent=labels[state.state]||state.state;
-  $('run-detail').textContent=state.detail||'';
+  $('run-detail').textContent=(state.detail||'')+(state.controller_owner?` ｜ 当前控制：${state.controller_owner==='points'?'固定关键点':'VLA'}${state.active_vla_name?` · 当前模型 ${state.active_vla_name}`:''} · 运行 ${(state.schedule_elapsed||0).toFixed(1)} 秒 · 已推理 ${state.inference_chunks||0} 次`:'');
   $('run-progress').value=state.progress||0;
   $('connection-state').textContent=state.connected?`${state.simulated?'模拟器':'真实从臂'}已连接${state.teaching?' · 连续录点中':''}`:'未连接设备';
   const available=compatible&&state.connected&&!state.busy&&!state.emergency;
@@ -273,11 +278,14 @@ function renderState(state) {
   }
   for(const id of ['capture','teach','home','recover','telemetry','update-feedback'])$(id).disabled=!available;
   $('capture-side').disabled=!!state.teaching||!!state.busy;
-  for(const id of ['run','run-from'])$(id).disabled=!available||!plan?.steps.length;
+  $('run').disabled=!available||(continuousMode()?(!continuousConfig().model||!continuousAvailable||(continuousConfig().switches.length>0&&!continuousSwitchesAvailable)||(hasJointTriggers()&&(!jointTriggersAvailable||!jointPoseTriggersAvailable))||(hasHighZTriggers()&&!highZTriggersAvailable)):!plan?.steps.length);
+  $('run-from').disabled=!available||continuousMode()||!plan?.steps.length;
+  $('repetitions').disabled=continuousMode();
+  $('run').textContent=continuousMode()?'启动持续 VLA 与关键点接管':'执行工作流';
   $('pause').disabled=!state.busy||state.state==='paused'||['home','preparing','recovery'].includes(state.operation);
   $('pause').hidden=state.state==='paused';$('resume').hidden=state.state!=='paused';
   $('resume').disabled=state.state!=='paused';
-  $('next').hidden=!state.busy||['home','preparing','recovery'].includes(state.operation)||!['vla','wait'].includes(state.step_type);
+  $('next').hidden=!state.busy||['home','preparing','recovery'].includes(state.operation)||continuousMode()||!['vla','wait'].includes(state.step_type);
   $('stop').disabled=!state.busy;$('emergency').disabled=!state.connected;
   $('preload').disabled=!compatible||state.busy;$('unload').disabled=!compatible||state.busy;
   $('inline-error').textContent=actionError||state.error||'';$('inline-error').hidden=!$('inline-error').textContent;
@@ -288,6 +296,7 @@ function renderState(state) {
     state.busy?(['home','preparing'].includes(state.operation)?`${state.detail||'正在准备运动'}；需要中断时点击「停止并保持」。`:'正在执行，右侧显示当前步骤和模型状态。'):
     state.teaching?`连续录点：${(state.teaching_sides||[]).map(s=>sideName[s]).join('、')}。通过机身示教按钮拖动并录制；网页不释放电机。退出机身示教后，执行会自动准备回零。`:
     !plan?.points.length&&!plan?.models.length?'下一步：录制关键点或新增 VLA 模型，两种控制方式都可以独立使用。':
+    continuousMode()?'下一步：选择常驻 VLA 和接管动作段，启动后持续运行到点击停止。':
     !plan.steps.length?'下一步：从关键点或 VLA 模型列表添加步骤，同一项可以反复引用。':'下一步：在编排页确认顺序，保存工作流，点击右侧「执行工作流」。';
   document.querySelectorAll('[data-point-action="test"], [data-point-action="recapture"]').forEach(b=>b.disabled=!available);
   const openLogs=new Set([...$('model-status').querySelectorAll('details[open]')].map(d=>d.closest('[data-model-state]').dataset.modelState));
@@ -317,7 +326,7 @@ function openPoint(point=null) {
   editingPoint=point?structuredClone(point):{id:uid(),name:uniqueName('新关键点',plan.points),notes:'',space:'joint',arms:{left:[0,.2,-.2,0,0,-.785,.04],right:[0,.2,-.2,0,0,.785,.04]}};
   $('point-name').value=editingPoint.name;$('point-notes').value=editingPoint.notes||'';$('point-space').value=editingPoint.space;
   $('point-side').value=Object.keys(editingPoint.arms).length===2?'both':Object.keys(editingPoint.arms)[0];
-  const count=plan.steps.filter(s=>s.point===editingPoint.id).length;
+  const count=allStepReferences().filter(s=>s.point===editingPoint.id).length;
   $('point-references').textContent=count?`当前流程引用 ${count} 次；保存后所有工作流共同使用新坐标。`:'保存即写入共享点库，所有工作流均可引用。';
   $('point-error').hidden=true;renderCoordinates();$('point-coordinates').open=!point;$('point-dialog').showModal();
 }
@@ -354,11 +363,19 @@ function applyLibrary(resources) {
     const deleted=new Set(resources[`deleted_${kind}`]);
     plan[kind]=[...resources[kind],...plan[kind].filter(row=>!ids.has(row.id)&&!deleted.has(row.id))];
   }
+  const previousSchedule=JSON.stringify(plan.continuous_vla);
+  if(plan.continuous_vla){
+    for(const event of plan.continuous_vla.takeovers)event.steps=event.steps.filter(s=>!resources.deleted_points.includes(s.point));
+    plan.continuous_vla.takeovers=plan.continuous_vla.takeovers.filter(e=>e.steps.length);
+    plan.continuous_vla.switches=(plan.continuous_vla.switches||[]).filter(s=>!resources.deleted_models.includes(s.model));
+    if(resources.deleted_models.includes(plan.continuous_vla.model)){plan.continuous_vla.model='';plan.mode='sequential';}
+  }
+  const scheduleChanged=previousSchedule!==JSON.stringify(plan.continuous_vla);
   const before=plan.steps.length;
   plan.steps=plan.steps.filter(s=>!(s.type==='point'&&resources.deleted_points.includes(s.point)||s.type==='vla'&&resources.deleted_models.includes(s.model)));
   if(plan.steps.length!==before){changed();toast('已同步共享库删除：相关引用步骤已移除');}
   localStorage.setItem('workflowDraft',JSON.stringify({plan,savedId}));
-  if(previous!==JSON.stringify([plan.points,plan.models,plan.steps])){renderPoints();renderSteps();}
+  if(scheduleChanged||previous!==JSON.stringify([plan.points,plan.models,plan.steps])){renderPoints();renderSteps();}
 }
 async function refreshLibrary() { applyLibrary(await api('library')); }
 async function deleteResource(kind, resource) {
@@ -367,23 +384,25 @@ async function deleteResource(kind, resource) {
   renderSaved((await api('bootstrap')).workflows);
   toast('已从共享库及工作流中删除');
 }
-async function run(start=0, override=null) {await api('run',{plan:override||plan,start,repetitions:override?1:Number($('repetitions').value),home_before:!override});toast(live.simulated?'模拟工作流已开始':'真实机械臂工作流已开始');await poll();}
+async function run(start=0, override=null) {if(!override&&continuousMode()&&(!continuousAvailable||(continuousConfig().switches.length>0&&!continuousSwitchesAvailable)||(hasJointTriggers()&&(!jointTriggersAvailable||!jointPoseTriggersAvailable))||(hasHighZTriggers()&&!highZTriggersAvailable)))throw new Error('请先重启工作流服务以启用定时接管模式');await api('run',{plan:override||plan,start,repetitions:override||continuousMode()?1:Number($('repetitions').value),home_before:!override});toast(live.simulated?'模拟工作流已开始':'真实机械臂工作流已开始');await poll();}
 async function poll() {
   if(polling)return;polling=true;
   try {
     const state=await api('state');renderState(state);
     if(compatible&&state.library_revision!==undefined&&state.library_revision!==libraryRevision&&
-       !document.activeElement?.closest('#steps, #settings'))await refreshLibrary();
+       !document.activeElement?.closest('#steps, #settings, #continuous-editor'))await refreshLibrary();
   } catch(e){$('run-detail').textContent=`服务连接中断：${e.message}`;}
   finally{polling=false;}
 }
 function triple(id) {const a=$(id).value.split(/[,，\s]+/).filter(Boolean).map(Number);if(a.length!==3||a.some(x=>!Number.isFinite(x)))throw new Error('XYZ 偏移须为 3 个数值');return a.map(v=>v/1000);}
 async function init() {
-  const boot=await api('bootstrap');compatible=boot.api_version===8;$('version-notice').hidden=compatible;plan=boot.plan;libraryRevision=boot.library?.revision??-1;renderSaved(boot.workflows);
+  const boot=await api('bootstrap');compatible=boot.api_version===9;$('version-notice').hidden=compatible;plan=boot.plan;libraryRevision=boot.library?.revision??-1;renderSaved(boot.workflows);
   const draft=localStorage.getItem('workflowDraft');if(draft){try{const parsed=JSON.parse(draft);const used=[];for(const step of parsed.plan.steps||[]){if(step.type==='vla'){step.name=uniqueName((step.name||'VLA').trim()||'VLA',used);used.push(step);}}plan=await api('validate',{plan:parsed.plan});savedId=parsed.savedId;dirty=true;$('dirty').textContent='已恢复本地草稿';}catch{toast('旧草稿无法恢复，已新建工作流',true);}}
   for(const [role,serial] of Object.entries(boot.serials)) $(`serial-${role}`).value=serial;
   $('calibrations').innerHTML=boot.calibrations.map(p=>`<option value="${esc(p)}"></option>`).join('');if(boot.calibrations.length)$('calibration').value=boot.calibrations.at(-1);
-  renderSaved(boot.workflows);render();renderState(boot.state);
+  motionRecordingAvailable=!!boot.features?.motion_recording;
+  if(!boot.features?.motion_recording)$('motion-recording-detail').textContent='重启自定义工作流模块后启用自动运行记录。';
+  initContinuous(boot);renderSaved(boot.workflows);render();renderState(boot.state);
   document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>tab(b.dataset.tab));
   $('plan-name').oninput=()=>{plan.name=$('plan-name').value;changed();};
   $('save').onclick=act(()=>save());$('save-copy').onclick=act(()=>save(true));
@@ -414,7 +433,7 @@ async function init() {
   $('close-point').onclick=()=>$('point-dialog').close();
   $('point-form').onsubmit=async event=>{event.preventDefault();const button=event.submitter;button.disabled=true;try{await storePoint(readPoint());$('point-dialog').close();toast('关键点已保存');}catch(error){$('point-error').textContent=error.message;$('point-error').hidden=false;}finally{button.disabled=false;}};
   $('update-feedback').onclick=act(async()=>{const p=await api('capture',{persist:false,name:$('point-name').value,space:$('point-space').value,side:$('point-side').value});editingPoint={...editingPoint,space:p.space,arms:p.arms,source:p.source};renderCoordinates();toast('已读取当前坐标，保存后生效');});
-  $('points').onclick=act(async event=>{const button=event.target.closest('[data-point-action]');if(!button)return;const id=button.closest('[data-point]').dataset.point,p=plan.points.find(p=>p.id===id);switch(button.dataset.pointAction){case'add':addStep('point',id);break;case'edit':openPoint(p);break;case'recapture':{const side=Object.keys(p.arms).length===2?'both':Object.keys(p.arms)[0];const sample=await api('capture',{persist:false,name:p.name,side,space:p.space});await storePoint({...p,arms:sample.arms,source:sample.source});toast('已用当前位置重录；名称和步骤引用保留，请核对角度后保存工作流');break;}case'copy':await storePoint({...structuredClone(p),id:uid(),name:uniqueName(`${p.name} 副本`,plan.points)});break;case'delete':await deleteResource('point',p);break;case'test':{const test=structuredClone(plan);test.steps=[{id:uid(),type:'point',point:id,name:`试运行 ${p.name}`,duration:3,blend:false}];test.models=[];await run(0,test);break;}}});
+  $('points').onclick=act(async event=>{const button=event.target.closest('[data-point-action]');if(!button)return;const id=button.closest('[data-point]').dataset.point,p=plan.points.find(p=>p.id===id);switch(button.dataset.pointAction){case'add':addStep('point',id);break;case'edit':openPoint(p);break;case'recapture':{const side=Object.keys(p.arms).length===2?'both':Object.keys(p.arms)[0];const sample=await api('capture',{persist:false,name:p.name,side,space:p.space});await storePoint({...p,arms:sample.arms,source:sample.source});toast('已用当前位置重录；名称和步骤引用保留，请核对角度后保存工作流');break;}case'copy':await storePoint({...structuredClone(p),id:uid(),name:uniqueName(`${p.name} 副本`,plan.points)});break;case'delete':await deleteResource('point',p);break;case'test':{const test=structuredClone(plan);test.steps=[{id:uid(),type:'point',point:id,name:`试运行 ${p.name}`,duration:3,blend:false}];test.models=[];test.mode='sequential';await run(0,test);break;}}});
   $('import-library').onclick=act(async()=>{await refreshLibrary();toast('已刷新共享关键点和模型');});
   $('hdf-import').onclick=act(async()=>{mergePoint(await api('from-hdf5',{path:$('hdf-path').value,frame:Number($('hdf-frame').value),name:$('capture-name').value.trim()||uniqueName('轨迹点',plan.points),space:$('capture-space').value,side:$('capture-side').value}));toast('已提取关键点，源文件未修改');});
   $('add-point-step').onclick=act(()=>addStep('point',$('add-point-select').value));
@@ -444,7 +463,7 @@ async function init() {
     try {
       const i=selected,step=plan.steps[i];
       if(action==='delete') {
-        if(step.type==='vla'&&!plan.steps.some(s=>s.id!==step.id&&s.type==='vla'&&s.model===step.model)) {
+        if(step.type==='vla'&&!(continuousMode()&&activeModelIds().includes(step.model))&&!plan.steps.some(s=>s.id!==step.id&&s.type==='vla'&&s.model===step.model)) {
           const state=await api('release-model',{id:step.model});renderState(state);
           toast(state.pending_unloads?.includes(step.model)?'步骤已删除，模型将在本次执行结束后自动卸载':'步骤已删除，模型已卸载；共享配置保留');
         }
@@ -519,7 +538,7 @@ async function init() {
       case 'delete':await deleteResource('model',model);break;
     }
   });
-  $('preload').onclick=act(async()=>{const ids=[...new Set(plan.steps.filter(s=>s.type==='vla').map(s=>s.model))];if(!ids.length)throw new Error('当前流程没有 VLA 步骤；也可在模型列表单独预加载');await api('preload',{plan,ids});await poll();});
+  $('preload').onclick=act(async()=>{const ids=activeModelIds();if(!ids.length)throw new Error('当前流程没有 VLA 步骤；也可在模型列表单独预加载');await api('preload',{plan,ids});await poll();});
   $('unload').onclick=act(async()=>{await api('unload',{});await poll();});
   $('run').onclick=act(()=>run());$('run-from').onclick=act(()=>run(selected));for(const cmd of ['pause','resume','next','stop','emergency'])$(cmd).onclick=act(async()=>{await api(cmd,{});await poll();});
   $('live-camera').onclick=()=>{frozen=null;pixel=null;clearInterval(previewTimer);previewTimer=setInterval(()=>{if(!frozen&&live.connected&&!$('tab-camera').hidden&&$('camera-image').complete)$('camera-image').src=`api/frame?camera=${$('camera-role').value}&t=${Date.now()}`;},500);$('pick-marker').hidden=true;$('camera-image').src=`api/frame?camera=${$('camera-role').value}&t=${Date.now()}`;$('pixel-info').textContent='预览画面：请先冻结再选点。';};

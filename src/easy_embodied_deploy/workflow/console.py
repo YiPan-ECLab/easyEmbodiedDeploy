@@ -21,6 +21,7 @@ from ..system import gpu_status
 from .plan import camera_point, new_plan, validate, require_models
 from .library import SharedPlanStore
 from .runtime import WorkflowController
+from .recording import recordings, recording_data, samples_csv, run_path
 
 
 class WorkflowServer(ThreadingHTTPServer):
@@ -50,9 +51,22 @@ class Handler(ModuleHandler, BaseHTTPRequestHandler):
             if parsed.path == "/api/bootstrap":
                 calibrations = [str(p) for p in (ROOT / "datasets/calibration").glob("*/calibration_bundle.json")]
                 resources = self.server.store.snapshot()
-                self.send(dict(api_version=8, plan=self.server.store.resolve(new_plan()), workflows=self.server.store.listing(),
+                self.send(dict(api_version=9, features=dict(continuous_vla=True, continuous_vla_switches=True, rtc_timing_fix=True, rtc_prefix_hold=True, joint_takeover_triggers=True, joint_sum_takeover_triggers=True, joint_pose_takeover_triggers=True, joint_sum_pose_takeover_triggers=True, high_z_override_takeover_triggers=True, motion_recording=True), plan=self.server.store.resolve(new_plan()), workflows=self.server.store.listing(),
                                library=resources, points=resources['points'], models=resources['models'],
                                calibrations=calibrations, serials=DEFAULT_SERIALS, state=controller.snapshot()))
+            elif parsed.path == '/api/recordings':
+                self.send(dict(runs=recordings(ROOT/'logs/workflow-runs')))
+            elif parsed.path == '/api/recording':
+                root = ROOT/'logs/workflow-runs'
+                if query.get('file') == 'samples.csv':
+                    self.send(samples_csv(root, query['id']), content_type='text/csv; charset=utf-8')
+                elif query.get('file') in ('metadata.json', 'summary.json', 'samples.jsonl', 'events.jsonl'):
+                    self.send((run_path(root,query['id'])/query['file']).read_bytes(),
+                              content_type='application/json' if query['file'].endswith('.json') else 'application/x-ndjson')
+                elif 'file' in query:
+                    raise ValueError('未知记录文件')
+                else:
+                    self.send(recording_data(root, query['id']))
             elif parsed.path == "/api/library":
                 self.send(self.server.store.snapshot())
             elif parsed.path == "/api/devices":

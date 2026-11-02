@@ -1,0 +1,85 @@
+{
+  "schema": "easy_embodied_workflow",
+  "version": 1,
+  "name": "我的工作流",
+  "points": [],
+  "models": [],
+  "steps": [],
+  "mode": "continuous_vla",
+  "continuous_vla": {
+    "model": "e1d3796c9e694c0eb93ceff220540dce",
+    "task": "",
+    "takeovers": [
+      {
+        "id": "f424826205e24a078c6b9583c9b5e039",
+        "name": "动作段 1",
+        "at_s": 12.0,
+        "trigger": {
+          "type": "right_joint_sum_pose",
+          "end_s": 25.0,
+          "hold_s": 0.05,
+          "sum_deg": 27.0,
+          "z_mm": 300.0,
+          "high_z_mm": 500
+        },
+        "steps": [
+          {
+            "id": "74224a06bdbd4344a6d218d7a59fafb3",
+            "type": "point",
+            "point": "f7c16b2fa631421090001473f970279b",
+            "duration": 1.0,
+            "blend": true
+          },
+          {
+            "id": "171b2910998f49ef9e1ba1a81b1b8536",
+            "type": "point",
+            "point": "9d8f09a13cb746b4a2d7031d9407cd5c",
+            "duration": 1.0,
+            "blend": true
+          },
+          {
+            "id": "9d69436c6e5c4d73ba7e15f8ffcbe4ae",
+            "type": "point",
+            "point": "0c61df782e354735a039829e9a87a08d",
+            "duration": 1.0,
+            "blend": true
+          },
+          {
+            "id": "60eac18e3dee40b6a863c1a845ed7e81",
+            "type": "point",
+            "point": "0ac3e6bcbdfb4e4dac9225972d09f79a",
+            "duration": 1.0,
+            "blend": true
+          },
+          {
+            "id": "20cb5f3d021640219539e0a89b3f3bf5",
+            "type": "point",
+            "point": "d026f8f174a34d1aa247c5f1c588181e",
+            "duration": 1.0,
+            "blend": true
+          },
+          {
+            "id": "fa785b5bcd59443287d4a15f230b9fd3",
+            "type": "point",
+            "point": "ccdeb2a626bd4185a94dd254d8cd499e",
+            "duration": 1.0,
+            "blend": true
+          }
+        ]
+      }
+    ],
+    "switches": []
+  },
+  "settings": {
+    "joint_command": "move_js",
+    "control_hz": 50.0,
+    "joint_speed": 3.0,
+    "joint_acceleration": 3.0,
+    "linear_speed": 1.0,
+    "angular_speed": 0.5,
+    "gripper_speed": 1.0,
+    "transition_s": 0.6,
+    "prefetch_s": 1.0
+  },
+  "resources": "shared"
+}

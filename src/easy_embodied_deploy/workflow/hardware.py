@@ -44,6 +44,10 @@ class MockHardware:
         self.commands = []
         self.emergency = False
 
+    def motion_feedback(self):
+        q = self.joints.copy()
+        return dict(joints_rad=np.r_[q[:6], q[7:13]].tolist(), provenance=dict(simulated=True))
+
     def snapshot(self):
         return dict(joints=self.joints.tolist(), poses={k: list(v) for k, v in self.poses.items()},
                     teaching=self.teaching, simulated=True)
@@ -329,7 +333,7 @@ class PiperHardware:
                 values[side] = [*q.tolist(), width]
             return values
 
-    def _joint_sample(self, side):
+    def _joint_sample(self, side, wait=True):
         """Copy all measured CAN groups, not the SDK's last-group timestamp.
 
         get_joint_angles() fills absent axes with cached/initial values and dates
@@ -338,7 +342,7 @@ class PiperHardware:
         """
         parser = self.arms[side]._parser
         groups = ("joint_12", "joint_34", "joint_56")
-        deadline = time.monotonic()+.25
+        deadline = time.monotonic()+(.25 if wait else 0)
         while True:
             messages = [getattr(parser, name, None) for name in groups]
             if all(m is not None for m in messages):
@@ -354,6 +358,16 @@ class PiperHardware:
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"{side} 从臂六轴反馈不完整、过期或不同步；未录制缓存角度，请检查从臂模式和 CAN")
             time.sleep(.005)
+
+    def motion_feedback(self):
+        # Use existing CAN receiver caches, with full group freshness checks.
+        # Never wait, take the command lock, change power/mode or open devices.
+        values, provenance = [], {}
+        for side in ('left', 'right'):
+            q, meta = self._joint_sample(side, wait=False)
+            values.extend(q.tolist())
+            provenance[side] = meta
+        return dict(joints_rad=values, provenance=provenance)
 
     def capture_point(self, space, sides):
         with self.lock:
